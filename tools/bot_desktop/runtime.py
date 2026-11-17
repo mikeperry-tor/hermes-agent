@@ -389,7 +389,7 @@ def ensure_started_for_tool() -> None:
         logger.info("Bot Desktop auto-start skipped: %s", exc)
 
 
-def tool_placement() -> str:
+def tool_placement(*, expected_sandbox: Optional[bool] = None) -> str:
     """Where the browser / cua-driver a tool is about to spawn MUST run: ``placement.GATEWAY`` or
     ``placement.TERMINAL``. Policy first, liveness second: a ``terminal`` placement whose screen is down gets
     it started here (raising with the blocker when it cannot come up) and a ``refused`` placement raises its
@@ -398,6 +398,8 @@ def tool_placement() -> str:
     where = placement.resolve()
     if where.where == placement.REFUSED:
         raise RuntimeError(where.reason)
+    if expected_sandbox is not None and (where.where == placement.TERMINAL) != expected_sandbox:
+        raise RuntimeError("The desktop placement changed; start a new computer-use session")
     if where.where == placement.GATEWAY:
         return placement.GATEWAY
     if not sandbox_screen_running() or not published_env().get("DISPLAY"):
@@ -579,7 +581,7 @@ def sandbox_screen_running() -> bool:
     return False
 
 
-def _owned_sandbox_env():
+def _owned_sandbox_env(*, reattach: bool = True):
     """The environment hosting the screen the marker records, re-attaching after a restart when the recorded
     sandbox is still alive; None when there is no marker or its sandbox is gone. Never builds a sandbox for
     a screen that is not there."""
@@ -590,7 +592,7 @@ def _owned_sandbox_env():
     env = _sandbox_env(create=False)
     if env is not None:
         return env
-    if sandbox_host.marker_sandbox_alive(marker):
+    if reattach and sandbox_host.marker_sandbox_alive(marker):
         return _sandbox_env(create=True)
     return None
 
@@ -894,6 +896,25 @@ def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
     (sd / "env").write_text("".join(f"{k}={v}\n" for k, v in published.items()), encoding="utf-8")
     touch_activity()
     return status()
+
+
+def tool_sandbox(*, reattach: bool = True):
+    """Read and act through the same verified environment that owns this profile's display."""
+    from tools.bot_desktop import sandbox_host
+
+    env = _owned_sandbox_env(reattach=reattach) or _sandbox_env(create=reattach)
+    if env is None:
+        raise RuntimeError("The recorded terminal desktop is unavailable; restore its terminal settings")
+    published = sandbox_host.published_env(env, _profile_name(), strict=True)
+    if not published.get("DISPLAY"):
+        raise RuntimeError("The terminal desktop screen is stopped; start it again")
+    return env, published
+
+
+def owns_tool_sandbox(env) -> bool:
+    """Revalidate a queued tool or companion operation without warming a new environment."""
+    return (env is not None and placement.resolve().where == placement.TERMINAL
+            and (_owned_sandbox_env(reattach=False) or _sandbox_env(create=False)) is env)
 
 
 def _sandbox_published_env() -> dict[str, str]:

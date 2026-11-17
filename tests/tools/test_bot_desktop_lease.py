@@ -119,7 +119,7 @@ def test_takeover_handback_during_approval_does_not_start_the_device_op(monkeypa
     rec = Rec()
     monkeypatch.setattr(tool, "_new_backend", lambda mode: rec)
 
-    def _approval_cycles_the_lease(scope, args, session_id=""):
+    def _approval_cycles_the_lease(_scope, _args, **_kwargs):
         lease.acquire("human")
         lease.release("human")
 
