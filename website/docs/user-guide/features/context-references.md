@@ -43,6 +43,27 @@ Check @file:main.py, and also @file:test.py.
 
 Trailing punctuation (`,`, `.`, `;`, `!`, `?`) is automatically stripped from reference values.
 
+## Disable implicit URL fetching
+
+By default, `@url:` references fetch page content. To keep URL text and chips
+without automatically fetching their contents, set this in `config.yaml`:
+
+```yaml
+context_references:
+  fetch_urls: false
+```
+
+Other reference kinds continue expanding. Disabled URL references do not consume
+reference-count or injected-content limits. Explicit web tool calls and browser
+image loading have separate controls. To apply the same setting deployment-wide,
+set it in the [managed configuration](../managed-scope.md).
+This setting takes precedence over profiles, including in safe/config-bypass
+sessions. Without a managed setting, those sessions use built-in defaults.
+
+Hermes blocks messages containing URL references if their settings cannot be
+read or validated. Use a YAML boolean for `fetch_urls`. Messages without URL
+references can still expand. Repair the setting or configuration source and retry.
+
 ## CLI Tab Completion
 
 In the interactive CLI, typing `@` triggers autocomplete:
