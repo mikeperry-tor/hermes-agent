@@ -42,12 +42,13 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
-def get_managed_dir() -> Optional[Path]:
+def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
     """Resolve the managed-scope directory, or None when no scope is present.
 
     Priority: ``$HERMES_MANAGED_DIR`` (IT-only bootstrap override; never persisted to any .env;
     honored only when non-empty AND the directory exists), then ``/etc/hermes`` when it exists.
-    A missing directory resolves to None — the common case, so it must be cheap + side-effect-free.
+    In strict mode return the selected path directly so stat on the file distinguishes absence from
+    an inaccessible directory. Normal callers keep the optional existing-directory check.
     """
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
@@ -56,7 +57,7 @@ def get_managed_dir() -> Optional[Path]:
         return None
     else:
         p = _DEFAULT_MANAGED_DIR
-    return p if p.is_dir() else None
+    return p if strict or p.is_dir() else None
 
 
 def invalidate_managed_cache() -> None:
@@ -104,11 +105,18 @@ def _cached_read(path: Path, cache: dict[str, tuple], parse, *, strict: bool = F
 
 
 def _load_managed_file(name: str, cache: dict[str, tuple], parse, *, strict: bool = False) -> dict:
-    managed_dir = get_managed_dir()
+    managed_dir = get_managed_dir(strict=strict)
     if managed_dir is None:
         return {}
     parsed = _cached_read(managed_dir / name, cache, parse, strict=strict)
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_managed_config(path: Path) -> dict:
+    parsed = fast_safe_load(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(parsed, dict):
+        raise ValueError("managed config.yaml must contain a mapping")
+    return parsed
 
 
 def load_managed_config(*, strict: bool = False) -> dict:
@@ -119,7 +127,7 @@ def load_managed_config(*, strict: bool = False) -> dict:
 
     if not get_config_backend().honors_managed_config():
         return {}
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {},
+    return _load_managed_file("config.yaml", _CONFIG_CACHE, _parse_managed_config,
                               strict=strict)
 
 
@@ -135,17 +143,18 @@ def _parse_managed_env(path: Path) -> dict[str, str]:
     return load_env_file(path)
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, *, managed_snapshot: Optional[dict] = None) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
     shadow a managed literal via a ref they control; a bare root ``model: x/y`` string is promoted
     to ``model.default`` so it can't clobber the dict shape callers expect; managed values
     deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
-    ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
+    ``config`` unchanged when no scope is present or on an error. An explicit validated snapshot is
+    applied without rereading the file, and expansion/merge errors then propagate.
     """
     try:
-        managed = load_managed_config()
+        managed = load_managed_config() if managed_snapshot is None else managed_snapshot
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
@@ -159,6 +168,8 @@ def apply_managed_overlay(config: dict) -> dict:
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded)
     except Exception:
+        if managed_snapshot is not None:
+            raise
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
 

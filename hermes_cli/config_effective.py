@@ -31,9 +31,10 @@ _LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
 _EFFECTIVE_CACHE: dict[str, tuple[Any, ...]] = {}
 
 
-def _effective(raw: dict[str, Any]) -> dict[str, Any]:
+def _effective(raw: dict[str, Any], managed_snapshot: Optional[dict] = None) -> dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
-    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {})
+    merged = managed_scope.apply_managed_overlay(expanded if isinstance(expanded, dict) else {},
+                                                 managed_snapshot=managed_snapshot)
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
@@ -50,7 +51,17 @@ def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[
     return copy.deepcopy(raw) if raw is not None else {}
 
 
-def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False) -> dict[str, Any]:
+def _signatures(config_path: Path, managed_snapshot: Optional[dict]):
+    if managed_snapshot is None:
+        return _config._load_config_cache_sig(config_path)
+    try:
+        return _config.config_cache_version(config_path), None
+    except FileNotFoundError:
+        return None, None
+
+
+def load_user_config_effective(config_path: Optional[Path] = None, *, fail_closed: bool = False,
+                               managed_snapshot: Optional[dict] = None) -> dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -61,19 +72,20 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
     user file — in-process first, then
     the newest ``backups/config/*.good.*`` copy — is served through the same pipeline, so a
     mid-edit torn write never silently drops user overrides (same contract as ``load_config``).
-    Cached on the user + managed file signatures and the values of every referenced env var."""
+    Cached on file signatures and referenced env vars. A supplied validated managed snapshot
+    bypasses the effective cache and is the only managed input for this decision."""
     from agent.safe_worker_policy import worker_config_snapshot
 
     # A frozen-policy worker is detached from the profile's files: the owner-supplied
     # snapshot IS the user layer (same seam load_config / read_raw_config honour).
     snapshot = worker_config_snapshot()
     if snapshot is not None:
-        return _effective(snapshot)
+        return _effective(snapshot, managed_snapshot)
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
-        user_sig, cache_sig = _config._load_config_cache_sig(config_path)
+        user_sig, cache_sig = _signatures(config_path, managed_snapshot)
         cached = _EFFECTIVE_CACHE.get(path_key)
         n = len(cache_sig) if cache_sig is not None else 0
         if cached is not None and cache_sig is not None and cached[:n] == cache_sig:
@@ -120,6 +132,9 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
             if loaded is not None and not isinstance(loaded, dict):
                 raise TypeError("config.yaml root is not a mapping")
             root_is_mapping = True
+
+        if managed_snapshot is not None:
+            return _effective(raw, managed_snapshot)
 
         env_snapshot = _config._env_ref_snapshot(raw)
         managed = managed_scope.load_managed_config()
