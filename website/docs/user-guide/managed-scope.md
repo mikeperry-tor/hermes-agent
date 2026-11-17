@@ -40,7 +40,9 @@ the managed files but cannot edit them.
 
 Either file is optional. A missing managed directory or missing file simply
 means "no managed scope," and configuration resolves exactly as it does without
-the feature.
+the feature. A present managed `config.yaml` must contain a YAML mapping.
+Use `{}` to specify an empty policy. Strict policy readers refuse blank or
+null documents until the file is repaired.
 
 ### Relocating the directory
 
