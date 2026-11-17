@@ -648,16 +648,35 @@ def status(profile: Optional[str] = None) -> DesktopStatus:
 
 
 def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
-    """Status of a sandbox-placed screen. Package presence is only known once the sandbox exists; before
-    that the pane shows "installed" with the image hint carried in ``install_command`` so Start can explain."""
+    """Inspect sandbox dependencies, retaining native owner reattachment.
+    Unavailable dependencies remain unknown; never install host dependencies here."""
     from tools.bot_desktop import sandbox_host
-    env = _owned_sandbox_env() or _sandbox_env(create=False)
-    missing = sandbox_host.missing_binaries(env) if env is not None else []
-    published = sandbox_host.published_env(env, profile or _profile_name()) if env is not None else {}
+    probe_error = None
+    display_error = None
+    missing = []
+    published = {}
+    inspection_failed = "Could not inspect desktop dependencies; check the terminal sandbox connection and retry."
+    try:
+        env = _owned_sandbox_env() or _sandbox_env(create=False)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        env = None
+        probe_error = inspection_failed
+    if env is None:
+        probe_error = probe_error or "Start the desktop to inspect its terminal sandbox dependencies."
+    else:
+        try:
+            missing = sandbox_host.missing_binaries(env)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            probe_error = inspection_failed
+        # A package probe cannot tell us whether the published screen is live.
+        try:
+            published = sandbox_host.published_env(env, profile or _profile_name(), strict=True)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            display_error = "Could not inspect the desktop display; check the terminal sandbox connection and retry."
     running = bool(published.get("DISPLAY"))
     # No install_command: the pane's Install button runs apt on the HOST, which is the wrong machine here.
     # A sandbox missing the stack is a blocker (shown in place of Start) naming the image that has it.
-    blocker = None
+    blocker = probe_error or display_error
     image_switch = None
     if missing:
         advice = sandbox_host.plugin_image_advice(where.backend) or (
@@ -679,7 +698,7 @@ def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
     return DesktopStatus(
         profile=profile or _profile_name(),
         supported=True,
-        installed=True,
+        installed=probe_error is None and not missing,
         missing=missing,
         running=running,
         pid=None,
