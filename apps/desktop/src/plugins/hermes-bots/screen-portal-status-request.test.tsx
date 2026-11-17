@@ -6,7 +6,7 @@
  * and `display` backwards (#110037).
  */
 
-import { act, renderHook } from '@testing-library/react'
+import { act, render, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import type { RosterRow } from './types'
@@ -27,13 +27,13 @@ vi.mock('./data', async () => {
 
   return { $lastRoster: atom<RosterRow[]>([]), botSelectionKey: (bot: RosterRow) => bot.name }
 })
-vi.mock('./i18n', () => ({ useBots: () => ({ screen: {} }) }))
+vi.mock('./i18n', () => ({ useBots: () => ({ screen: { portalTitle: 'Screen', portalWatching: 'Watching', portalStopped: 'Stopped', portalNotInstalled: 'Desktop not installed' } }) }))
 vi.mock('./screen-open', () => ({ openBotScreen: vi.fn() }))
 
 import { host } from '@hermes/plugin-sdk'
 
 import type { DisplayStatus } from './screen-connection'
-import { useScreenPortalState } from './screen-portal'
+import { ScreenPortal, useScreenPortalState } from './screen-portal'
 import { $screenState, beginScreenStatusRequest, screenStateFor, setScreenStatus } from './screen-state'
 
 const bot: RosterRow = { name: 'ops' }
@@ -90,5 +90,23 @@ it('a portal status reply superseded by a newer status request does not move run
   const status = screenStateFor($screenState.get(), bot)?.status
   expect(status?.running).toBe(false)
   expect(status?.display).toBeNull()
+  view.unmount()
+})
+
+
+it('shows the connection diagnostic instead of installation advice and clears it after recovery', () => {
+  const blocker = 'Could not inspect desktop dependencies; check the terminal sandbox connection and retry.'
+  setScreenStatus(bot, { ...stopped, installed: false, blocker })
+  const view = render(<ScreenPortal bot={bot} />)
+  expect(view.getByText(blocker)).toBeTruthy()
+  expect(view.queryByText('Desktop not installed')).toBeNull()
+  act(() => setScreenStatus(bot, { ...running, installed: false, blocker }))
+  expect(view.getByText('Watching')).toBeTruthy()
+  expect(view.queryByText(blocker)).toBeNull()
+  act(() => setScreenStatus(bot, stopped))
+  expect(view.queryByText(blocker)).toBeNull()
+  expect(view.getByText('Stopped')).toBeTruthy()
+  act(() => setScreenStatus(bot, { ...stopped, installed: false }))
+  expect(view.getByText('Desktop not installed')).toBeTruthy()
   view.unmount()
 })
