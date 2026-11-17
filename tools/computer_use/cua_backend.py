@@ -27,7 +27,7 @@ from tools.computer_use.cua_backend_driver import (
     resolve_cua_driver_cmd)
 from tools.computer_use.cua_backend_input import _InputMixin
 from tools.computer_use.cua_backend_parse import _action_result_from
-from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
+from tools.computer_use.cua_backend_session import DesktopChanged, _AsyncBridge, _CuaDriverSession
 
 logger = logging.getLogger(__name__)
 # cua-driver's anonymous PostHog telemetry gate ("0" disables; absent => ON upstream).
@@ -157,26 +157,24 @@ def cua_driver_child_env(base_env: Optional[dict[str, str]] = None) -> dict[str,
         env[_CUA_NATIVE_WAYLAND_ENV_VAR] = "1"
     return env
 
-def sandbox_mcp_invocation() -> Optional[tuple[tuple[str, list[str]], dict[str, str]]]:
-    """``((command, args), child_env)`` spawning ``cua-driver mcp`` INSIDE the terminal backend when the Bot
+def sandbox_mcp_invocation(*, expected_sandbox: Optional[bool] = None):
+    """Return the invocation and its exact desktop binding when the Bot
     Desktop is placed there (the driver in the sandbox image drives the sandbox's own screen); None on a
     gateway-hosted desktop, where the local driver is used. Placement is the authority: a ``terminal``
     placement gets its screen started here and a ``refused`` one raises — the host driver is never the
     fallback for a sandbox whose screen is down."""
     from tools.bot_desktop import placement, runtime as _bd_runtime
-    if _bd_runtime.tool_placement() == placement.GATEWAY:
+    where = (_bd_runtime.tool_placement() if expected_sandbox is None
+             else _bd_runtime.tool_placement(expected_sandbox=expected_sandbox))
+    if where == placement.GATEWAY:
         return None
-    published = _bd_runtime.published_env()
-    if not published.get("DISPLAY"):
-        raise RuntimeError("the screen inside the terminal backend's sandbox is gone; start it again")
     from tools.bot_desktop import sandbox_host
-    env = _bd_runtime._sandbox_env(create=True)
-    if env is None:
-        raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run cua-driver")
+
+    env, published = _bd_runtime.tool_sandbox()
     command, args = sandbox_host.cua_mcp_invocation(env, _bd_runtime._profile_name(),
                                                     {**published, _CUA_TELEMETRY_ENV_VAR: "0"})
     _bd_runtime.touch_activity()
-    return (command, args), {"PATH": os.environ.get("PATH", "")}
+    return (command, args), {"PATH": os.environ.get("PATH", "")}, (env, published)
 
 
 def sanitized_cua_driver_env() -> dict[str, str]:
@@ -258,6 +256,11 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
     def __init__(self, permission_mode: str = "standard") -> None:
         if permission_mode not in {"standard", "bounded", "unrestricted"}:
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
+        if permission_mode != "standard":
+            from tools.bot_desktop import placement
+            if placement.resolve().where != placement.GATEWAY:
+                raise ValueError("Terminal desktop placement supports standard permissions only; "
+                                 "bounded and unrestricted require a gateway-local daemon")
         self.permission_mode = permission_mode
         self._embedded_daemon: Optional[_EmbeddedCuaDaemon] = None
         if permission_mode != "standard":
@@ -317,6 +320,10 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         importlib.invalidate_caches()
         with contextlib.ExitStack() as rollback:  # a failed start stops the private daemon, then re-raises
             if self._embedded_daemon is not None:
+                from tools.bot_desktop import placement
+                if placement.resolve().where != placement.GATEWAY:
+                    raise ValueError("Terminal desktop placement supports standard permissions only; "
+                                     "bounded and unrestricted require a gateway-local daemon")
                 rollback.callback(self._embedded_daemon.stop) and self._embedded_daemon.start()
             self._session.start()
             rollback.pop_all()
@@ -425,6 +432,8 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
             args.setdefault("session", self._session_id)
         try:
             out = self._session.call_tool(name, args)
+        except DesktopChanged:
+            raise
         except Exception as e:
             logger.exception("cua-driver %s call failed", name)
             return ActionResult(ok=False, action=name, message=f"cua-driver error: {e}")
