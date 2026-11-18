@@ -86,6 +86,34 @@ class TestBuildSSHCommand:
         env = SSHEnvironment(host="h", user="u")
         assert env._build_ssh_command()[-1] == "u@h"
 
+    @pytest.mark.platforms("posix")
+    def test_explicit_ssh_config_pins_commands_and_separates_mux_identity(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ssh_env, "_SSH_MULTIPLEX", True)
+        path = str(tmp_path / "deployed ssh config")
+        default = SSHEnvironment(host="h", user="u")
+        managed = SSHEnvironment(host="h", user="u", ssh_config=path)
+        cmd = managed._build_ssh_command(send_env=("TZ",))
+        assert cmd[:7] == ["ssh", "-F", path, "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes"]
+        assert "StrictHostKeyChecking=accept-new" not in cmd
+        assert default.control_socket != managed.control_socket
+        assert default._control_socket_for(("TZ",)) != managed._control_socket_for(("TZ",))
+        captured = []
+
+        def capture(command, **_):
+            captured.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        monkeypatch.setattr(ssh_env, "run_capture", capture)
+        managed._scp_upload("source", "destination")
+        assert captured[-1][:7] == ["scp", *cmd[1:7]]
+
+    def test_relative_ssh_config_is_refused_before_connecting(self, monkeypatch):
+        establish = MagicMock()
+        monkeypatch.setattr(SSHEnvironment, "_establish_connection", establish)
+        with pytest.raises(ValueError, match="absolute OpenSSH configuration"):
+            SSHEnvironment(host="h", user="u", ssh_config="relative.conf")
+        establish.assert_not_called()
+
     def _capture_run_bash(self, monkeypatch, env, cmd="echo ok"):
         captured = {}
 

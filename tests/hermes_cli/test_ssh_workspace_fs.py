@@ -134,6 +134,7 @@ def test_ssh_workspace_factory_disables_agent_file_sync(monkeypatch):
             "ssh_user": "dev",
             "ssh_port": 2222,
             "ssh_key": "/keys/id_ed25519",
+            "ssh_config": "/etc/hermes/executor-ssh.conf",
             "timeout": 45,
         },
     )
@@ -149,6 +150,7 @@ def test_ssh_workspace_factory_disables_agent_file_sync(monkeypatch):
             "port": 2222,
             "key_path": "/keys/id_ed25519",
             "sync_files": False,
+            "ssh_config": "/etc/hermes/executor-ssh.conf",
         }
     ]
 

@@ -214,12 +214,18 @@ def _check_docker_backend(terminal_env: str, running_in_container: bool, issues:
 
 
 def _check_ssh_backend(issues: list[str]) -> None:
+    from tools.environments.ssh import ssh_config_options
+
     ssh_host = os.getenv("TERMINAL_SSH_HOST")
     if not ssh_host:
         return _fail_and_issue("SSH host not configured", "(needed for the 'ssh' terminal backend)",
                                "run `hermes setup terminal` and enter the SSH host and user.", issues)
     ssh_user, ssh_port, ssh_key = (os.getenv(f"TERMINAL_SSH_{k}") for k in ("USER", "PORT", "KEY"))
-    cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+    try:
+        flags = ssh_config_options(os.getenv("TERMINAL_SSH_CONFIG", ""))
+    except ValueError as exc:
+        return _fail_and_issue("Invalid SSH configuration path", "", str(exc), issues)
+    cmd = ["ssh", *(flags or ["-o", "BatchMode=yes"]), "-o", "ConnectTimeout=5"]
     if ssh_port:
         cmd += ["-p", ssh_port]
     if ssh_key:
