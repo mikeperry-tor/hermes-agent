@@ -13,6 +13,7 @@ class Socket {
   static OPEN = 1
   static instances: Socket[] = []
   static reply = (socket: Socket) => socket.metadata()
+  static acceptStartupCancellation = true
   readyState = 1
   binaryType = ''
   onmessage: ((event: MessageEvent) => void) | null = null
@@ -24,7 +25,12 @@ class Socket {
   constructor(url: string | URL) {
     this.url = new URL(url)
     Socket.instances.push(this)
-    queueMicrotask(() => Socket.reply(this))
+    queueMicrotask(() => {
+      if (Socket.acceptStartupCancellation && this.url.searchParams.get('startup') === '1') {
+        this.onmessage?.({ data: META + '{"preparing":true,"ackStartup":true}' } as MessageEvent)
+      }
+      Socket.reply(this)
+    })
   }
 
   metadata(extra: Record<string, unknown> = {}) {
@@ -58,6 +64,7 @@ beforeEach(() => {
   localStorage.clear()
   vi.useFakeTimers()
   Socket.instances = []
+  Socket.acceptStartupCancellation = true
   Socket.reply = socket => socket.metadata()
   vi.stubGlobal('WebSocket', Socket)
   let tickets = 0
@@ -70,6 +77,7 @@ afterEach(() => {
   Reflect.deleteProperty(window, 'hermesDesktop')
   Reflect.deleteProperty(window, '__HERMES_AUTH_REQUIRED__')
   Reflect.deleteProperty(window, '__HERMES_BASE_PATH__')
+  Reflect.deleteProperty(window, '__HERMES_TERMINAL_ENVIRONMENT__')
   $connection.set(null)
   vi.useRealTimers()
   vi.unstubAllGlobals()
@@ -78,6 +86,18 @@ afterEach(() => {
 })
 
 describe('persistent browser terminals', () => {
+  it.each(['executor', null] as const)('skips independent cwd resolution for a local terminal in %s mode', async mode => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = mode
+    const api = install()
+    await api.start()
+    expect(Socket.instances[0].url.searchParams.has('cwd')).toBe(false)
+    expect(Socket.instances[0].url.searchParams.get('environment')).toBe(mode ?? 'unavailable')
+    expect(vi.mocked(fetch).mock.calls.some(([input]) => String(input).includes('/api/fs/default-cwd'))).toBe(false)
+
+    await api.start({ cwd: '/explicit path ' })
+    expect(Socket.instances[1].url.searchParams.get('cwd')).toBe('/explicit path ')
+  })
+
   it('consumes an empty replay frame without suppressing the first live output', async () => {
     const api = install()
     const session = await api.start({ cwd: '/original', restoreKey: 'empty-history' })
@@ -221,6 +241,7 @@ describe('persistent browser terminals', () => {
     Socket.reply = socket => socket.close(4410, 'Process exited')
     await expect(api.start({ restoreKey: 'tab-one', resumeOnly: true })).rejects.toMatchObject({ signal: 'exited' })
     expect(Socket.instances[1].url.searchParams.get('attach')).toBe('opaque-server-id')
+    expect(Socket.instances[1].url.searchParams.has('action')).toBe(false)
     expect(localStorage.length).toBe(0)
   })
 
@@ -393,4 +414,207 @@ describe('host terminal after sign-out', () => {
     expect(exit).toHaveBeenCalledExactlyOnceWith({ code: null, signal: 'signed-out' })
     expect($desktopBoot.get().error).not.toBe(WEBAPP_LAUNCH_REQUIRED)
   })
+})
+
+describe('executor startup cancellation', () => {
+  afterEach(() => { Reflect.deleteProperty(window, '__HERMES_TERMINAL_ENVIRONMENT__') })
+
+  it.each(['cwd', 'url', 'metadata'] as const)('closes during pending %s without a late socket or metadata revival', async stage => {
+    const { createBrowserTerminal } = await import('./browser-terminal')
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+    let release!: (value: string) => void
+    const pending = new Promise<string>(resolve => { release = resolve })
+    Socket.reply = () => undefined
+    const api = createBrowserTerminal({ basePath: '', currentProfile: () => null, currentConnection: () => 'local',
+      defaultCwd: () => stage === 'cwd' ? pending : Promise.resolve('/work'),
+      websocketUrl: () => stage === 'url' ? pending : Promise.resolve('ws://localhost/terminal') })
+    const start = api.start({ restoreKey: 'pending' })
+    const failed = expect(start).rejects.toThrow('cancelled')
+    if (stage === 'metadata') {await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))}
+    expect(await api.closeSaved!('pending')).toBe(true)
+    release(stage === 'url' ? 'ws://localhost/late' : '/late')
+    await failed
+    await Promise.resolve()
+    for (const socket of Socket.instances) {
+      socket.metadata()
+      expect(socket.readyState).toBe(3)
+    }
+    expect(Socket.instances).toHaveLength(stage === 'metadata' ? 1 : 0)
+  })
+
+  it('cancels overlapping remount starts without spawning a successor', async () => {
+    Socket.reply = () => undefined
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+    const api = install()
+    const first = api.start({ cwd: '/work', restoreKey: 'remount' })
+    const firstFailed = expect(first).rejects.toThrow('cancelled')
+    const second = api.start({ cwd: '/work', restoreKey: 'remount' })
+    const secondFailed = expect(second).rejects.toThrow('cancelled')
+    await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+    expect(await api.closeSaved!('remount')).toBe(true)
+    await Promise.all([firstFailed, secondFailed])
+    expect(Socket.instances).toHaveLength(1)
+    expect(Socket.instances[0].readyState).toBe(3)
+  })
+
+  it('allows slow fresh executor preparation and bounds a stalled reattach', async () => {
+    Socket.reply = () => undefined
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+    const api = install()
+    const started = vi.fn()
+    const starting = api.start({ cwd: '/work', restoreKey: 'executor-startup' }).then(result => { started(); return result })
+    await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(started).not.toHaveBeenCalled()
+    Socket.instances[0].metadata()
+    expect((await starting).cwd).toBe('/original')
+    Socket.instances[0].close(1006)
+    await vi.waitFor(() => expect(Socket.instances).toHaveLength(2))
+    expect(Socket.instances[1].url.searchParams.get('attach')).toBe('opaque-server-id')
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(Socket.instances[1].readyState).toBe(3)
+  })
+})
+
+it('keeps the tab owner through slow relayed startup and closes a published shell by its token', async () => {
+  const { createBrowserTerminal } = await import('./browser-terminal')
+  Socket.reply = socket => {
+    if (socket.url.searchParams.get('action') === 'close') {
+      socket.metadata({ terminalId: socket.url.searchParams.get('attach'), closed: true })
+      socket.close()
+    }
+  }
+  const websocketUrl = vi.fn(async () => 'ws://localhost/gateway-relay/tab-owner/api/host-terminal')
+  const defaultCwd = vi.fn(async () => '/remote')
+  const api = createBrowserTerminal({ basePath: '', currentProfile: () => 'selected-profile',
+    currentConnection: () => 'another-gateway', defaultCwd, websocketUrl })
+  const starting = api.start({ restoreKey: 'remote-pending', connectionId: 'tab-owner', profile: 'tab-profile' })
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+  expect(defaultCwd).toHaveBeenCalledWith('tab-profile', 'tab-owner')
+  expect(websocketUrl).toHaveBeenCalledWith('tab-profile', 'tab-owner')
+  await vi.advanceTimersByTimeAsync(60_000)
+  expect(Socket.instances[0].readyState).not.toBe(3)
+  Socket.instances[0].metadata()
+  await starting
+  expect(Socket.instances[0].sent[0]).toBe(META + '{"attached":true}')
+  await api.closeSaved!('remote-pending')
+  expect(Socket.instances).toHaveLength(2)
+  expect(Socket.instances[1].url.searchParams.get('action')).toBe('close')
+  expect(Socket.instances[1].url.searchParams.get('attach')).toBe('opaque-server-id')
+  expect(websocketUrl).toHaveBeenLastCalledWith('tab-profile', 'tab-owner')
+})
+
+it('closes an unpublished relayed startup without waiting for metadata', async () => {
+  const { createBrowserTerminal } = await import('./browser-terminal')
+  Socket.reply = () => undefined
+  const api = createBrowserTerminal({ basePath: '', currentProfile: () => null, currentConnection: () => 'saved-gateway',
+    defaultCwd: async () => '/remote', websocketUrl: async () => 'ws://localhost/terminal' })
+  const starting = api.start({ restoreKey: 'remote-pending' })
+  const failed = expect(starting).rejects.toThrow('cancelled')
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+  expect(await api.closeSaved!('remote-pending')).toBe(true)
+  await failed
+  expect(Socket.instances).toHaveLength(1)
+  expect(Socket.instances[0].readyState).toBe(3)
+})
+
+it('bounds a fresh executor handshake when the receiver never announces preparation', async () => {
+  window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+  Socket.acceptStartupCancellation = false
+  Socket.reply = () => undefined
+  const api = install()
+  const failed = expect(api.start({ restoreKey: 'executor-no-metadata' }))
+    .rejects.toThrow('did not provide startup metadata')
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+  await vi.advanceTimersByTimeAsync(10_000)
+  await failed
+  expect(Socket.instances[0].readyState).toBe(3)
+})
+
+it('closes a fresh local executor terminal before the receiver sends any metadata', async () => {
+  window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+  Socket.acceptStartupCancellation = false
+  Socket.reply = () => undefined
+  const api = install()
+  const failed = expect(api.start({ restoreKey: 'executor-close-before-metadata' })).rejects.toThrow('cancelled')
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+  expect(await api.closeSaved!('executor-close-before-metadata')).toBe(true)
+  await failed
+  expect(Socket.instances).toHaveLength(1)
+  expect(Socket.instances[0].readyState).toBe(3)
+})
+
+it('finishes closing a relay when startup fails before reaching the receiver', async () => {
+  const { createBrowserTerminal } = await import('./browser-terminal')
+  Socket.acceptStartupCancellation = false
+  Socket.reply = () => undefined
+  const api = createBrowserTerminal({ basePath: '', currentProfile: () => null, currentConnection: () => 'remote-gateway',
+    defaultCwd: async () => '', websocketUrl: async () => 'ws://localhost/terminal' })
+  const failed = expect(api.start({ restoreKey: 'relay-startup-failure' })).rejects.toThrow('Host terminal closed')
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+  const closing = api.closeSaved!('relay-startup-failure')
+  Socket.instances[0].close(1006)
+  expect(await closing).toBe(true)
+  await failed
+  expect(Socket.instances).toHaveLength(1)
+})
+
+it('waits for a legacy receiver token before disposing its startup socket', async () => {
+  const { createBrowserTerminal } = await import('./browser-terminal')
+  Socket.acceptStartupCancellation = false
+  Socket.reply = socket => {
+    if (socket.url.searchParams.get('action') === 'close') {
+      socket.metadata({ terminalId: socket.url.searchParams.get('attach'), closed: true })
+      socket.close()
+    }
+  }
+  const api = createBrowserTerminal({ basePath: '', currentProfile: () => null, currentConnection: () => 'old-receiver',
+    defaultCwd: async () => '', websocketUrl: async () => 'ws://localhost/terminal' })
+  const starting = api.start({ restoreKey: 'old-start' })
+  await vi.waitFor(() => expect(Socket.instances).toHaveLength(1))
+  const disposing = api.closeSaved!('old-start')
+  await vi.advanceTimersByTimeAsync(100)
+  expect(Socket.instances[0].readyState).toBe(Socket.OPEN)
+  Socket.instances[0].metadata()
+  await starting
+  expect(await disposing).toBe(true)
+  expect(Socket.instances[1].url.searchParams.get('action')).toBe('close')
+  expect(Socket.instances[1].url.searchParams.get('attach')).toBe('opaque-server-id')
+})
+
+it('pins the receiving environment after the token expires, including a fresh retry', async () => {
+  const { createBrowserTerminal } = await import('./browser-terminal')
+  const api = createBrowserTerminal({ basePath: '', currentProfile: () => null, currentConnection: () => 'saved-gateway',
+    defaultCwd: async () => '', websocketUrl: async () => 'ws://localhost/terminal' })
+  Socket.reply = socket => socket.metadata({ environment: 'executor' })
+  await api.start({ restoreKey: 'pinned-receiver' })
+  expect(Socket.instances[0].url.searchParams.has('environment')).toBe(false)
+
+  Socket.instances[0].close(4410, 'expired')
+  Socket.reply = socket => socket.close(4411, 'Terminal environment changed; reload the WebApp')
+  await expect(api.start({ restoreKey: 'pinned-receiver' })).rejects.toThrow('environment changed')
+  expect(Socket.instances[1].url.searchParams.get('environment')).toBe('executor')
+  expect(Socket.instances[1].url.searchParams.get('action')).toBe('start')
+  expect(Socket.instances[1].url.searchParams.has('attach')).toBe(false)
+})
+
+it('refuses a fresh direct retry against a receiver without placement support', async () => {
+  window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+  const api = install()
+  Socket.reply = socket => socket.metadata({ environment: 'executor' })
+  await api.start({ restoreKey: 'direct-executor' })
+
+  Socket.instances[0].close(4410, 'expired')
+  Socket.acceptStartupCancellation = false
+  const startedGatewayShell = vi.fn()
+  Socket.reply = socket => {
+    if (socket.url.searchParams.get('action') === 'start') {
+      socket.close(4403, 'Terminal belongs to another identity or profile')
+    } else {
+      startedGatewayShell()
+      socket.metadata()
+    }
+  }
+  await expect(api.start({ restoreKey: 'direct-executor' })).rejects.toThrow('Terminal belongs to another identity or profile')
+  expect(startedGatewayShell).not.toHaveBeenCalled()
 })
