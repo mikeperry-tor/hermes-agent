@@ -567,10 +567,11 @@ class SQLiteSessionRepository:
         with refusals(holder, session_id):
             set_session_yolo(holder, session_id, enabled)
 
-    def update_system_prompt(self, session_id: SessionId, system_prompt: Optional[str]) -> None:
+    def update_system_prompt(self, session_id: SessionId, system_prompt: Optional[str], *,
+                             managed_tools: list[str] | str | None = None) -> None:
         holder = self._store.holder()
         with refusals(holder, session_id):
-            update_system_prompt(holder, session_id, system_prompt)
+            update_system_prompt(holder, session_id, system_prompt, managed_tools=managed_tools)
 
     def request_prompt_refresh(self, session_id: Optional[SessionId] = None) -> int:
         holder = self._store.holder()
