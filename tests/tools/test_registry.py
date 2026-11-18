@@ -436,9 +436,9 @@ class TestThreadSafety:
 
         entries = reg._snapshot_entries()
 
-        def snapshot_then_mutate():
+        def snapshot_then_mutate(*, permitted=None):
             reg.deregister("alpha")
-            return entries
+            return entries if permitted is None else [entry for entry in entries if permitted(entry.name)]
 
         monkeypatch.setattr(reg, "_snapshot_entries", snapshot_then_mutate)
 

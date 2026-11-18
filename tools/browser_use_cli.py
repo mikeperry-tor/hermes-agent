@@ -784,10 +784,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
-    from tools.hosted_tool_policy import hosted_tool_refusal
+    from tools.hosted_tool_policy import tool_refusal
     from tools.registry import tool_error, tool_result
     # A direct (non-dispatch) entry meets the same allowlist, before any setup.
-    if refusal := hosted_tool_refusal("browser_exec") or _no_code_error(code):
+    if refusal := tool_refusal("browser_exec") or _no_code_error(code):
         return tool_error(refusal)
 
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
