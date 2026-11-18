@@ -148,6 +148,7 @@ that device.
 browser:
   executable_path: ""     # Chromium binary to launch instead of the packaged one
   user_data_dir: ""       # persistent profile directory; "" = fresh profile per session
+  require_sandbox: false   # true: never launch Chromium with sandbox bypass flags
   chromium_args: []       # extra Chromium command-line flags, e.g. ["--lang=de-DE"]
   headed: false           # true = visible window
   command_timeout: 30     # Chromium launch timeout floor (seconds)
@@ -663,6 +664,18 @@ wait_for_load()
 print(js("[...document.querySelectorAll('article h2 a')].map(a => a.textContent.replace(/\\s+/g, ' ').trim())"))
 """)
 ```
+
+## Requiring Chromium sandboxing
+
+Set `browser.require_sandbox: true` to require Chromium's sandbox for both
+agent launches and the Bot Desktop Browser icon, including terminal sandboxes.
+The default preserves existing host/container launch behavior. Required mode
+rejects conflicting `chromium_args`, never retries with sandbox bypass, and needs
+an unprivileged browser account and working OS sandbox support. A launch failure
+must be repaired in that environment before retrying. This controls new launches;
+stop any existing browser and desktop before applying it. It does not attest an
+externally supplied CDP endpoint or change cloud-provider sandbox guarantees.
+
 
 ## Limitations
 
