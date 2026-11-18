@@ -48,6 +48,9 @@ BROWSER_ORPHAN_REAP_INTERVAL = 300
 MAX_INACTIVITY_CLEANUP_FAILURES = 3
 
 _active_sessions: dict[str, dict[str, Any]] = {}
+# A sandbox attachment owns its Chromium from the in-lock DevTools observation
+# until the browser record is published or released. Guarded by _cleanup_lock.
+_pending_sandbox_attachments: dict[str, tuple] = {}
 _session_last_activity: dict[str, float] = {}
 # Owner Hermes home per session: the janitor is one process-global thread, so each teardown re-enters the
 # OWNING profile's scope (#86402).
@@ -323,7 +326,7 @@ def _reuse_or_evict(cache_key: str) -> Optional[dict[str, Any]]:
     if not _lifecycle.session_has_expired(existing) and not _backend_dead(existing):
         return existing
     logger.info("Replacing expired or dead browser session for %s", cache_key)
-    _lifecycle.cleanup_single_session(cache_key)
+    _lifecycle.cleanup_single_session(cache_key, expected=existing)
     _lifecycle.update_session_activity(cache_key)  # teardown dropped the entry; track the replacement
     with _cleanup_lock:
         replacement = _active_sessions.get(cache_key)  # another thread may already have rebuilt it
@@ -336,6 +339,7 @@ def _publish(cache_key: str, session_info: dict[str, Any], home_key: str) -> dic
     session_info.setdefault("owner_task_id", owner_task_id(cache_key))
     session_info.setdefault("home_key", home_key)  # the profile reaped on /browser connect
     _active_sessions[cache_key] = session_info
+    _pending_sandbox_attachments.pop(session_info.get("session_name"), None)
     return session_info
 
 
