@@ -254,9 +254,11 @@ class SQLiteWorkerExecutionRepository:
         return SessionLifecycleStatus(self._value('session.lifecycle', {}, epoch, execution_id, session_id, generation,
                                                   sequence))
 
-    def set_session_system_prompt(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, system_prompt: str | None) -> None:
-        self._value('session.prompt', {'system_prompt': system_prompt}, epoch, execution_id, session_id, generation,
-                    sequence)
+    def set_session_system_prompt(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, system_prompt: str | None, managed_tools: list[str] | str | None = None) -> None:
+        payload: dict[str, JsonValue] = {'system_prompt': system_prompt}
+        if managed_tools is not None:
+            payload['managed_tools'] = managed_tools
+        self._value('session.prompt', payload, epoch, execution_id, session_id, generation, sequence)
 
     def patch_session_sidecars(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, patch: Mapping[str, JsonValue]) -> None:
         payload = {'patch': dict(patch) if isinstance(patch, Mapping) else patch}

@@ -340,11 +340,17 @@ class SessionTitlesConfigMixin:
         if row is not None:
             self._set_config(row, {**row["model_config"], YOLO_KEY: bool(enabled)})
 
-    def update_system_prompt(self, session_id: SessionId, system_prompt: Optional[str]) -> None:
+    def update_system_prompt(
+        self, session_id: SessionId, system_prompt: Optional[str], *, managed_tools: Any = None
+    ) -> None:
+        from agent.prompt_refresh import with_prompt_policy
+
         scope = self._backend.scope
         row = self._table(scope).get(session_id)
         if row is not None:
             row["system_prompt"] = system_prompt
+            if managed_tools is not None:
+                self._set_config(row, with_prompt_policy(row["model_config"], managed_tools))
 
     # ── prompt refresh epochs ─────────────────────────────────────────────
     # ``None`` keys the profile-wide epoch, a session id that session's own.

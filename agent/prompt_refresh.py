@@ -17,11 +17,17 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from persistence.conversation.sessions import PROMPT_MANAGED_TOOLS_KEY as MANAGED_TOOLS_KEY
 
 logger = logging.getLogger(__name__)
 
 # model_config key: the refresh epoch the session's stored prompt already satisfies.
 SESSION_EPOCH_KEY = "prompt_refresh_epoch"
+
+
+def with_prompt_policy(model_config: Any, policy: list[str] | str | None) -> Any:
+    """Carry the producing policy when the native row owner writes the prompt."""
+    return model_config if policy is None else {**(model_config or {}), MANAGED_TOOLS_KEY: policy}
 
 
 def requested_epoch(agent: Any) -> int:
