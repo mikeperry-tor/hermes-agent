@@ -383,7 +383,7 @@ function buildInteractiveSshArgs(conn, remoteCwd, connectTimeoutMs?, remoteComma
     return args
   }
 
-  const cwd = String(remoteCwd || '').trim()
+  const cwd = String(remoteCwd || '')
 
   if (cwd) {
     const q = `'${cwd.replace(/'/g, `'\\''`)}'`
