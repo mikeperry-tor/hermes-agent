@@ -3092,6 +3092,7 @@ browser:
   # Local Chromium launched by Hermes
   executable_path: ""            # Chromium binary override; "" = the packaged Chromium
   user_data_dir: ""              # Persistent profile shared by every session; "" = fresh profile per session
+  require_sandbox: false         # true = require Chromium's sandbox and refuse --no-sandbox bypass flags
   chromium_args: []              # Extra Chromium command-line flags, e.g. ["--lang=de-DE"]
   # Cloud browser selection (written by `hermes tools` → Browser Automation)
   cloud_provider: local          # local | browserbase | browser-use | firecrawl | nous | <provider plugin>; unset = autodetect from credentials
