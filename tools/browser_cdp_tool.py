@@ -376,6 +376,13 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     WebSocket instead — the only reliable way to evaluate inside an iframe where fresh per-call connections
     hit signed-URL expiry (Browserbase). Both paths share the same private-page/SSRF guard. Returns JSON
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
+    from tools.bot_desktop.placement import executor_only
+
+    try:
+        if executor_only():
+            return tool_error("The deployment does not allow raw external CDP connections")
+    except RuntimeError as exc:
+        return tool_error(str(exc))
     effective_task_id = task_id or "default"
 
     if frame_id:

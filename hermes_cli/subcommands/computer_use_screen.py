@@ -62,6 +62,9 @@ def _screen_stop(args) -> int:
 
 def _screen_install(args) -> int:
     from tools.bot_desktop import install, runtime
+    if refusal := install.placement_refusal():
+        print(f"Bot Desktop: {refusal}")
+        return 1
     if not runtime.is_supported_host():
         print("Bot Desktop screens run on Linux gateway hosts only.")
         return 1

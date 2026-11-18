@@ -43,6 +43,31 @@ def _setting() -> str:
     return value if value in ("auto", TERMINAL, GATEWAY) else "auto"
 
 
+def executor_only() -> bool:
+    """Deployment-owned selection for the desktop and its browser routes.
+
+    Intentionally managed-only (``/etc/hermes/config.yaml``) and omitted from user ``DEFAULT_CONFIG``.
+    """
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli.managed_scope import load_managed_config
+    from hermes_yaml import YAMLError
+
+    try:
+        desktop = load_managed_config(strict=True).get("bot_desktop", {})
+        if not isinstance(desktop, dict) or type(desktop.get("executor_only", False)) is not bool:
+            raise ValueError("managed bot_desktop.executor_only must be boolean")
+        return desktop.get("executor_only", False)
+    except (ConfigBackendUnavailable, OSError, ValueError, YAMLError) as exc:
+        raise RuntimeError("Could not validate the managed desktop policy; contact the deployment administrator") from exc
+
+
+def cua_executor_ready(*, probe_timeout: float = 4.0, deadline: Optional[float] = None) -> bool:
+    """Whether a managed-only terminal executor is reachable and has ``cua-driver``."""
+    from tools.bot_desktop import sandbox_host
+
+    return sandbox_host.ready_cua_executor(probe_timeout=probe_timeout, deadline=deadline) is not None
+
+
 def _terminal_backend() -> str:
     from tools.terminal_tool import _get_env_config
     return str(_get_env_config().get("env_type") or "local")
@@ -62,12 +87,21 @@ def _plugin_host_isolated() -> bool:
 
 
 def resolve() -> Placement:
-    # Backend first (env only): a local terminal IS the gateway host whatever the setting says, and that is
-    # the common case — it must not cost a config load (this runs on every browser / cua-driver spawn).
-    backend = _terminal_backend()
+    try:
+        required = executor_only()
+    except RuntimeError as exc:
+        return Placement(REFUSED, "", str(exc))
+    from tools.terminal_scope import TerminalPolicyUnavailable
+
+    try:
+        backend = _terminal_backend()
+    except TerminalPolicyUnavailable as exc:
+        return Placement(REFUSED, "", str(exc))
     if backend == "local":
+        if required:
+            return Placement(REFUSED, backend, "The deployment requires a desktop in the terminal executor")
         return Placement(GATEWAY, backend, "terminal.backend is local, so the terminal IS the gateway host")
-    setting = _setting()
+    setting = TERMINAL if required else _setting()
     if setting == GATEWAY:
         return Placement(GATEWAY, backend)
     if backend in _STREAM_BACKENDS:

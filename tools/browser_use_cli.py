@@ -146,7 +146,7 @@ class _CodeUrlVerdict(NamedTuple):
     local_sidecar: bool
 
 
-def _code_url_verdict(code: str) -> _CodeUrlVerdict:
+def _code_url_verdict(code: str, *, force_local: bool = False) -> _CodeUrlVerdict:
     """One pass over the code's URL literals: the blocking error, if any, and whether the call must run on
     the hybrid LOCAL sidecar. Each URL's routing predicate is evaluated ONCE and feeds both answers: it
     resolves DNS unmemoised, so a rebinding host evaluated twice could relax the private-address floor and
@@ -154,7 +154,7 @@ def _code_url_verdict(code: str) -> _CodeUrlVerdict:
     from tools.browser_url_policy import evaluate_url_safety, hybrid_routes_locally
     local_sidecar = False
     for url in _URL_RE.findall(code or ""):
-        routes_local = hybrid_routes_locally(url)
+        routes_local = force_local or hybrid_routes_locally(url)
         local_sidecar = local_sidecar or routes_local
         err = evaluate_url_safety(url, auto_local=routes_local)
         if err:
@@ -262,6 +262,13 @@ def browser_exec_available() -> bool:
     from tools.browser_session_cdp import get_cdp_override_raw
     from tools.browser_session_cloud import get_cloud_provider
 
+    try:
+        if placement.executor_only():
+            from tools.browser_use_executor import available
+            return available(require_ready=True)
+    except RuntimeError:
+        return False
+
     gateway = _find_cli() is not None
     if _has_cdp_env(os.environ) or get_cdp_override_raw() or using_lightpanda_engine():
         return gateway
@@ -368,12 +375,17 @@ def _sandbox_executor_ready() -> bool:
     """Whether the active sandbox browser has an in-sandbox ``browser-harness`` to run ``browser_exec``.
 
     Stock sandbox images (such as ``nousresearch/hermes-sandbox:desktop``) run Chromium inside the
-    sandbox without preinstalling ``browser-harness``; when absent, the gateway host drives that
-    Chromium over the forwarded ``BU_CDP_WS`` tunnel.
+    sandbox without preinstalling ``browser-harness``; when absent and ``executor_only`` is false,
+    the gateway host drives that Chromium over the forwarded ``BU_CDP_WS`` tunnel.
     """
     from tools.bot_desktop import placement, runtime
     from tools.browser_use_executor import available
 
+    try:
+        if placement.executor_only():
+            return True
+    except RuntimeError:
+        return False
     env = runtime._owned_sandbox_env(reattach=False) or placement.terminal_environment(create=False)
     return available(require_ready=True, env=env)
 
@@ -839,6 +851,20 @@ def _needs_gateway_harness(env: dict, local: bool, local_sidecar: bool) -> bool:
             or (not local_sidecar and _quiet(get_cloud_provider, None) is not None))
 
 
+def _execute_required_browser(code: str, session: str, timeout_s: int, task_id: Optional[str], local: bool):
+    from tools.registry import tool_error
+
+    if local:
+        return tool_error("The deployment requires a browser in the terminal executor")
+    if session and not _SESSION_RE.fullmatch(session):
+        return tool_error("Invalid session name: use 1-64 letters, digits, dashes or underscores")
+    if blocked := _code_url_verdict(code, force_local=True).blocked:
+        return tool_error(blocked)
+    from tools.browser_use_executor import execute
+    _exec_local_engine.set("local")
+    return execute(_backend_cache_key(task_id, session), code, session, timeout_s, task_id)
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
@@ -847,6 +873,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     # A direct (non-dispatch) entry meets the same allowlist, before any setup.
     if refusal := hosted_tool_refusal("browser_exec") or _no_code_error(code):
         return tool_error(refusal)
+
+    from tools.bot_desktop.placement import executor_only
+    try:
+        required = executor_only()
+    except RuntimeError as exc:
+        return tool_error(str(exc))
+    if required:
+        return _execute_required_browser(code, session, timeout_s, task_id, local)
 
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
     # evaluation could relax the floor and still pick the cloud for a rebinding host.
@@ -1048,10 +1082,10 @@ _HELPERS_DIGEST = (
 )
 
 
-def _description_header() -> str:
+def _description_header(*, executor_chromium: bool = False) -> str:
     """Header tailored to whether screenshots ride back natively in this tool's results."""
-    if _lazy_call("tools.browser_lightpanda", "lightpanda_engine_status", (False, ""),
-                  "lightpanda engine status unavailable")[0]:  # no screenshots, whatever the model sees
+    if not executor_chromium and _lazy_call("tools.browser_lightpanda", "lightpanda_engine_status", (False, ""),
+                                           "lightpanda engine status unavailable")[0]:
         return _HEADER_BASE + _HEADER_LIGHTPANDA
     if _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, ""):
         return _HEADER_BASE + _HEADER_VISION
@@ -1059,6 +1093,10 @@ def _description_header() -> str:
 
 
 def _dynamic_schema_overrides() -> dict:
+    from tools.bot_desktop.placement import executor_only
+
+    if executor_only():
+        return {"description": _description_header(executor_chromium=True) + _HELPERS_DIGEST}
     overrides: dict = {"description": _description_header() + _HELPERS_DIGEST}
     # ``local`` exists ONLY when the user consented to real-profile browsing — everyone
     # else's schema carries zero extra surface. The caller memoizes on config.yaml mtime,
