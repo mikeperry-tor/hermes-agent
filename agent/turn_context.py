@@ -615,6 +615,11 @@ def _refresh_mcp_tools_between_turns(agent: Any) -> None:
         if "tools.connectors.mcp" in sys.modules:
             from tools.connectors.mcp import adopt_late_connections
             adopt_late_connections(agent)
+        from toolsets import managed_tool_selection_changed
+        if managed_tool_selection_changed(agent):
+            from tools.mcp_tool_agent import refresh_agent_mcp_tools
+            refresh_agent_mcp_tools(agent, quiet_mode=True)
+            return
         # Import-cost gate: MCP tools are only registered by code that already imported
         # ``tools.mcp_tool`` (~0.4s); not in sys.modules => nothing to do.
         if not getattr(agent, "_skip_mcp_refresh", False) and "tools.mcp_tool" in sys.modules:

@@ -83,17 +83,28 @@ def issue_side_question_token(agent: Any, messages: list[dict[str, Any]], turn_i
 
     if is_unattended_turn(agent) or not _consented_plugin_loaded():
         return None
-    capture = SideQuestionCapture(
-        parent_ref=weakref.ref(agent),
-        messages=copy.deepcopy(messages),
-        system_prompt=agent._cached_system_prompt,
-        system_prompt_static=getattr(agent, "_cached_system_prompt_static", None),
-        tools=copy.deepcopy(agent.tools or []),
-        session_id=agent.session_id,
-        turn_id=turn_id,
-        runtime=runtime_key(agent),
-        context=contextvars.copy_context(),
-    )
+    from tools.hosted_tool_policy import managed_disabled_tools
+    from tools.mcp_tool_agent import _agent_tools_lock
+    from toolsets import managed_tool_policy_key, managed_tool_snapshot_key
+
+    transcript = copy.deepcopy(messages)
+    with _agent_tools_lock:
+        policy = managed_tool_snapshot_key(agent)
+        if (policy != managed_tool_policy_key(managed_disabled_tools())
+                or getattr(agent, "_prompt_managed_tools", []) != policy):
+            return None
+        capture = SideQuestionCapture(
+            parent_ref=weakref.ref(agent),
+            messages=transcript,
+            system_prompt=agent._cached_system_prompt,
+            system_prompt_static=getattr(agent, "_cached_system_prompt_static", None),
+            tools=copy.deepcopy(agent.tools or []),
+            session_id=agent.session_id,
+            turn_id=turn_id,
+            runtime=runtime_key(agent),
+            context=contextvars.copy_context(),
+            managed_tool_policy=policy,
+        )
     token = secrets.token_urlsafe(24)
     now = time.monotonic()
     with _lock:

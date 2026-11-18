@@ -88,11 +88,13 @@ def _raw(*names: str) -> list[dict]:
 def _session_defs(names, *, tool_search="auto"):
     """A stand-in for ``model_tools.get_tool_definitions`` over ``names``: raw when asked to skip
     Tool Search, else assembled by the real ``assemble_tool_defs``."""
+    from tools.hosted_tool_policy import CURRENT_MANAGED_POLICY, discovery_tool_filter
     from tools.tool_search import ToolSearchConfig, assemble_tool_defs
 
     def get_tool_definitions(enabled_toolsets=None, disabled_toolsets=None, quiet_mode=False,
-                             skip_tool_search_assembly=False):
-        raw = _raw(*names)
+                             skip_tool_search_assembly=False, *, managed_policy=CURRENT_MANAGED_POLICY):
+        permitted = discovery_tool_filter(managed_policy)
+        raw = _raw(*(name for name in names if permitted(name)))
         if skip_tool_search_assembly:
             return raw
         return assemble_tool_defs(raw, config=ToolSearchConfig.from_raw({"enabled": tool_search})).tool_defs

@@ -3501,7 +3501,13 @@ selection. Profiles cannot repoint it through `.env` or user configuration. An
 absent managed document or the explicit empty mapping `{}` adds no denial.
 A present blank, null, malformed or unreadable document refuses tool operations
 until repaired. Discovery reports the policy failure without exposing its contents.
-Inspection and repair remain available. Changes follow the native managed-file
-cache and affect subsequent discovery and dispatch.
-Remote configuration backends that do not honor native
+Inspection and repair remain available. Changes follow the
+native managed-file cache and affect subsequent discovery and dispatch. Resumed
+and live sessions refresh tool definitions and generated prompt guidance when the
+policy changes, including same-model review and `/btw` forks. Bot Chat can still
+reply to incoming messages when outbound messaging is disabled. Kanban workers
+receive guidance for the operations their tool list supports. Plugin requests
+that require the captured prompt and tools return a refusal if their captured
+policy is out of date. Stable policy preserves the normal session cache, and
+conversation history is retained. Remote configuration backends that do not honor native
 managed files retain their existing authority and ignore this option.

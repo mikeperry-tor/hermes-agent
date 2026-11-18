@@ -24,8 +24,10 @@ import agent.background_review as bg
 
 
 def _review_agent(memory_enabled=True, user_profile_enabled=False) -> SimpleNamespace:
-    """The whitelist only reads the profile's memory flags off the fork."""
-    return SimpleNamespace(_memory_enabled=memory_enabled, _user_profile_enabled=user_profile_enabled)
+    return SimpleNamespace(
+        _memory_enabled=memory_enabled, _user_profile_enabled=user_profile_enabled,
+        tools=[{"function": {"name": name}} for name in ("memory", "skill_manage")],
+    )
 
 
 class TestReviewToolWhitelistScope:
@@ -48,6 +50,14 @@ class TestReviewToolWhitelistScope:
         # skill review that used memory nobody asked it to touch.
         whitelist, _extra = bg._review_tool_whitelist(_review_agent(), None)
         assert "memory" not in whitelist
+
+
+def test_stock_review_keeps_only_tasks_supported_by_its_tools():
+    review = bg._COMBINED_REVIEW_PROMPT
+    skills = {"skills_list", "skill_view", "skill_manage"}
+    assert bg._permitted_review_prompt(review, {"memory"}) == bg._MEMORY_REVIEW_PROMPT
+    assert bg._permitted_review_prompt(review, skills) == bg._SKILL_REVIEW_PROMPT
+    assert bg._permitted_review_prompt(review, skills | {"memory"}) == review
 
 
 class TestSpawnForwardsScope:

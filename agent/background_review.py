@@ -1047,21 +1047,24 @@ def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iteratio
     return kwargs
 
 
-# Above any live registry generation: _publish_tool_snapshot refuses an older-generation rebuild,
-# so the compaction-boundary refresh_agent_mcp_tools(content_aware=True) cannot rebuild the fork's
-# tools[] from the live registry and drop the inherited provider/plugin tools (#103579).
-_FROZEN_TOOL_SNAPSHOT_GENERATION = 2_147_483_647
+def _inherit_parent_prefix(review_agent: Any, agent: Any) -> None:
+    """Reuse warm bytes only when the cached prompt and schemas carry present authority."""
+    from tools.hosted_tool_policy import managed_disabled_tools
+    from tools.mcp_tool_agent import FROZEN_TOOL_SNAPSHOT_GENERATION, _agent_tools_lock
+    from toolsets import managed_tool_policy_key, managed_tool_snapshot_key
 
-
-def _inherit_parent_tool_surface(review_agent: Any, agent: Any) -> None:
-    """Same-model fork: advertise the parent's exact tools[] (its last outbound payload — an
-    empty list included) so the request prefix matches byte-for-byte, then freeze the snapshot
-    generation. Dispatch stays behind the review whitelist; advertising is not permission."""
-    # getattr: /btw and review callers build bare object.__new__ agents in tests without ``tools``.
-    review_agent.tools = copy.deepcopy(getattr(agent, "tools", None) or [])
-    review_agent.valid_tool_names = {tool["function"]["name"] for tool in review_agent.tools}
-    review_agent._tool_snapshot_generation = _FROZEN_TOOL_SNAPSHOT_GENERATION
-
+    with _agent_tools_lock:
+        policy = managed_tool_policy_key(managed_disabled_tools())
+        if (managed_tool_snapshot_key(agent) != policy or managed_tool_snapshot_key(review_agent) != policy
+                or getattr(agent, "_prompt_managed_tools", []) != policy):
+            return
+        review_agent._cached_system_prompt = agent._cached_system_prompt
+        review_agent._cached_system_prompt_static = getattr(agent, "_cached_system_prompt_static", None)
+        review_agent._prompt_managed_tools = policy
+        review_agent._prompt_refresh_epoch = 0  # detached forks have no saved refresh epoch
+        review_agent.tools = copy.deepcopy(getattr(agent, "tools", None) or [])
+        review_agent.valid_tool_names = {tool["function"]["name"] for tool in (getattr(review_agent, "tools", None) or [])}
+        review_agent._tool_snapshot_generation = FROZEN_TOOL_SNAPSHOT_GENERATION
 
 
 def build_cache_parity_fork(
@@ -1126,7 +1129,6 @@ def build_cache_parity_fork(
     # model the parent's cached prompt is for the wrong model/cache key and would miss anyway, so let the
     # routed fork build its own.
     if not _routed:
-        review_agent._cached_system_prompt = agent._cached_system_prompt
         review_agent.session_start = agent.session_start
         # Cache-scope parity (#109964): the fork shares the parent's physical session_id and
         # byte-identical prefix, but is _persist_disabled (declared scope fails closed) and
@@ -1149,7 +1151,7 @@ def build_cache_parity_fork(
         # _conversation_root_id() falls back to the parent's PHYSICAL id, so after a compression
         # rotation the review's usage was attributed to a different conversation than its parent.
         review_agent._cached_conversation_root = agent._conversation_root_id()
-        _inherit_parent_tool_surface(review_agent, agent)
+        _inherit_parent_prefix(review_agent, agent)
     _detach_fork_compression(review_agent)
     # Compaction bounds a single request; this bounds the WHOLE review (checked in
     # conversation_loop via _review_input_budget_exhausted).
@@ -1249,7 +1251,28 @@ def _review_tool_whitelist(
             configured_extra_tools = {name.strip() for name in extra_raw if isinstance(name, str) and name.strip()}
     except Exception:
         logger.debug("background_review extra_tools parse failed", exc_info=True)
-    return whitelist | configured_extra_tools, configured_extra_tools
+    from toolsets import session_tool_discovery_filter
+
+    allowed = session_tool_discovery_filter(review_agent)
+    advertised = {tool["function"]["name"] for tool in (getattr(review_agent, "tools", None) or [])}
+    candidates = (whitelist | configured_extra_tools) & advertised
+    permitted = {name for name in candidates if allowed(name)}
+    return permitted, configured_extra_tools & permitted
+
+
+def _permitted_review_prompt(prompt: str, allowed: set[str]) -> str:
+    """Select the stock review tasks whose required tools are available to the fork."""
+    if prompt not in (_MEMORY_REVIEW_PROMPT, _SKILL_REVIEW_PROMPT, _COMBINED_REVIEW_PROMPT):
+        return prompt
+    memory = prompt != _SKILL_REVIEW_PROMPT and "memory" in allowed
+    skills = prompt != _MEMORY_REVIEW_PROMPT and {"skill_view", "skills_list", "skill_manage"} <= allowed
+    if memory and skills:
+        return _COMBINED_REVIEW_PROMPT
+    if memory:
+        return _MEMORY_REVIEW_PROMPT
+    if skills:
+        return _SKILL_REVIEW_PROMPT
+    return "The tools needed to save memory or edit skills are unavailable. Summarize any useful findings."
 
 
 @dataclass
@@ -1298,22 +1321,13 @@ def _run_review_fork(
     st.review_agent._review_attended = explicit
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
-    review_whitelist, configured_extra_tools = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
-    extra_list = ", ".join(sorted(configured_extra_tools))
-    deny_extra = f" Configured extra tools also allowed: {extra_list}." if configured_extra_tools else ""
-    prompt_extra = f" Exception — these configured tools are also allowed: {extra_list}." if configured_extra_tools else ""
-    # Keep the deny/prompt wording in sync with the whitelist: a memory-less review must not
-    # tell the model that memory is available, or it will burn iterations on denied calls.
-    memory_phrase_deny = " and memory for notes (add only)" if "memory" in review_whitelist else ""
-    memory_phrase_prompt = "memory and skill " if "memory" in review_whitelist else "skill "
+    review_whitelist, _ = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
+    prompt = _permitted_review_prompt(prompt, review_whitelist)
+    names = ", ".join(sorted(review_whitelist))
+    guidance = f"Use only these tools for this review: {names}." if names else "No tools are available for this review."
     set_thread_tool_whitelist(
         review_whitelist,
-        deny_msg_fmt=(
-            "Background review denied non-whitelisted tool: "
-            "{tool_name}. Allowed here: skill_view/skills_list/read_file/search_files to read, "
-            "skill_manage(action='patch'|...) to change skills"
-            + memory_phrase_deny + "." + deny_extra + " Do not retry {tool_name}."
-        ),
+        deny_msg_fmt="Background review denied {tool_name}. " + guidance + " Do not retry {tool_name}.",
     )
     with suppress(Exception):
         from tools.skill_manager_guards import _reset_background_review_read_marks
@@ -1323,11 +1337,7 @@ def _run_review_fork(
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
             st.review_agent.run_conversation(
-                user_message=(
-                    prompt + "\n\nYou can only call " + memory_phrase_prompt +
-                    "management tools. Other tools will be denied "
-                    "at runtime — do not attempt them." + prompt_extra
-                ),
+                user_message=prompt + "\n\n" + guidance,
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
     finally:

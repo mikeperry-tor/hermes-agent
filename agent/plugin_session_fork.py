@@ -427,17 +427,6 @@ def interrupt_plugin_forks(agent: Any, *, message: str, tool_reason: str) -> lis
     return [job.run for job in jobs]
 
 
-def _pin_capture(fork: Any, capture: Any) -> None:
-    """Same-model fork: replay the captured request inputs byte-for-byte (cache parity)."""
-    import copy
-
-    fork._cached_system_prompt = capture.system_prompt
-    fork._cached_system_prompt_static = capture.system_prompt_static
-    fork.tools = copy.deepcopy(capture.tools)
-    fork.valid_tool_names = {tool["function"]["name"] for tool in fork.tools}
-    fork._prompt_cache_fork_tag = PLUGIN_FORK_TASK
-
-
 def _called_tool(tc: dict) -> Optional[str]:
     """The tool a call runs: its own name, or a ``tool_call`` carrier's single target (the only
     form the executor unwraps; the dispatch guard then checks the target, never the bridge)."""
@@ -513,7 +502,11 @@ def _run_job(job: _ForkJob) -> None:
                 outcome = f"refused:{refusal}"
                 return
             if not routed:
-                _pin_capture(fork, capture)
+                if not capture.policy_matches(fork):
+                    outcome = "refused:policy_changed"
+                    return
+                capture.pin_prefix(fork)
+                fork._prompt_cache_fork_tag = PLUGIN_FORK_TASK
             fork.session_id = capture.session_id
             # The ceiling is the user's own review bound (auxiliary.background_review), never the
             # fork's routing block: that is {} without ``task`` and the plugin's own defaults with one.

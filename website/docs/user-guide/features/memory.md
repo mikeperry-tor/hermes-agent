@@ -482,11 +482,12 @@ auxiliary:
       - propose_shared_memory
 ```
 
-The tool must already be available to the parent agent; this setting only adds
-it to the review fork's runtime whitelist. It does not enable arbitrary tools,
-and tools not listed here remain denied. Keep the list narrow and prefer tools
-that stage a proposal for human review rather than applying external or
-destructive changes directly. The default is an empty list.
+The tool must appear in the fork's effective tool definitions and be allowed by
+the deployment's managed policy. This setting adds the eligible name to the
+review's runtime whitelist. The review prompt and denial message list tools
+from that same whitelist. Automatic review requests memory and skill operations
+only when their required tools are available. Keep the list narrow and prefer tools that stage a
+proposal for human review. The default is an empty list.
 
 ### Local models: reviews wait for an idle GPU (`defer`)
 
