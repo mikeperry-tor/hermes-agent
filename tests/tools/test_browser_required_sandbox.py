@@ -24,3 +24,26 @@ def test_required_sandbox_rejects_conflicting_flags(monkeypatch, origin):
     with pytest.raises(ValueError, match='conflicts'):
         launcher.build_chromium_argv('chrome', '/profile', packaged=False, headed=True,
                                      sandbox_bypass=True, extra_args=['--no-sandbox'] if origin == 'extra' else [])
+
+
+def test_sandbox_chromium_preserves_repeated_arg_values_and_validates_config_key(monkeypatch):
+    import subprocess
+    from hermes_cli.config import _validate_config_key
+    from tools import browser_session_sandbox
+    from tools.environments import streams
+
+    assert _validate_config_key('browser.require_sandbox') == (True, None)
+
+    commands = []
+    monkeypatch.setattr(
+        streams,
+        'run_in',
+        lambda _env, argv, **_kw: (commands.append(argv), subprocess.CompletedProcess(argv, 0, b'4242 999\n', b''))[1],
+    )
+    monkeypatch.setattr(
+        browser_session_cloud,
+        'browser_section',
+        lambda: {'chromium_args': ['--window-position', '0', '--window-size', '0']},
+    )
+    assert browser_session_sandbox._start_chromium(object(), None, '/usr/bin/chromium', '/tmp/p', {'DISPLAY': ':5'}) == (4242, '999')
+    assert '--window-position 0 --window-size 0' in commands[-1][-1]
