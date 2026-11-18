@@ -86,7 +86,10 @@ def sandbox_screen(home, backend, monkeypatch):
                                                   "container": env._container_id, "docker": "docker"}))
     monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: env)
     monkeypatch.setattr(placement, "_setting", lambda: "terminal")
+    from tools.environments import docker
     monkeypatch.setattr(placement, "_terminal_backend", lambda: "docker")
+    monkeypatch.setattr(docker, "find_docker", lambda: "docker")
+    monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda marker: True)
     return env
 
 
@@ -177,8 +180,8 @@ def test_browser_and_cua_driver_envs_carry_none_of_the_backend_values(sandbox_sc
 
 
 def test_a_host_cua_driver_never_gets_this_machines_seat_for_a_sandbox_hosted_screen(sandbox_screen, monkeypatch):
-    """bounded / unrestricted computer_use runs its embedded daemon on THIS machine even under terminal placement:
-    with no display it fails, where the seat would put an approval-bypassed driver on the human's own desktop."""
+    """An existing sandbox screen still owns display selection after a gateway placement change."""
+    monkeypatch.setattr(placement, "_setting", lambda: "gateway")
     for key, value in {"DISPLAY": ":0", "XAUTHORITY": "/home/u/.Xauthority",
                        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/u/bus"}.items():
         monkeypatch.setenv(key, value)
@@ -223,14 +226,13 @@ def test_processes_inside_the_backend_still_receive_the_published_values(sandbox
 
     from tools import browser_session_sandbox
     env, published = browser_session_sandbox._sandbox()
-    assert env is sandbox_screen and published == LAUNCHER_VALUES
+    assert env.container == sandbox_screen._container_id and published == LAUNCHER_VALUES
 
     from tools.computer_use import cua_backend
-    monkeypatch.setattr(streams, "exec_prefix", lambda e, *, user=None, interactive=True:
-                        ["docker", "exec", "-i", e._container_id])
     invocation = cua_backend.sandbox_mcp_invocation()
     assert invocation is not None
-    (command, args), child_env = invocation
+    (command, args), child_env, (owner, display) = invocation
+    assert owner is env and display == published
     assert command == "docker" and "cua-driver mcp" in args[-1]
     for key, value in LAUNCHER_VALUES.items():
         assert f"export {key}=" in args[-1] and value in args[-1], key

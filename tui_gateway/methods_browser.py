@@ -95,8 +95,14 @@ def _reap_profile_browsers() -> None:
 def _browser_connect(rid, params: dict) -> dict:
     import platform
     from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL
+    from tools.bot_desktop.placement import executor_only
     from tools.browser_session_cdp import set_live_cdp_override
     from urllib.parse import urlparse
+    try:
+        if executor_only():
+            return _err(rid, 4015, "The deployment does not allow external CDP connections")
+    except RuntimeError as exc:
+        return _err(rid, 4015, str(exc))
     raw_url = params.get("url")
     if raw_url is not None and not isinstance(raw_url, str):
         return _err(rid, 4015, f"browser url must be a string, got {type(raw_url).__name__}")

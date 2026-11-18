@@ -534,6 +534,10 @@ def published_env() -> dict[str, str]:
     from tools.bot_desktop import sandbox_host
     if sandbox_host._read_marker():
         return _sandbox_published_env()
+    return _gateway_published_env()
+
+
+def _gateway_published_env() -> dict[str, str]:
     if _launcher_pid() is None:
         return {}
     raw = _read(state_dir() / "env")
@@ -562,52 +566,63 @@ def in_sandbox() -> bool:
     return placement.resolve().where == placement.TERMINAL
 
 
-def sandbox_screen_running() -> bool:
-    """True when a sandbox-hosted screen is UP for this profile: the start marker exists AND the sandbox it
-    names is alive — registered in this process, or (after a gateway restart emptied the registry) the
-    marker's recorded container still running. Only a sandbox that is provably gone (its container removed
-    out from under us) drops the marker, so the next start rebuilds instead of the browser exec-ing into a
-    dead container; an unregistered-but-alive one is re-attached by ``_sandbox_env(create=True)`` at the
-    next spawn (the terminal planner reuses the persisted container by label)."""
+def observation_placement() -> placement.Placement:
+    """Choose the allowed viewing route without starting a screen."""
     from tools.bot_desktop import sandbox_host
-    marker = sandbox_host._read_marker()
-    if not marker:
-        return False
-    if _sandbox_env(create=False) is not None:
-        return True
-    if sandbox_host.marker_sandbox_alive(marker):
-        return True
-    sandbox_host._marker().unlink(missing_ok=True)
-    return False
+
+    where = placement.resolve()
+    if where.where == placement.GATEWAY and sandbox_host._read_marker():
+        return placement.Placement(placement.TERMINAL, where.backend)
+    return where
+
+
+def sandbox_screen_running() -> bool:
+    """Report the recorded owner without provisioning a new terminal environment."""
+    return _owned_sandbox_env(reattach=False) is not None
 
 
 def _owned_sandbox_env(*, reattach: bool = True):
-    """The environment hosting the screen the marker records, re-attaching after a restart when the recorded
-    sandbox is still alive; None when there is no marker or its sandbox is gone. Never builds a sandbox for
-    a screen that is not there."""
+    """Use the recorded container or verify the exact target before reattaching over SSH."""
     from tools.bot_desktop import sandbox_host
+    from tools.environments.ssh import ssh_config_options
+    from tools.terminal_tool import _get_env_config
+
     marker = sandbox_host._read_marker()
     if not marker:
         return None
+    backend = placement._terminal_backend()
+    if marker.get("container"):
+        if backend != "docker":
+            return None
+        return sandbox_host.recorded_docker(marker)
     env = _sandbox_env(create=False)
-    if env is not None:
-        return env
-    if reattach and sandbox_host.marker_sandbox_alive(marker):
-        return _sandbox_env(create=True)
-    return None
+    if marker.get("ssh"):
+        if backend != "ssh":
+            return None
+        cfg = _get_env_config()
+        try:
+            options = ssh_config_options(cfg["ssh_config"])
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        expected = sandbox_host.ssh_owner(cfg["ssh_host"], cfg["ssh_user"], cfg["ssh_port"], cfg["ssh_key"], options)
+        if expected != marker["ssh"]:
+            return None
+        if env is None and reattach:
+            env = _sandbox_env(create=True)
+    if env is None:
+        return None
+    identity = sandbox_host._owner_identity(env)
+    return env if identity and all(marker.get(key) == value for key, value in identity.items()) else None
 
 
 def is_running() -> bool:
     return bool(published_env().get("DISPLAY"))
 
 
-def open_rfb_stream() -> subprocess.Popen:
-    """Popen whose stdin/stdout carry RFB bytes for a sandbox-hosted screen (``in_sandbox()`` only)."""
+def open_rfb_stream(env, profile: str) -> subprocess.Popen:
+    """Open an RFB relay in the already acquired sandbox owning this profile's screen."""
     from tools.bot_desktop import sandbox_host
-    env = _sandbox_env(create=False)
-    if env is None:
-        raise RuntimeError("the sandbox hosting this screen is not running")
-    return sandbox_host.open_rfb_stream(env, _profile_name())
+    return sandbox_host.open_rfb_stream(env, profile)
 
 
 def geometry() -> str:
@@ -619,15 +634,16 @@ def geometry() -> str:
 def status(profile: Optional[str] = None) -> DesktopStatus:
     from tools.bot_desktop import browser as _bd_browser
     from tools.bot_desktop import resources
-    from tools.bot_desktop import sandbox_host
-    where = placement.resolve()
-    if where.where == placement.TERMINAL or sandbox_host._read_marker():
-        # A screen already running inside a sandbox is reported (and stoppable) even after the placement
-        # setting moved: the recorded owner wins over the current policy until it is stopped.
+    where = observation_placement()
+    if where.where == placement.REFUSED:
+        return DesktopStatus(profile or _profile_name(), False, False, [], False,
+                             None, None, None, "1440x900", None, None,
+                             blocker=where.reason, placement=placement.REFUSED)
+    if where.where == placement.TERMINAL:
         return _sandbox_status(profile, where)
     missing: list[str] = missing_binaries() if is_supported_host() else list(REQUIRED_BINARIES)
     pid = _launcher_pid()
-    env = published_env()
+    env = _gateway_published_env()
     running = pid is not None and bool(env.get("DISPLAY"))
     mem = resources.memory_info() if is_supported_host() else resources.MemoryInfo(None, None)
     return DesktopStatus(
@@ -653,18 +669,22 @@ def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
     """Inspect sandbox dependencies, retaining native owner reattachment.
     Unavailable dependencies remain unknown; never install host dependencies here."""
     from tools.bot_desktop import sandbox_host
+    marker = sandbox_host._read_marker()
     probe_error = None
     display_error = None
     missing = []
     published = {}
     inspection_failed = "Could not inspect desktop dependencies; check the terminal sandbox connection and retry."
     try:
-        env = _owned_sandbox_env() or _sandbox_env(create=False)
+        env = _owned_sandbox_env() if marker else _sandbox_env(create=False)
     except (OSError, RuntimeError, subprocess.SubprocessError):
         env = None
         probe_error = inspection_failed
     if env is None:
-        probe_error = probe_error or "Start the desktop to inspect its terminal sandbox dependencies."
+        probe_error = probe_error or (
+            "Start the desktop to inspect its terminal sandbox dependencies."
+            if not marker else "Restore the recorded desktop's terminal settings and stop it before starting another."
+        )
     else:
         try:
             missing = sandbox_host.missing_binaries(env)
@@ -769,7 +789,13 @@ def start(*, wait_seconds: float = 15.0) -> DesktopStatus:
     sd.mkdir(parents=True, exist_ok=True)
     os.chmod(sd, 0o700)
     with _flocked(sd / "start.lock"):
-        if _launcher_pid() is not None and published_env().get("DISPLAY"):
+        from tools.bot_desktop import sandbox_host
+        marker = sandbox_host._read_marker()
+        if marker:
+            if not marker.get("container") or sandbox_host.marker_sandbox_alive(marker) is not False:
+                raise RuntimeError("Stop the current terminal desktop before starting a desktop on the gateway")
+            sandbox_host._marker().unlink(missing_ok=True)
+        if _launcher_pid() is not None and _gateway_published_env().get("DISPLAY"):
             return status()
         from tools.bot_desktop import resources
         floor = resources.min_free_mb()
@@ -879,13 +905,22 @@ def _sandbox_env(*, create: bool):
 
 def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
     from tools.bot_desktop import sandbox_host
-    env = _sandbox_env(create=True)
-    if env is None:
-        raise RuntimeError("the terminal backend's sandbox could not be started, so there is nowhere to put the screen")
     sd = state_dir()
     sd.mkdir(parents=True, exist_ok=True)
     os.chmod(sd, 0o700)
     with _flocked(sd / "start.lock"):
+        if _launcher_pid() is not None:
+            raise RuntimeError("Stop the current gateway desktop before starting a desktop in the terminal executor")
+        marker = sandbox_host._read_marker()
+        env = _owned_sandbox_env() if marker else None
+        if marker and env is None:
+            if not marker.get("container") or sandbox_host.marker_sandbox_alive(marker) is not False:
+                raise RuntimeError("Restore the recorded desktop's terminal settings and stop it before starting another")
+            sandbox_host._marker().unlink(missing_ok=True)
+        if env is None:
+            env = _sandbox_env(create=True)
+        if env is None:
+            raise RuntimeError("The terminal sandbox could not be started")
         # The dock's Browser icon runs the sandbox's own Playwright Chromium on the profile the agent's browser
         # uses there: the human's browser is the bot's browser, as on the host.
         from tools.bot_desktop.browser import dock_exec_line
@@ -893,16 +928,16 @@ def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
         browser = (exe, dock_exec_line(exe, sandbox_host.browser_profile_dir(env), sandbox_bypass=True)) if exe else (None, None)
         published = sandbox_host.start(env, _profile_name(), geometry=geometry(), wait_seconds=max(wait_seconds, 20.0),
                                        browser_exec=browser[0], browser_exec_line=browser[1])
-    (sd / "env").write_text("".join(f"{k}={v}\n" for k, v in published.items()), encoding="utf-8")
-    touch_activity()
-    return status()
+        (sd / "env").write_text("".join(f"{k}={v}\n" for k, v in published.items()), encoding="utf-8")
+        touch_activity()
+        return status()
 
 
 def tool_sandbox(*, reattach: bool = True):
     """Read and act through the same verified environment that owns this profile's display."""
     from tools.bot_desktop import sandbox_host
 
-    env = _owned_sandbox_env(reattach=reattach) or _sandbox_env(create=reattach)
+    env = _owned_sandbox_env(reattach=reattach)
     if env is None:
         raise RuntimeError("The recorded terminal desktop is unavailable; restore its terminal settings")
     published = sandbox_host.published_env(env, _profile_name(), strict=True)
@@ -914,13 +949,13 @@ def tool_sandbox(*, reattach: bool = True):
 def owns_tool_sandbox(env) -> bool:
     """Revalidate a queued tool or companion operation without warming a new environment."""
     return (env is not None and placement.resolve().where == placement.TERMINAL
-            and (_owned_sandbox_env(reattach=False) or _sandbox_env(create=False)) is env)
+            and _owned_sandbox_env(reattach=False) is env)
 
 
 def _sandbox_published_env() -> dict[str, str]:
     """Published env of a sandbox-hosted screen (the caller saw the host-side marker written at start)."""
     from tools.bot_desktop import sandbox_host
-    env = _sandbox_env(create=False)
+    env = _owned_sandbox_env(reattach=False)
     if env is None:
         return {}
     return sandbox_host.published_env(env, _profile_name())
@@ -931,26 +966,25 @@ def stop(still_due: Optional[Callable[[], bool]] = None) -> bool:
     was signalled. ``still_due`` is asked again before anything is killed (under ``start.lock`` for a screen on
     this host); False there leaves the screen running."""
     from tools.bot_desktop import sandbox_host
-    if sandbox_host._read_marker() or placement.resolve().where == placement.TERMINAL:
-        if still_due is not None and not still_due():
-            return False
-        # The marker names the sandbox that owns the screen; stop THAT one (re-attaching after a restart),
-        # whatever the placement setting says now. A marker whose sandbox is gone is simply dropped.
-        env = _owned_sandbox_env()
-        stopped = sandbox_host.stop(env, _profile_name()) if env is not None else False
-        sandbox_host._marker().unlink(missing_ok=True)
-        for name in ("env", "activity"):
-            (state_dir() / name).unlink(missing_ok=True)
-        return stopped
-    if not is_supported_host():
-        return False
+
     sd = state_dir()
+    if not sd.exists() and not is_supported_host():
+        return False
     sd.mkdir(parents=True, exist_ok=True)
     with _flocked(sd / "start.lock"):
         if still_due is not None and not still_due():
-            logger.info("Bot Desktop for profile %s changed while the idle stop waited; kept", _profile_name())
             return False
-        return _stop_locked(sd)
+        marker = sandbox_host._read_marker()
+        if marker:
+            env = _owned_sandbox_env()
+            if env is None and (not marker.get("container") or sandbox_host.marker_sandbox_alive(marker) is not False):
+                raise RuntimeError("Could not stop the recorded desktop; restore its terminal settings and retry")
+            stopped = sandbox_host.stop(env, _profile_name()) if env is not None else False
+            sandbox_host._marker().unlink(missing_ok=True)
+            for name in ("env", "activity"):
+                (sd / name).unlink(missing_ok=True)
+            return stopped
+        return _stop_locked(sd) if is_supported_host() else False
 
 
 def _stop_locked(sd: Path) -> bool:

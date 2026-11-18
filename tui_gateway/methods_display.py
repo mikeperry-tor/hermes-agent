@@ -155,11 +155,17 @@ def _(rid, params: dict) -> dict:
     from hermes_constants import get_hermes_home
     from hermes_cli.dashboard_auth.ws_tickets import mint_ticket
     from hermes_cli.web_session_sockets import admission_of
-    from tools.bot_desktop import runtime as _bd_runtime
+    from tools.bot_desktop import placement, runtime as _bd_runtime
     try:
-        # The bridge dials either the host RFB socket or the sandbox relay; neither exists before start.
-        if _bd_runtime.rfb_socket_path() is None and not _bd_runtime.sandbox_screen_running():
-            return _err(rid, _DISPLAY_ERR, "this profile's Bot Desktop is not running; call display.start first")
+        where = _bd_runtime.observation_placement()
+        if where.where == placement.REFUSED:
+            return _err(rid, _DISPLAY_ERR, where.reason)
+        missing_screen = "this profile's Bot Desktop is not running; call display.start first"
+        if where.where == placement.GATEWAY and _bd_runtime.rfb_socket_path() is None:
+            return _err(rid, _DISPLAY_ERR, missing_screen)
+        snapshot = _display_snapshot()
+        if where.where == placement.TERMINAL and not snapshot["running"]:
+            return _err(rid, _DISPLAY_ERR, snapshot["blocker"] or missing_screen)
         viewer_id = _mint_viewer_id(str(params.get("viewer_id") or "").strip())
         extra = {"hermes_home": str(get_hermes_home()), "viewer_id": viewer_id}
         # A viewer a browser tab opens watches and can drive this screen: it signs out with that tab,
@@ -168,7 +174,7 @@ def _(rid, params: dict) -> dict:
             extra["admitted_with"] = admitted
         ticket = mint_ticket(user_id=f"display:{viewer_id}", provider="bot-desktop", extra=extra)
         return _ok(rid, {"ticket": ticket, "path": "/api/display/ws", "viewer_id": viewer_id,
-                         **_display_snapshot()})
+                         **snapshot})
     except Exception as e:
         return _err(rid, _DISPLAY_ERR, str(e))
 
@@ -196,10 +202,8 @@ def _(rid, params: dict) -> dict:
     from tools.bot_desktop import install as _bd_install, runtime as _bd_runtime
     if not _bd_runtime.is_supported_host():
         return _err(rid, _DISPLAY_ERR, "Bot Desktop runs on Linux gateway hosts only")
-    if _bd_runtime.in_sandbox():
-        return _err(rid, _DISPLAY_ERR, "this profile's screen lives inside the terminal backend's sandbox; give that "
-                                       "sandbox an image with the desktop stack (nousresearch/hermes-sandbox:desktop) "
-                                       "instead of installing on the gateway host")
+    if refusal := _bd_install.placement_refusal():
+        return _err(rid, _DISPLAY_ERR, refusal)
     if _bd_runtime.install_command() is None:
         return _err(rid, _DISPLAY_ERR, "no supported package manager (apt-get, dnf, pacman) on this host")
     profile_key = hermes_home_key()

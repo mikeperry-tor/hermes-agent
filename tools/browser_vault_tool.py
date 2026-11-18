@@ -56,6 +56,13 @@ def _check_vault_available() -> bool:
     from agent.browser_page_registry import list_providers
     from tools.browser_session_cdp import get_cdp_override_raw
     from tools.browser_use_cli import browser_exec_available
+    from tools.bot_desktop.placement import executor_only
+
+    try:
+        if executor_only():
+            return browser_exec_available()
+    except RuntimeError:
+        return False
     return bool(browser_exec_available() or get_cdp_override_raw() or list_providers())
 
 
@@ -121,7 +128,14 @@ def _page_backend(task_id: str):
     page pinned for a ``target='preview'`` operation, else the plugin browser holding this task's live page
     (e.g. Camofox), else None."""
     from agent.browser_page_registry import backend_for_task
+    from tools.bot_desktop.placement import executor_only
     from tools.browser_vault_preview import active_page
+
+    try:
+        if executor_only():
+            return None
+    except RuntimeError:
+        return None
     return active_page() or backend_for_task(task_id)
 
 
@@ -246,8 +260,15 @@ def _ensure_supervisor(task_id: str):
     """The supervisor for ``task_id`` (browser_exec attaches one on every call), attaching one on demand to
     the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
     refuses rather than touching argv."""
+    from tools.bot_desktop.placement import executor_only
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_executor import task_supervisor
 
+    try:
+        if executor_only():
+            return task_supervisor(task_id)
+    except RuntimeError:
+        return None
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
@@ -1321,6 +1342,13 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
                                                        "enter_code or unlock."})
     target = args.get("target") or "browser"
     if target == "preview":
+        from tools.bot_desktop.placement import executor_only
+
+        try:
+            if executor_only():
+                return json.dumps({"success": False, "error": "The deployment requires a browser in the terminal executor"})
+        except RuntimeError as exc:
+            return json.dumps({"success": False, "error": str(exc)})
         # The in-app browser is not the Bot Desktop browser; its window owns the page and refuses a
         # changed tab or document itself. Never retried on another browser.
         from tools.browser_vault_preview import run_preview_vault

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -110,24 +111,36 @@ def _signed_out(ws: WebSocket, info: dict) -> bool:
     return False
 
 
+def _rfb_sandbox(profile_home: Path):
+    from tools.bot_desktop import placement, runtime, sandbox_host
+    from tui_gateway.server import _launch_home, _session_profile_runtime_scope
+
+    named_home = None if profile_home == _launch_home() else str(profile_home)
+    with _session_profile_runtime_scope({"profile_home": named_home}, hydrate_secrets=False):
+        where = runtime.observation_placement()
+        if where.where == placement.REFUSED:
+            raise OSError(where.reason)
+        if where.where == placement.GATEWAY:
+            return None, None
+        env = runtime._owned_sandbox_env()
+        if env is None:
+            raise OSError("The terminal executor's screen is not running")
+        sandbox_host._user_for(env)  # Prime the exec user lookup before returning to the event loop.
+        return env, runtime._profile_name()
+
+
 async def _open_rfb(profile_home: Path):
     """``(reader, writer, relay)`` for THIS profile's Xvnc. Gateway-hosted screen: its unix socket. Screen inside
     the terminal backend: a ``docker exec`` / ``ssh`` relay whose stdio IS the RFB stream (``relay`` is that
     Popen; None for a socket). Raises OSError when nothing is running."""
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from tools.bot_desktop import runtime as _bd_runtime
-    token = set_hermes_home_override(profile_home)
-    try:
-        if _bd_runtime.sandbox_screen_running():
-            relay = _bd_runtime.open_rfb_stream()
-        else:
-            sock = profile_home / "bot-desktop" / "rfb.sock"
-            if not sock.exists():
-                raise OSError("rfb.sock missing")
-            reader, writer = await asyncio.open_unix_connection(str(sock))
-            return reader, writer, None
-    finally:
-        reset_hermes_home_override(token)
+    from tools.bot_desktop import runtime
+
+    env, profile = await asyncio.to_thread(_rfb_sandbox, profile_home)
+    if env is None:
+        sock = profile_home / "bot-desktop" / "rfb.sock"
+        reader, writer = await asyncio.open_unix_connection(str(sock))
+        return reader, writer, None
+    relay = runtime.open_rfb_stream(env, profile)
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), relay.stdout)
@@ -150,7 +163,7 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
     viewer_id = str(info.get("viewer_id") or info.get("user_id") or "viewer")
     try:
         reader, writer, relay = await _open_rfb(Path(profile_home))
-    except OSError as exc:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         _log.warning("display ws: cannot reach RFB endpoint for %s: %s", profile_home, exc)
         await ws.close(code=_CLOSE_DESKTOP_GONE, reason="Bot Desktop is not running")
         return

@@ -346,6 +346,12 @@ bot_desktop:
   placement: auto           # auto | terminal | gateway — see "Where the screen runs"
 ```
 
+Deployments using [Managed Scope](../managed-scope.md) can set
+`bot_desktop.executor_only: true` in `/etc/hermes/config.yaml` to require
+terminal-executor placement for Bot Desktop, `computer_use` and `browser_exec`,
+refusing gateway-host displays, local real-profile copies and external CDP
+overrides.
+
 `auto_start` is off by default. Start the screen from the Desktop's Screen
 pane (**Start screen**), from `hermes computer-use screen start`, or set the
 flag to `true` for a headless host that should bring its screen up the first

@@ -698,8 +698,41 @@ Retry after the active command finishes. Vault reads and writes on the desktop b
 honor the human-control lease, including named and hybrid sessions.
 Closing a session closes its stream and asks its daemon to exit. Chromium stays
 up while any session is attaching or using it. If the previous browser is still
-shutting down, retry once it has exited. Hermes never automatically replays a
-failed or interrupted action.
+shutting down, retry once it has exited. After a lost launch reply, a retry can
+recover Chromium started by the same Hermes process. Browsers started from the
+dock retain their own lifecycle. Hermes never automatically replays a failed or
+interrupted action.
+
+Administrators can require the executor's Chromium and desktop by setting
+`bot_desktop.executor_only: true` in the deployment's managed configuration.
+Pin the terminal backend and its endpoint in the same deployment configuration.
+With this selection Hermes uses the terminal's Chromium, ignores ambient CDP,
+cloud, real-profile and alternate-engine settings, and refuses explicit
+real-profile requests or `/browser connect`. A local or unsupported terminal
+backend, unavailable executor, or invalid managed policy refuses the affected
+operation. Native website and URL safety checks still apply. The gateway
+package installer is unavailable for a terminal desktop. The Screen pane,
+thumbnail and viewer tickets follow the same placement policy. Stop a previous
+gateway desktop before starting the executor desktop to release its resources.
+Browser actions and desktop viewers use the recorded container or SSH target.
+Executor-only discovery probes the desktop and configured browser harness in
+the terminal environment. It leaves the screen stopped until first use.
+Hermes records the owner before launching a detached screen. After a transport
+failure, retry on that same executor. Stop the desktop before changing its
+terminal settings. If the settings already changed, restore the recorded ones
+and stop the desktop there. Before upgrading
+an older version that does not record SSH target identity, stop its desktop
+on the original executor. In executor-only mode, vault page operations use
+the current executor attachment. Direct CDP, its dialog commands and gateway
+real-profile sign-in export are unavailable.
+
+Install Chromium, the desktop dependencies and the pinned browser-harness in
+the executor image. To use a dedicated image-installed Python, set
+`browser.executor_python` to its absolute path. Set
+`browser.require_sandbox: true` to require the Chromium sandbox for both
+automation and the dock, and pin `browser.executor_workspace` if the deployment
+provides a workspace mount. Hermes supplies the native runner to that interpreter
+and does not install tools into the running executor.
 
 ## Limitations
 

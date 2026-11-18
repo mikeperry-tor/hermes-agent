@@ -5,8 +5,9 @@ gateway host and this module via ``placement()``; callers keep using ``runtime.s
 
 Layout inside the sandbox, under ``<sandbox tmp>/hermes-bot-desktop/<profile>/``: ``launcher.sh`` (copied in
 at start), ``env`` (published DISPLAY/XAUTHORITY/DBUS), ``rfb.sock`` (Xvnc's unix socket), ``launcher.pid``.
-Host-side state under ``<HERMES_HOME>/bot-desktop/``: ``sandbox.json`` = ``{"env_key": ..., "display": ...}``
-so status() knows which terminal environment owns the screen without re-deriving it.
+Host-side state under ``<HERMES_HOME>/bot-desktop/``: ``sandbox.json`` records ``display``, ``dir``, ``profile``,
+``backend``, and the backend owner identity (``container`` + ``docker``, ``ssh``, or ``instance``) so status(),
+stop() and viewer reattachment know which terminal environment owns the screen without re-deriving it.
 
 The Desktop pane never sees a socket path: ``open_rfb_stream()`` returns a Popen whose stdin/stdout ARE the
 RFB byte stream, relayed by a 15-line Python script inside the sandbox (python3 is in every sandbox image;
@@ -15,18 +16,22 @@ socat is not). cua-driver runs the same way: ``cua_mcp_argv()`` is the docker/ss
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import json
 import logging
 import re
 import shlex
 import subprocess
+import threading
 import time
+from weakref import WeakValueDictionary
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.deadline import poll_until
 from hermes_constants import get_hermes_home
 from tools.environments import streams
+from tools.environments.base import BaseEnvironment
 
 logger = logging.getLogger(__name__)
 # Registry check_fn probes are abandoned after 10s; one absolute budget covers env creation
@@ -73,43 +78,101 @@ def _marker() -> Path:
 
 def _read_marker() -> dict[str, Any]:
     try:
-        return json.loads(_marker().read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
+        marker = json.loads(_marker().read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Could not read the stored desktop owner; inspect sandbox.json before changing placement") from exc
+    if not isinstance(marker, dict) or not marker:
+        raise RuntimeError("The stored desktop owner is invalid; inspect sandbox.json before changing placement")
+    return marker
 
 
 def _owner_identity(env: Any) -> dict[str, Any]:
     """What the marker records about the sandbox hosting the screen, so a restarted gateway (empty terminal
     registry) can tell a still-running sandbox from one that was removed."""
+    if isinstance(env, RecordedDocker):
+        return {"backend": "DockerEnvironment", "container": env.container, "docker": env.executable}
     ident: dict[str, Any] = {"backend": type(env).__name__}
     container = getattr(env, "_container_id", None)
     if container:
         ident["container"] = container
         ident["docker"] = getattr(env, "_docker_exe", "docker")
+    elif streams.shell_joined(env):
+        ident["ssh"] = ssh_owner(env.host, env.user, env.port, env.key_path, env._ssh_config_options)
+    else:
+        ident["instance"] = getattr(env, "_session_id", None) or str(id(env))
     return ident
 
 
-_ALIVE_CACHE: dict[str, tuple[float, bool]] = {}
+def ssh_owner(host, user, port, key, options) -> list:
+    return [host, user, str(port), key, list(options)]
 
 
-def marker_sandbox_alive(marker: dict[str, Any]) -> bool:
-    """Whether the sandbox a marker names still exists. Docker: ``docker inspect`` on the recorded container
-    (cached a few seconds; this sits on the browser's per-command path). Other backends (ssh host, apptainer
-    instance) cannot be probed from here without their environment object: the re-attach's own
-    ``published_env`` probe decides, so they read as alive."""
+@dataclass
+class RecordedDocker:
+    executable: str
+    container: str
+
+    def exec_prefix(self, *, user: Optional[str], interactive: bool) -> list[str]:
+        return streams.docker_exec_prefix(self.executable, self.container, user=user, interactive=interactive)
+
+    def execute(self, command: str, *, timeout: int, **_options) -> dict:
+        # Used by the native bounded file extraction path. Never recreate the recorded container.
+        proc = streams.run_in(self, ["bash", "-c", command], user=_user_for(self), timeout=timeout)
+        return {"returncode": proc.returncode, "output": proc.stdout.decode("utf-8", errors="replace")}
+
+    fetch_file = BaseEnvironment.fetch_file
+
+
+_recorded_dockers: WeakValueDictionary[tuple[str, str], RecordedDocker] = WeakValueDictionary()
+_docker_handles_lock = threading.Lock()
+
+
+def recorded_docker(marker: dict[str, Any]) -> Optional[RecordedDocker]:
+    from tools.environments.docker import find_docker
+
     container = marker.get("container")
-    if not container:
-        return True
+    engine = find_docker() or "docker"
+    if (isinstance(container, str) and re.fullmatch(r"[a-f0-9]{6,64}", container)
+            and marker.get("docker", "docker") == engine and marker_sandbox_alive(marker) is not False):
+        key = (engine, container)
+        with _docker_handles_lock:
+            handle = _recorded_dockers.get(key)
+            if handle is None:
+                handle = _recorded_dockers[key] = RecordedDocker(engine, container)
+            return handle
+    return None
+
+
+_ALIVE_CACHE: dict[str, tuple[float, Optional[bool]]] = {}
+
+
+def marker_sandbox_alive(marker: dict[str, Any]) -> Optional[bool]:
+    """Inspect the recorded container. Distinguish a gone owner from a failed inspection."""
+    from tools.environments.docker import find_docker
+
+    container = marker.get("container")
+    engine = find_docker() or "docker"
+    if (not isinstance(container, str) or not re.fullmatch(r"[a-f0-9]{6,64}", container)
+            or marker.get("docker", "docker") != engine):
+        return None
     now = time.monotonic()
     cached = _ALIVE_CACHE.get(container)
     if cached and now - cached[0] < 5.0:
         return cached[1]
     try:
-        proc = subprocess.run([marker.get("docker") or "docker", "inspect", "-f", "{{.State.Running}}", container],
+        proc = subprocess.run([engine, "inspect", "-f", "{{.State.Running}}", container],
                               capture_output=True, text=True, timeout=15, check=False, stdin=subprocess.DEVNULL)
-        alive = proc.returncode == 0 and proc.stdout.strip() == "true"
+        answer = proc.stdout.strip()
+        if proc.returncode == 0 and answer in ("true", "false"):
+            alive = answer == "true"
+        elif "no such object" in proc.stderr.lower() or "no such container" in proc.stderr.lower():
+            alive = False
+        else:
+            alive = None
     except (OSError, subprocess.TimeoutExpired):
-        alive = False
+        alive = None
     _ALIVE_CACHE[container] = (now, alive)
     return alive
 
@@ -245,9 +308,27 @@ def ready_cua_executor(*, probe_timeout: float = 4.0, deadline: Optional[float] 
     return None
 
 
+# The PID file can survive a killed launcher. Check the exact script, working
+# directory and session before treating its PID as an owner or sending signals.
+_LAUNCHER_LIVE = r"""
+launcher_live() {
+    case "$p" in ""|*[!0-9]*) return 1 ;; esac
+    [ "$(readlink -f -- "/proc/$p/cwd" 2>/dev/null)" = "$(readlink -f -- "$dir")" ] || return 1
+    {
+        IFS= read -r -d '' executable && IFS= read -r -d '' script
+    } < "/proc/$p/cmdline" 2>/dev/null || return 1
+    [ "${executable##*/}" = bash ] && [ "$script" = launcher.sh ] || return 1
+    stat=$(cat "/proc/$p/stat" 2>/dev/null) || return 1
+    set -- ${stat##*) }
+    [ "$4" = "$p" ]
+}
+"""
+
+
 def _published(env: Any, rdir: str, *, strict: bool = False) -> dict[str, str]:
-    cmd = (f'dir={shlex.quote(rdir)}; pid=$(cat "$dir/launcher.pid" 2>/dev/null) || exit 3; '
-           'kill -0 "$pid" 2>/dev/null && test -S "$dir/rfb.sock" || exit 3; cat "$dir/env"')
+    cmd = (f'dir={shlex.quote(rdir)};' + _LAUNCHER_LIVE +
+           'p=$(cat "$dir/launcher.pid" 2>/dev/null) && launcher_live && test -S "$dir/rfb.sock" '
+           '|| exit 3; cat "$dir/env"')
     proc = streams.run_in(env, ["bash", "-c", cmd], user=_user_for(env), timeout=15)
     if proc.returncode:
         if strict and proc.returncode != 3:
@@ -343,6 +424,9 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
     spawn = (f"cd {shlex.quote(rdir)} && setsid -f bash -c "
              f"'echo $$ > launcher.pid; exec bash launcher.sh' > launcher.log 2>&1 < /dev/null; "
              f"for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s launcher.pid ] && break; sleep 0.1; done; [ -s launcher.pid ]")
+    # The launcher can survive a dropped reply from the terminal. Publish its
+    # owner before detaching it, under the profile lifecycle lock.
+    _record(env, rdir, profile, {"DISPLAY": f":{num}"})
     proc = streams.run_in(env, ["bash", "-c", spawn], child_env=child_env, user=user, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(f"sandbox desktop launcher did not start: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
@@ -362,8 +446,10 @@ def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,
 
 def _record(env: Any, rdir: str, profile: str, live: dict[str, str]) -> dict[str, str]:
     _marker().parent.mkdir(parents=True, exist_ok=True)
-    _marker().write_text(json.dumps({"display": live["DISPLAY"], "dir": rdir, "profile": profile,
-                                     **_owner_identity(env)}), encoding="utf-8")
+    from utils.files import atomic_write_text
+
+    atomic_write_text(_marker(), json.dumps({"display": live["DISPLAY"], "dir": rdir, "profile": profile,
+                                             **_owner_identity(env)}), mode=0o600)
     return live
 
 
@@ -374,17 +460,46 @@ def stop(env: Any, profile: str) -> bool:
     rdir = _remote_dir(env, profile)
     q = shlex.quote(rdir)
     script = f"""
+dir={q}
+{_LAUNCHER_LIVE}
+screen_pids() {{
+    local file arg pid
+    for file in /proc/[0-9]*/cmdline; do
+        [ -r "$file" ] || continue
+        while IFS= read -r -d '' arg; do
+            case "$arg" in
+                "$dir"/rfb.sock|"$dir"/Xauthority)
+                    pid=${{file#/proc/}}
+                    printf '%s\n' "${{pid%/cmdline}}"
+                    break
+                    ;;
+            esac
+        done < "$file" 2>/dev/null
+    done
+}}
+p=$(cat "$dir/launcher.pid" 2>/dev/null)
 live=0
-p=$(cat {q}/launcher.pid 2>/dev/null)
-if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then live=1; kill -TERM -- -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; fi
-for pid in $(pgrep -f -- {shlex.quote(rdir + "/")} 2>/dev/null); do [ "$pid" != "$$" ] && {{ live=1; kill -TERM "$pid" 2>/dev/null; }}; done
-sleep 0.5
-for pid in $(pgrep -f -- {shlex.quote(rdir + "/")} 2>/dev/null); do [ "$pid" != "$$" ] && kill -KILL "$pid" 2>/dev/null; done
-rm -f {q}/env {q}/launcher.pid {q}/rfb.sock
-[ "$live" = 1 ]
+if launcher_live; then
+    live=1
+    kill -TERM -- -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+fi
+for pid in $(screen_pids); do live=1; kill -TERM "$pid" 2>/dev/null; done
+if [ "$live" = 1 ]; then
+    sleep 0.5
+    if launcher_live; then kill -KILL -- -"$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null; fi
+    for pid in $(screen_pids); do kill -KILL "$pid" 2>/dev/null; done
+    for attempt in 1 2 3 4 5; do
+        if ! launcher_live && [ -z "$(screen_pids)" ]; then break; fi
+        sleep 0.1
+    done
+fi
+if launcher_live || [ -n "$(screen_pids)" ]; then exit 4; fi
+rm -f "$dir/env" "$dir/launcher.pid" "$dir/rfb.sock" || exit 4
+[ "$live" = 1 ] || exit 3
 """
     proc = streams.run_in(env, ["bash", "-c", script], user=_user_for(env), timeout=30)
-    _marker().unlink(missing_ok=True)
+    if proc.returncode not in (0, 3):
+        raise RuntimeError("Could not stop the desktop; check the terminal sandbox connection and retry")
     return proc.returncode == 0
 
 

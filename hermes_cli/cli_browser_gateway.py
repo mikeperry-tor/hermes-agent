@@ -53,6 +53,20 @@ def gateway_browser(cli, connection, word: str, rest: str) -> None:
                f"   {_t('browser.status_connect_hint')}", f"   {_t('browser.status_disconnect_hint')}")
 
 
+def local_browser_cdp_url(cdp_url: str):
+    """Check the local CLI's deployment policy before looking up a CDP endpoint."""
+    from tools.bot_desktop.placement import executor_only
+
+    try:
+        if executor_only():
+            _say_block("The deployment does not allow external CDP connections")
+            return None
+    except RuntimeError as exc:
+        _say_block(str(exc))
+        return None
+    return _normalize_cdp_url(cdp_url)
+
+
 def _normalize_cdp_url(cdp_url: str):
     """Validate a /browser connect URL: ``(cdp_url, port)`` or None after printing the error.
     A ``/devtools/browser/<id>`` path is kept verbatim; anything else is reduced to the origin."""
