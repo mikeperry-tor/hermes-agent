@@ -98,6 +98,11 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
+    from tools.bot_desktop import lease
+    try:
+        _assert_browser_lease(task_id, supervisor)
+    except lease.HumanHasControl as exc:
+        return {"success": False, "error_type": "human_has_control", "error": str(exc)}
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
@@ -162,11 +167,11 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # refuse here, before the credential lands in a page the human is now typing into. The outer
     # epoch check only discards the result, and a fill is a side effect, not a result.
     from tools.browser_vault_preview import active_page
-    if active_page() is None and _bot_desktop_browser_session(task_id):
-        from tools.bot_desktop import lease as _bd_lease
+    from tools.bot_desktop import lease
+    if active_page() is None:
         try:
-            _bd_lease.assert_agent_may_act()
-        except _bd_lease.HumanHasControl as exc:
+            _assert_browser_lease(task_id, supervisor)
+        except lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
     if page is not None:
@@ -231,6 +236,7 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         return None
     try:
         supervisor = _ensure_supervisor(task_id)
+        _assert_browser_lease(task_id, supervisor)
     except Exception:
         supervisor = None
     if supervisor is None:
@@ -687,18 +693,34 @@ BROWSER_VAULT_SCHEMA = {
 }
 
 
-def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
-    from tools.browser_session import session_for_task, shares_bot_desktop_browser
-    return shares_bot_desktop_browser(session_for_task(task_id))
+def _vault_browser_session(task_id: Optional[str], supervisor=None) -> dict[str, Any]:
+    from tools.browser_session import session_for_task
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    if supervisor is None:
+        supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
+    local = getattr(supervisor, "local_browser", None)
+    if isinstance(local, bool):
+        # browser_exec names the task here even for a named daemon or hybrid sidecar.
+        return {"features": {"local": local}}
+    return session_for_task(task_id)
+
+
+def _assert_browser_lease(task_id: str, supervisor) -> None:
+    from tools.bot_desktop import lease
+    from tools.browser_session import shares_bot_desktop_browser
+
+    if shares_bot_desktop_browser(_vault_browser_session(task_id, supervisor)):
+        lease.assert_agent_may_act()
 
 
 def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     browser_exec; they must honour the Bot Desktop lease like every other page access, or a human
     typing a credential on the taken-over screen could be read or written to."""
-    from tools.browser_session import run_fenced, session_for_task
+    from tools.browser_session import run_fenced
 
-    res = run_fenced(session_for_task(task_id), lambda: {"raw": fn()})
+    res = run_fenced(_vault_browser_session(task_id), lambda: {"raw": fn()})
     return res["raw"] if "raw" in res else json.dumps(res)
 
 

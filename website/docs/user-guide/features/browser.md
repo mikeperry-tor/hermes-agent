@@ -677,6 +677,30 @@ stop any existing browser and desktop before applying it. It does not attest an
 externally supplied CDP endpoint or change cloud-provider sandbox guarantees.
 
 
+## Execution in terminal sandboxes
+
+When the selected Chromium session lives inside a terminal desktop sandbox,
+`browser_exec` runs its Python there too. Install the same `browser-harness`
+dependency in that environment and set `browser.executor_python` to its Python
+executable (default `python3`). Missing dependencies fail visibly; Hermes does
+not execute the program on the gateway instead. Local, real-profile, external
+CDP and cloud sessions retain their native execution paths. Print the path
+returned by `capture_screenshot()` on its own line to attach it, including when
+the path contains spaces or is relative to the task workspace. Hermes fetches
+the screenshot from the executor. Browser Python gets a stable
+per-task scratch directory under the desktop user's `~/.hermes/browser-use`.
+Set `browser.executor_workspace` to an absolute path inside the executor to
+use a different root, such as an installed workspace mount. Close existing
+browser sessions before changing this path. Named sessions have separate
+daemons and tabs and share the desktop browser's cookies and downloads. For
+one task, a running command refuses concurrent commands on a different endpoint.
+Retry after the active command finishes. Vault reads and writes on the desktop browser
+honor the human-control lease, including named and hybrid sessions.
+Closing a session closes its stream and asks its daemon to exit. Chromium stays
+up while any session is attaching or using it. If the previous browser is still
+shutting down, retry once it has exited. Hermes never automatically replays a
+failed or interrupted action.
+
 ## Limitations
 
 - **Session timeout** — cloud sessions expire based on your provider's plan settings.

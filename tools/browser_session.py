@@ -111,12 +111,24 @@ def run_fenced(session_info: dict[str, Any], fn: Callable[[], dict[str, Any]]) -
     """
     if not shares_bot_desktop_browser(session_info):
         return fn()
+    return run_fenced_dispatch(lambda _check_lease: fn())
+
+
+def run_fenced_dispatch(fn: Callable[[Callable[[], None]], dict[str, Any]]) -> dict[str, Any]:
+    """Fence a desktop action whose preparation can wait before it is sent."""
     from tools.bot_desktop import lease as _bd_lease
+
+    def check_lease():
+        if _bd_lease.get().epoch != admitted.epoch:
+            raise _bd_lease.HumanHasControl(
+                "A human took over the bot's screen before this browser command was sent. "
+                "Tell the user what you need; retry once they hand back.")
+
     try:
         admitted = _bd_lease.assert_agent_may_act()
+        result = fn(check_lease)
     except _bd_lease.HumanHasControl as e:
         return {"success": False, "error": str(e), "code": "human_has_control"}
-    result = fn()
     if _bd_lease.get().epoch != admitted.epoch:
         return {"success": False, "code": "human_has_control",
                 "error": "A human took over the bot's screen while this browser command ran; its result was "

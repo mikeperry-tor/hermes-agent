@@ -29,6 +29,9 @@ from hermes_constants import get_hermes_home
 from tools.environments import streams
 
 logger = logging.getLogger(__name__)
+# Registry check_fn probes are abandoned after 10s; one absolute budget covers env creation
+# plus the sequential user/binary probes so a cold executor cannot sum past the ceiling.
+_DISCOVERY_BUDGET_S = 8.0
 
 # The user desktop processes run as inside the sandbox image. nikolaik (and hermes-sandbox:desktop on top of
 # it) ships uid 1000 `pn`; a root Xvnc/Chromium/cua-driver is the wrong shape (Chromium refuses the sandbox,
@@ -115,7 +118,7 @@ def _remote_dir(env: Any, profile: str) -> str:
     return f"{streams.sandbox_temp_dir(env).rstrip('/')}/hermes-bot-desktop/{profile}"
 
 
-def desktop_home(env: Any) -> str:
+def desktop_home(env: Any, *, timeout: float = 15.0) -> str:
     """``$HOME`` of the user the desktop and the browser run as inside ``env`` (cached on the env). This
     is where state that must outlive a container stop goes: ``/tmp`` in the Docker backend is a 512 MB
     tmpfs that is emptied on every stop and shared with the sandbox's scratch, so a browser profile
@@ -123,10 +126,11 @@ def desktop_home(env: Any) -> str:
     cached = getattr(env, "_bd_desktop_home", None)
     if cached:
         return cached
-    proc = streams.run_in(env, ["bash", "-c", 'printf %s "$HOME"'], user=_user_for(env), timeout=15)
+    user = _user_for(env, timeout=timeout)
+    proc = streams.run_in(env, ["bash", "-c", 'printf %s "$HOME"'], user=user, timeout=timeout)
     home = proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
     if not home or not home.startswith("/"):
-        home = f"/home/{DESKTOP_USER}" if _user_for(env) else "/root"
+        home = f"/home/{DESKTOP_USER}" if user else "/root"
     env._bd_desktop_home = home
     return home
 
@@ -189,23 +193,56 @@ def grab_jpeg(env: Any, published: dict[str, str], max_size: tuple[int, int], qu
     return proc.stdout
 
 
-def _user_for(env: Any) -> Optional[str]:
+def _user_for(env: Any, *, timeout: float = 15.0) -> Optional[str]:
     """DESKTOP_USER when the sandbox has it, else None (exec default). Cached on the env object."""
     cached = getattr(env, "_bd_desktop_user", "unset")
     if cached != "unset":
         return cached
-    probe = streams.run_in(env, ["id", "-u", DESKTOP_USER], timeout=15)
+    probe = streams.run_in(env, ["id", "-u", DESKTOP_USER], timeout=timeout)
     user = DESKTOP_USER if probe.returncode == 0 else None
     env._bd_desktop_user = user
     return user
 
 
-def missing_binaries(env: Any) -> list[str]:
-    script = "for b in " + " ".join(_REQUIRED) + '; do command -v "$b" >/dev/null 2>&1 || echo "$b"; done'
-    proc = streams.run_in(env, ["bash", "-c", script], user=_user_for(env), timeout=20)
+def probe_budget(deadline: Optional[float], per_probe: float) -> float:
+    """Timeout for one discovery probe, shrinking as its caller's overall deadline approaches.
+
+    Registry ``check_fn`` probes are abandoned after ``_CHECK_FN_PROBE_TIMEOUT_SECONDS`` (10s), so
+    discovery passes one deadline through the sequential user/home/import probes instead of granting
+    each its own full timeout (which could sum past the ceiling).
+    """
+    if deadline is None:
+        return per_probe
+    return max(0.25, min(per_probe, deadline - time.monotonic()))
+
+
+def missing_binaries(env: Any, *, extra: tuple[str, ...] = (), timeout: float = 20.0,
+                     deadline: Optional[float] = None) -> list[str]:
+    script = "for b in " + shlex.join([*_REQUIRED, *extra]) + '; do command -v "$b" >/dev/null 2>&1 || echo "$b"; done'
+    user = _user_for(env, timeout=probe_budget(deadline, timeout))
+    proc = streams.run_in(env, ["bash", "-c", script], user=user,
+                          timeout=probe_budget(deadline, timeout))
     if proc.returncode:
         raise RuntimeError("Could not inspect desktop dependencies in the terminal sandbox")
     return [b for b in proc.stdout.decode("utf-8", "replace").split() if b]
+
+
+def ready_cua_executor(*, probe_timeout: float = 4.0, deadline: Optional[float] = None) -> Optional[Any]:
+    """Probe the deployment's terminal environment without starting its desktop."""
+    from tools.bot_desktop import placement
+
+    if placement.resolve().where != placement.TERMINAL:
+        return None
+    if deadline is None:
+        deadline = time.monotonic() + _DISCOVERY_BUDGET_S
+    try:
+        env = placement.terminal_environment(create=True)
+        if env is not None and not missing_binaries(env, extra=("cua-driver",),
+                                                    timeout=probe_timeout, deadline=deadline):
+            return env
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        logger.debug("Could not check terminal executor readiness", exc_info=True)
+    return None
 
 
 def _published(env: Any, rdir: str, *, strict: bool = False) -> dict[str, str]:

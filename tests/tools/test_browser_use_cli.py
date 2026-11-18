@@ -58,7 +58,7 @@ def _fake_supervisor_registry(monkeypatch):
 
     attached = []
 
-    class _Registry:
+    class _Registry(browser_supervisor._SupervisorRegistry):
         def get_or_start(self, task_id, cdp_url, **kw):
             attached.append((task_id, cdp_url))
 
@@ -583,12 +583,15 @@ class TestOwnTabPreamble:
     def test_marker_write_never_follows_a_planted_symlink(self, tmp_path, monkeypatch):
         """The marker name in the shared temp root is predictable: a planted link must not create its target."""
         monkeypatch.setenv("BU_NAME", "r7k2")
-        monkeypatch.setitem(sys.modules, "browser_harness", None)  # no daemon pid: marker suffix "0"
+        from types import SimpleNamespace
+        monkeypatch.setitem(sys.modules, "browser_harness", SimpleNamespace(
+            _ipc=SimpleNamespace(identify=lambda name: 123)))
         monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
         victim = tmp_path / "victim"
-        (tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-0").symlink_to(victim)  # windows-footgun: ok — posix-only
+        (tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-123").symlink_to(victim)  # windows-footgun: ok — posix-only
 
-        exec(bu_cli._OWN_TAB_PREAMBLE, {"cdp": lambda *a, **k: {}, "switch_tab": lambda _tid: None})
+        with pytest.raises(OSError):
+            exec(bu_cli._OWN_TAB_PREAMBLE, {"cdp": lambda *a, **k: {"targetId": "ours"}, "switch_tab": lambda _tid: None})
 
         assert not victim.exists()
 
@@ -1143,3 +1146,53 @@ class TestExecHybridPrivateUrlRouting:
         assert daemons == [want for _, want in steps]
         assert self.cloud_keys == ["t"]
         assert self.local_keys == ["t::local", "t::local"]
+
+    def test_executor_sidecar_continuation_stays_on_executor(self, monkeypatch):
+        from tools import browser_use_executor
+        original = bs.get_session_info
+
+        def executor_session(key):
+            info = original(key)
+            if bs.is_local_sidecar_key(key):
+                info['features']['sandbox'] = True
+            return info
+
+        monkeypatch.setattr(bs, 'get_session_info', executor_session)
+        monkeypatch.setattr(browser_use_executor, 'available', lambda **_kw: True)
+        calls = []
+
+        def execute(key, code, *args):
+            calls.append(key)
+            return json.dumps({'success': True, 'output': 'executor'})
+
+        monkeypatch.setattr(browser_use_executor, 'execute', execute)
+        for code in [f'new_tab("{self.LAN}")', 'print(js("document.title"))']:
+            assert json.loads(bu_cli.browser_exec(code, task_id='t'))['output'] == 'executor'
+        assert calls == ['t::local', 't::local']
+        assert self.cloud_keys == []
+
+
+@pytest.mark.parametrize("daemon", [None, 123, 456])
+def test_named_tab_setup_tracks_live_daemon_and_preserves_intentional_selection(tmp_path, monkeypatch, daemon):
+    from types import SimpleNamespace
+    monkeypatch.setenv("BU_NAME", "research")
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    identity = SimpleNamespace(pid=daemon)
+    monkeypatch.setitem(sys.modules, "browser_harness", SimpleNamespace(
+        _ipc=SimpleNamespace(identify=lambda name: identity.pid)))
+    selected = []
+    namespace = {"cdp": lambda *args, **kw: {"targetId": str(identity.pid)},
+                 "switch_tab": selected.append}
+    if daemon is None:
+        with pytest.raises(RuntimeError, match="Could not identify"):
+            exec(bu_cli._OWN_TAB_PREAMBLE + "raise AssertionError('model ran')", namespace)
+        assert selected == []
+        assert not list(tmp_path.glob("hermes-bu-owntab-*"))
+        return
+    exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+    selected.append("intentional-switch")
+    exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+    assert selected == [str(daemon), "intentional-switch"]
+    identity.pid += 1
+    exec(bu_cli._OWN_TAB_PREAMBLE, namespace)
+    assert selected[-1] == str(identity.pid)
