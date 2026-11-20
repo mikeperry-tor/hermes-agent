@@ -1149,6 +1149,7 @@ class TestExecHybridPrivateUrlRouting:
 
     def test_executor_sidecar_continuation_stays_on_executor(self, monkeypatch):
         from tools import browser_use_executor
+        from tools.bot_desktop import placement
         original = bs.get_session_info
 
         def executor_session(key):
@@ -1158,7 +1159,8 @@ class TestExecHybridPrivateUrlRouting:
             return info
 
         monkeypatch.setattr(bs, 'get_session_info', executor_session)
-        monkeypatch.setattr(browser_use_executor, 'available', lambda **_kw: True)
+        monkeypatch.setattr(placement, 'terminal_environment', lambda **_kw: object())
+        monkeypatch.setattr(browser_use_executor, 'probe_harness', lambda _env: True)
         calls = []
 
         def execute(key, code, *args):

@@ -680,11 +680,13 @@ externally supplied CDP endpoint or change cloud-provider sandbox guarantees.
 ## Execution in terminal sandboxes
 
 When the selected Chromium session lives inside a terminal desktop sandbox,
-`browser_exec` runs its Python there too. Install the same `browser-harness`
-dependency in that environment and set `browser.executor_python` to its Python
-executable (default `python3`). Missing dependencies fail visibly; Hermes does
-not execute the program on the gateway instead. Local, real-profile, external
-CDP and cloud sessions retain their native execution paths. Print the path
+`browser_exec` uses the executor's `browser-harness` when installed. Set
+`browser.executor_python` to its Python executable (default `python3`).
+Without the executor-only policy, a stock sandbox without the harness can use
+Hermes's gateway harness over the sandbox's forwarded CDP connection.
+Executor-only mode requires an executor harness. An executor connection failure
+reports an error so you can restore the connection and retry. Local,
+real-profile, external CDP and cloud sessions retain their native paths. Print the path
 returned by `capture_screenshot()` on its own line to attach it, including when
 the path contains spaces or is relative to the task workspace. Hermes fetches
 the screenshot from the executor. Browser Python gets a stable

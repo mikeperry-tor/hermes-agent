@@ -379,28 +379,30 @@ def _sandbox_executor_ready() -> bool:
     the gateway host drives that Chromium over the forwarded ``BU_CDP_WS`` tunnel.
     """
     from tools.bot_desktop import placement, runtime
-    from tools.browser_use_executor import available
+    from tools.browser_use_executor import probe_harness
 
-    try:
-        if placement.executor_only():
-            return True
-    except RuntimeError:
-        return False
     env = runtime._owned_sandbox_env(reattach=False) or placement.terminal_environment(create=False)
-    return available(require_ready=True, env=env)
+    if env is None:
+        raise RuntimeError("The terminal executor owning this browser is unavailable")
+    return probe_harness(env)
 
 
-def _mark_local_browser(env: dict, session: dict, key: str) -> None:
+def _mark_local_browser(env: dict, session: dict, key: str) -> Optional[str]:
     """Flags for a LOCAL session browser: it runs on the Bot Desktop display (lease fence), and unless a
     persistent profile / the real-profile browser is shared by every key, it is exclusive to this key (no
     own-tab preamble: nothing to share a tab with)."""
     features = session.get("features") or {}
-    if features.get("sandbox") and _sandbox_executor_ready():
-        env[_EXECUTOR_BROWSER_SENTINEL] = key
+    if features.get("sandbox"):
+        try:
+            if _sandbox_executor_ready():
+                env[_EXECUTOR_BROWSER_SENTINEL] = key
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return "Could not inspect browser-harness on the terminal executor. Check the executor and retry."
     env[_BOT_DESKTOP_BROWSER_SENTINEL] = "lightpanda" if features.get("lightpanda") else "local"
     if not session.get("shared_profile") and not features.get("real_profile"):
         env[_PRIVATE_BROWSER_SENTINEL] = "1"
     _export_real_profile_note(env, key)
+    return None
 
 
 def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = "",
@@ -424,9 +426,7 @@ def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = ""
         fail = lambda e: (f"The local browser could not be started: {e} "
                           "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     err = _export_session_cdp(env, _session_info, key, fail, "The local browser session returned no CDP endpoint.")
-    if err is None:
-        _mark_local_browser(env, session, key)
-    return err
+    return err if err is not None else _mark_local_browser(env, session, key)
 
 
 def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = "",
@@ -497,9 +497,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
         # browser for this key; it already carries its CDP URL.
         logger.warning("browser_exec: %s failed (%s); using local Chromium for this session",
                        provider_name, session.get("fallback_reason"))
-        if err is None:
-            _mark_local_browser(env, session, key)
-        return err
+        return err if err is not None else _mark_local_browser(env, session, key)
     if err is None:
         from tools.browser_use_shot import ACTIVATE_ALWAYS
         env[_CLOUD_BROWSER_SENTINEL] = ACTIVATE_ALWAYS  # the provider's own session: the harness connects only there

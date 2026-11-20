@@ -72,11 +72,11 @@ def test_executor_only_discovery_checks_remote_dependencies_without_starting_scr
     monkeypatch.setattr(runtime, "start", start)
     monkeypatch.setattr(cua_backend_driver, "cua_driver_binary_available",
                         Mock(side_effect=AssertionError("checked the gateway driver")))
-    missing = Mock(return_value=["cua-driver"])
+    missing = Mock(side_effect=lambda _env, *, extra, **_kw: list(extra))
     monkeypatch.setattr(sandbox_host, "missing_binaries", missing)
     monkeypatch.setattr(sandbox_host, "desktop_home", lambda _env, **_kw: "/home/runner")
     monkeypatch.setattr(sandbox_host, "_user_for", lambda _env, **_kw: "runner")
-    harness = Mock(return_value=SimpleNamespace(returncode=1))
+    harness = Mock(return_value=SimpleNamespace(returncode=0, stdout=b'harness-missing\n'))
     monkeypatch.setattr(streams, "run_in", harness)
     provider = CuaDriverProvider()
 
@@ -86,11 +86,11 @@ def test_executor_only_discovery_checks_remote_dependencies_without_starting_scr
     assert not provider.is_available() and not browser_use_cli.browser_exec_available()
     assert missing.call_args.kwargs["timeout"] == 4.0
     assert isinstance(missing.call_args.kwargs["deadline"], float)  # browser_exec_available shares one budget
-    harness.assert_not_called()
-    missing.return_value = []
     monkeypatch.setattr(browser_use_cli, "_find_cli", lambda: ["/gateway/venv/bin/browser-harness"])
-    assert provider.is_available() and not browser_use_cli.browser_exec_available()
-    env._bd_browser_harness.clear()
+    harness.return_value.stdout = b'harness-ready\n'
+    assert not provider.is_available() and browser_use_cli.browser_exec_available()
+    harness.return_value.returncode = 255
+    assert not browser_use_cli.browser_exec_available()
     harness.return_value.returncode = 0
     assert browser_use_cli.browser_exec_available()
     assert harness.call_args.args[0] is env
