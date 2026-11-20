@@ -186,17 +186,20 @@ def test_bootstrapped_managed_env_keeps_published_claims_on_read_error(env_homes
     from pathlib import Path
 
     from hermes_cli.config import reload_env
-    from hermes_cli.env_loader import apply_config_bootstrap_env, managed_env_claims
+    from hermes_cli.env_loader import apply_config_bootstrap_env, managed_env_claims, resolve_home_dotenv
 
     home, managed = env_homes
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.delenv("HERMES_CONFIG_BACKEND", raising=False)
     monkeypatch.delenv("ORG_BOOTSTRAP_UNUSED", raising=False)
+    monkeypatch.delenv("ORG_BOOTSTRAP_VALUE", raising=False)
     (home / ".env").write_text("HERMES_CONFIG_BACKEND=other\nORG_BOOTSTRAP_UNUSED=profile\n")
     policy = managed / ".env"
-    policy.write_text("HERMES_CONFIG_BACKEND=file\nORG_BOOTSTRAP_UNUSED=admin\n")
-    apply_config_bootstrap_env(lambda _kind: (), home)
+    policy.write_text("HERMES_CONFIG_BACKEND=file\nORG_BOOTSTRAP_UNUSED=admin\n"
+                      "ORG_BOOTSTRAP_VALUE=${ORG_BOOTSTRAP_UNUSED}\n")
+    apply_config_bootstrap_env(lambda _kind: {"ORG_BOOTSTRAP_VALUE"}, home)
     assert os.environ["HERMES_CONFIG_BACKEND"] == "file"
+    assert os.environ["ORG_BOOTSTRAP_VALUE"] == "admin"
     assert "ORG_BOOTSTRAP_UNUSED" not in os.environ
 
     open_file = Path.open
@@ -207,7 +210,23 @@ def test_bootstrapped_managed_env_keeps_published_claims_on_read_error(env_homes
         return open_file(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", unreadable)
-    assert managed_env_claims() == {"HERMES_CONFIG_BACKEND"}
+    expected = {"HERMES_CONFIG_BACKEND": "file", "ORG_BOOTSTRAP_VALUE": "admin"}
+    assert managed_env_claims() == expected.keys()
+    assert resolve_home_dotenv(home, lookup_env={}, managed_only=True) == expected
     reload_env()
     assert os.environ["HERMES_CONFIG_BACKEND"] == "file"
     assert os.environ["ORG_BOOTSTRAP_UNUSED"] == "profile"
+
+
+def test_repeated_managed_bootstrap_uses_the_original_environment(env_homes, monkeypatch):
+    from hermes_cli.env_loader import _apply_managed_env, apply_config_bootstrap_env
+
+    home, managed = env_homes
+    monkeypatch.setenv("ORG_BOOTSTRAP_PATH", "/instance")
+    (managed / ".env").write_text("ORG_BOOTSTRAP_PATH=${ORG_BOOTSTRAP_PATH}/base\n")
+
+    for _ in range(2):
+        apply_config_bootstrap_env(lambda _kind: {"ORG_BOOTSTRAP_PATH"}, home)
+        assert os.environ["ORG_BOOTSTRAP_PATH"] == "/instance/base"
+    _apply_managed_env()
+    assert os.environ["ORG_BOOTSTRAP_PATH"] == "/instance/base"

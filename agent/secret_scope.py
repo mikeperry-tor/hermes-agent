@@ -476,8 +476,9 @@ def _expand_dotenv_templates(secrets: dict[str, str], hermes_home: Path, raw: di
     templated = {k: v for k, v in raw.items() if "${" in v and secrets.get(k) == v}
     if not templated:
         return
-    from hermes_cli.env_loader import resolve_home_dotenv
-    lookup = None if _is_process_home(hermes_home) else {k: v for k, v in os.environ.items() if _is_global_env(k)}
+    from hermes_cli.env_loader import resolve_home_dotenv, routed_dotenv_lookup_env
+
+    lookup = None if _is_process_home(hermes_home) else routed_dotenv_lookup_env()
     resolved = resolve_home_dotenv(Path(hermes_home), lookup_env=lookup)
     secrets.update((k, resolved[k]) for k in templated if k in resolved)
 

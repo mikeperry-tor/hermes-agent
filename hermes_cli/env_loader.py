@@ -189,8 +189,7 @@ def has_nonblank_dotenv_value(name: str) -> bool:
 
 
 def managed_dotenv_keys() -> frozenset[str]:
-    """KEY names the administrator-managed ``.env`` loaded (see ``_MANAGED_DOTENV_KEYS``). Policy for
-    every profile: never stripped from a routed child, and re-applied over the routed scope."""
+    """Names ever published from managed dotenv, including retired launch-process values."""
     return frozenset(_MANAGED_DOTENV_KEYS)
 
 
@@ -443,6 +442,16 @@ def _resolve_dotenv_assignments(
     return resolved
 
 
+def routed_dotenv_lookup_env() -> dict[str, str]:
+    """Allow instance environment defaults in routed interpolation while excluding launch output."""
+    from agent.secret_scope import _is_global_env
+
+    owned = launch_dotenv_keys() | managed_dotenv_keys() | set(source_supplied_names())
+    owned = {key.upper() for key in owned}
+    return {key: value for key, value in os.environ.items()
+            if _is_global_env(key) and key.upper() not in owned and not key.upper().startswith("TERMINAL_")}
+
+
 def resolve_home_dotenv(
     home: Path, *, lookup_env: dict[str, str] | None = None, managed_only: bool = False,
 ) -> dict[str, str]:
@@ -452,7 +461,7 @@ def resolve_home_dotenv(
     layer seeing the one before. External secret sources and the project ``.env`` are not included.
     *lookup_env* replaces that environment for routed profiles. With *managed_only*, only the
     managed layer is returned, still interpolated against the target's own dotenv."""
-    from hermes_cli.managed_scope import applied_managed_assignments, retain_managed_env_claims
+    from hermes_cli.managed_scope import applied_managed_env, retain_managed_env_claims
 
     managed_path = _managed_env_path()
     layers = [home / ".env", *([managed_path] if managed_path is not None else [])]
@@ -463,6 +472,7 @@ def resolve_home_dotenv(
             lookup_env = _dotenv_lookup_env(None)
     out: dict[str, str] = {}
     for path in layers:
+        applied = None
         try:
             assignments = _parse_dotenv_file(path)
         except FileNotFoundError:
@@ -472,12 +482,12 @@ def resolve_home_dotenv(
         except OSError:
             if path != managed_path:
                 continue
-            assignments = applied_managed_assignments(path)
+            assignments, applied = applied_managed_env(path)
         else:
             if path == managed_path:
                 retain_managed_env_claims(path, _claimed_env_names(dict(assignments).items()))
         for name, value in _resolve_dotenv_assignments(assignments, lookup_env, override=True).items():
-            if value is not None:
+            if value is not None and (applied is None or name in applied):
                 lookup_env[name] = value
                 if not managed_only or path == managed_path:
                     out[name] = value
@@ -548,8 +558,7 @@ def _load_dotenv_with_fallback(
         names = _claimed_env_names(resolved.items())
         with _DOTENV_LOCK:
             current = dict(os.environ)
-            raw = [(name, value) for name, value in assignments if name in names]
-            remember_applied_managed_env(path, raw, {name: current[name] for name in names & current.keys()})
+            remember_applied_managed_env(path, assignments, {name: current[name] for name in names & current.keys()})
             _MANAGED_DOTENV_KEYS.update(names)
     else:
         _LOADED_DOTENV_KEYS.update(name for name, _value in assignments if not is_launch_only_env_key(name))
@@ -631,7 +640,8 @@ def _managed_env_assignments(path: Path | None) -> tuple[list[tuple[str, str | N
     except FileNotFoundError:
         assignments = []
     except OSError:
-        return [], applied_managed_env(path)
+        _, applied = applied_managed_env(path)
+        return [], applied
     retain_managed_env_claims(path, _claimed_env_names(dict(assignments).items()))
     return assignments, {}
 
@@ -716,15 +726,20 @@ def apply_config_bootstrap_env(backend_names, home: Path | None = None, project_
     env, managed = _bootstrap_env(home, project_env, managed_path=managed_path)
     # The selector itself always, so a file deployment is not read as another kind meanwhile.
     names = {BACKEND_ENV} | set(backend_names((env.get(BACKEND_ENV) or "").strip().lower() or "file"))
+    managed_names = _claimed_env_names(dict(managed).items()) & names
     with _DOTENV_LOCK:
+        load_pass = next(_DOTENV_PASSES)
+        baseline = _dotenv_lookup_env(None)
         for name in names & env.keys():
             os.environ[name] = env[name]
-        managed_names = _claimed_env_names(dict(managed).items()) & names
+            if name in managed_names:
+                _DOTENV_PUBLISHED[name] = (baseline.get(name), env[name], load_pass)
         if managed_path is not None and managed_names:
             from hermes_cli.managed_scope import applied_managed_env, remember_applied_managed_env
 
-            values = applied_managed_env(managed_path) | {name: env[name] for name in managed_names}
-            remember_applied_managed_env(managed_path, [(k, v) for k, v in managed if k in values], values)
+            _, values = applied_managed_env(managed_path)
+            values.update((name, env[name]) for name in managed_names)
+            remember_applied_managed_env(managed_path, managed, values)
             _MANAGED_DOTENV_KEYS.update(managed_names)
 
 
@@ -1104,12 +1119,7 @@ def _refuse_protected_env_from_sources(report, backend=None, environ_before=None
     if not backend.protected_env_names():
         # The file backend has no plane credential: only the selector clashed. Reverted, and dropped
         # from the report so no provenance/snapshot re-applies it later; keep going.
-        for name in clash:
-            report.provenance.pop(name, None)
-            for src in report.sources:
-                for bucket in (getattr(src, "applied", None), getattr(src, "skipped_existing", None)):
-                    if isinstance(bucket, list) and name in bucket:
-                        bucket.remove(name)
+        _discard_source_claims(report, clash)
         print(f"  Secret sources: ignored {BACKEND_ENV} from a secrets: source (the config backend is "
               "chosen by .env or the process environment only).", file=sys.stderr)
         return
@@ -1119,6 +1129,16 @@ def _refuse_protected_env_from_sources(report, backend=None, environ_before=None
         f"A secrets: source supplies {', '.join(clash)}, which the {backend.name!r} config "
         "backend uses to reach its config plane. That credential must come from auth.json or .env, never "
         f"from a secret source; remove the mapping. {outcome}")
+
+
+def _discard_source_claims(report, names) -> None:
+    """Drop blocked source names from the metadata used for later restores."""
+    for name in names:
+        report.provenance.pop(name, None)
+        for src in report.sources:
+            for bucket in (getattr(src, "applied", None), getattr(src, "skipped_existing", None)):
+                if isinstance(bucket, list) and name in bucket:
+                    bucket.remove(name)
 
 
 def _publish_staged_env(staged: dict, environ_before: dict, managed_claims: frozenset[str]) -> None:
@@ -1206,6 +1226,7 @@ def _apply_external_secret_sources(home_path: Path, *, managed_claims: frozenset
         _publish_live_source_values(home_key, home_path, {})
         return
     _refuse_protected_env_from_sources(report, backend_before, environ_before, env=staged)
+    _discard_source_claims(report, managed_claims)
     _publish_staged_env(staged, environ_before, managed_claims)
 
     # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
