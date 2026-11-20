@@ -65,7 +65,8 @@ def cua_executor_ready(*, probe_timeout: float = 4.0, deadline: Optional[float] 
     """Whether a managed-only terminal executor is reachable and has ``cua-driver``."""
     from tools.bot_desktop import sandbox_host
 
-    return sandbox_host.ready_cua_executor(probe_timeout=probe_timeout, deadline=deadline) is not None
+    return sandbox_host.ready_executor(extra=("cua-driver",), probe_timeout=probe_timeout,
+                                       deadline=deadline) is not None
 
 
 def _terminal_backend() -> str:

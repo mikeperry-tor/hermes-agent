@@ -47,7 +47,9 @@ def test_cloud_hybrid_sidecar_needs_only_the_executor_harness(monkeypatch):
     monkeypatch.setattr(browser_session_cloud, "get_cloud_provider", lambda: object())
     monkeypatch.setattr(browser_lightpanda, "using_lightpanda_engine", lambda: False)
     monkeypatch.setattr(placement, "resolve", lambda: placement.Placement(placement.TERMINAL, "ssh"))
+    monkeypatch.setattr(placement, "terminal_environment", lambda **_kw: object())
     monkeypatch.setattr(executor, "available", lambda **_kw: True)
+    monkeypatch.setattr(executor, "probe_harness", lambda _env: True)
     session = Mock(return_value={"features": {"sandbox": True}, "cdp_url": "ws://127.0.0.1:9"})
     monkeypatch.setattr(browser_session, "get_session_info", session)
     run_remote = Mock(return_value={"success": True})
@@ -390,7 +392,7 @@ def test_availability_follows_active_executor_without_provisioning(monkeypatch):
 
     env = SimpleNamespace()
     lookup = Mock(return_value=env)
-    probe = Mock(return_value=Mock(returncode=0))
+    probe = Mock(return_value=Mock(returncode=0, stdout=b'harness-ready\n'))
     monkeypatch.setattr(native, '_has_cdp_env', lambda env: False)
     monkeypatch.setattr(browser_session_cdp, 'get_cdp_override_raw', lambda: None)
     monkeypatch.setattr(browser_session_cloud, 'get_cloud_provider', lambda: None)
@@ -411,9 +413,7 @@ def test_availability_follows_active_executor_without_provisioning(monkeypatch):
     assert probe.call_args.kwargs['user'] == 'runner'
     assert probe.call_args.kwargs['timeout'] == 4.0  # remaining discovery budget, capped at probe_timeout
     assert native.browser_exec_available()
-    assert probe.call_count == 1  # memoized per (env, executor_python)
-    env._bd_browser_harness.clear()
-    probe.return_value.returncode = 1
+    probe.return_value.stdout = b'harness-missing\n'
     assert not native.browser_exec_available()
     lookup.return_value = None
     assert native.browser_exec_available()
@@ -623,7 +623,7 @@ def test_cua_discovery_shares_one_absolute_budget_with_env_creation(monkeypatch)
         return subprocess.CompletedProcess(argv, 0, b'', b'')
 
     monkeypatch.setattr(streams, 'run_in', run_in)
-    assert sandbox_host.ready_cua_executor(probe_timeout=4.0) is env
+    assert sandbox_host.ready_executor(extra=("cua-driver",), probe_timeout=4.0) is env
     assert seen and 0.25 <= seen[-1] < 4.0  # env creation already consumed part of the shared budget
 
 
@@ -635,12 +635,12 @@ def test_discovery_probes_share_one_budget_under_registry_ceiling(monkeypatch):
     from tools.bot_desktop import sandbox_host
     from tools.environments import streams
 
-    env = SimpleNamespace(_bd_desktop_user=None, _bd_browser_harness={})
+    env = SimpleNamespace(_bd_desktop_user=None, _bd_desktop_home="/home/runner")
     seen = []
 
     def run_in(_env, argv, **kwargs):
         seen.append(kwargs['timeout'])
-        return subprocess.CompletedProcess(argv, 0, b'', b'')
+        return subprocess.CompletedProcess(argv, 0, b'harness-ready\n', b'')
 
     monkeypatch.setattr(streams, 'run_in', run_in)
     monkeypatch.setattr(browser_session_cloud, 'browser_section', lambda: {'executor_python': 'python3'})
@@ -650,6 +650,48 @@ def test_discovery_probes_share_one_budget_under_registry_ceiling(monkeypatch):
     # A cold sequential discovery keeps its whole budget under registry's 10s check_fn ceiling.
     assert sandbox_host.probe_budget(_time.monotonic() + 8.0, 4.0) <= 4.0
     assert sandbox_host.probe_budget(_time.monotonic() - 1.0, 4.0) == 0.25
+
+
+def test_desktop_user_probe_recovers_after_client_error(monkeypatch):
+    from types import SimpleNamespace
+    from tools.bot_desktop import sandbox_host
+    from tools.environments import streams
+
+    env = SimpleNamespace()
+    responses = [Mock(returncode=1, stdout=b''), Mock(returncode=0, stdout=b'desktop-user\n')]
+    monkeypatch.setattr(streams, 'run_in', Mock(side_effect=responses))
+    with pytest.raises(RuntimeError, match='inspect the desktop account'):
+        sandbox_host._user_for(env)
+    assert sandbox_host._user_for(env) == sandbox_host.DESKTOP_USER
+
+
+@pytest.mark.platforms("posix")
+def test_harness_probe_keeps_inherited_python_packages_out_of_the_runner(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+    from tools.environments import streams
+
+    injections = tmp_path / "extra-packages"
+    package = injections / "browser_harness"
+    package.mkdir(parents=True)
+    for module in ("__init__", "run", "admin"):
+        (package / (module + ".py")).touch()
+    python = tmp_path / "python-no-site"
+    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" -S "$@"\n')
+    python.chmod(0o700)
+    monkeypatch.setattr(executor, "_executor_python", lambda: str(python))
+    monkeypatch.setenv("PYTHONPATH", str(injections))
+    # The package is usable with the executor's inherited environment.
+    subprocess.run([str(python), "-c", "import browser_harness.run"], check=True, env=os.environ)
+
+    def run_in(_env, argv, **kwargs):
+        return subprocess.run(argv, capture_output=True, timeout=kwargs["timeout"], check=False)
+
+    monkeypatch.setattr(streams, "run_in", run_in)
+    env = SimpleNamespace(_bd_desktop_user=None, _bd_desktop_home=str(tmp_path))
+    assert not executor.probe_harness(env)
 
 
 def test_stock_sandbox_without_remote_harness_falls_back_to_gateway_cli(monkeypatch):
@@ -668,7 +710,9 @@ def test_stock_sandbox_without_remote_harness_falls_back_to_gateway_cli(monkeypa
     monkeypatch.setattr(placement, "executor_only", lambda: False, raising=False)
     monkeypatch.setattr(placement, "terminal_environment", lambda create=False: env)
     monkeypatch.setattr(runtime, "_owned_sandbox_env", lambda reattach=False: env)
-    monkeypatch.setattr(executor, "available", lambda **_kw: False)
+    from tools.environments import streams
+    probe = Mock(return_value=Mock(returncode=1, stdout=b''))
+    monkeypatch.setattr(streams, "run_in", probe)
     monkeypatch.setattr(native, "_find_cli", lambda: ["/gateway/venv/bin/browser-harness"])
     assert native.browser_exec_available()
 
@@ -697,6 +741,11 @@ def test_stock_sandbox_without_remote_harness_falls_back_to_gateway_cli(monkeypa
         return subprocess.CompletedProcess(cmd, 0, "stock-ok\n", "")
 
     monkeypatch.setattr(native, "_run_cli_killing_process_group", fake_run)
+    unavailable = json.loads(native.browser_exec("print(1)", task_id="stock"))
+    assert "Check the executor and retry" in unavailable["error"]
+    assert not seen
+    probe.return_value.returncode = 0
+    probe.return_value.stdout = b'harness-missing\n'
     out = json.loads(native.browser_exec("print(1)", task_id="stock"))
     assert out["success"] and out["output"].strip() == "stock-ok"
     assert seen == {

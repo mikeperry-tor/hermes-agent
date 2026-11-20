@@ -191,9 +191,9 @@ def desktop_home(env: Any, *, timeout: float = 15.0) -> str:
         return cached
     user = _user_for(env, timeout=timeout)
     proc = streams.run_in(env, ["bash", "-c", 'printf %s "$HOME"'], user=user, timeout=timeout)
-    home = proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
-    if not home or not home.startswith("/"):
-        home = f"/home/{DESKTOP_USER}" if user else "/root"
+    home = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode or not home.startswith("/"):
+        raise RuntimeError("Could not read the desktop account's HOME in the terminal sandbox")
     env._bd_desktop_home = home
     return home
 
@@ -210,20 +210,24 @@ _CHROMIUM_PROBE = (
     'for d in "${PLAYWRIGHT_BROWSERS_PATH:-}" /opt/playwright "$HOME/.cache/ms-playwright"; do'
     ' [ -n "$d" ] || continue;'
     ' for c in "$d"/chromium-*/chrome-linux*/chrome; do'
-    ' [ -x "$c" ] && { printf %s "$c"; exit 0; }; done; done; exit 1'
+    ' [ -x "$c" ] && { printf %s "$c"; exit 0; }; done; done; echo chromium-missing'
 )
 
 
 def chromium_executable(env: Any) -> Optional[str]:
     """Path of the Playwright Chromium the agent's browser uses inside ``env`` (the dock's Browser icon must run
     the same binary), or None when the image has none. Cached on the env."""
-    cached = getattr(env, "_bd_chromium", "unset")
-    if cached != "unset":
+    cached = getattr(env, "_bd_chromium", None)
+    if cached is not None:
         return cached
     proc = streams.run_in(env, ["bash", "-c", _CHROMIUM_PROBE], user=_user_for(env), timeout=20)
-    exe = proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else ""
-    env._bd_chromium = exe or None
-    return env._bd_chromium
+    exe = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode or not (exe == "chromium-missing" or exe.startswith("/")):
+        raise RuntimeError("Could not inspect Playwright Chromium in the terminal sandbox")
+    if exe == "chromium-missing":
+        return None
+    env._bd_chromium = exe
+    return exe
 
 
 _GRAB_SCRIPT = """
@@ -261,8 +265,13 @@ def _user_for(env: Any, *, timeout: float = 15.0) -> Optional[str]:
     cached = getattr(env, "_bd_desktop_user", "unset")
     if cached != "unset":
         return cached
-    probe = streams.run_in(env, ["id", "-u", DESKTOP_USER], timeout=timeout)
-    user = DESKTOP_USER if probe.returncode == 0 else None
+    probe = streams.run_in(
+        env, ["bash", "-c", 'if id -u "$0" >/dev/null 2>&1; then echo desktop-user; else echo default-user; fi',
+              DESKTOP_USER], timeout=timeout)
+    result = probe.stdout.strip()
+    if probe.returncode or result not in (b"desktop-user", b"default-user"):
+        raise RuntimeError("Could not inspect the desktop account in the terminal sandbox")
+    user = DESKTOP_USER if result == b"desktop-user" else None
     env._bd_desktop_user = user
     return user
 
@@ -290,7 +299,8 @@ def missing_binaries(env: Any, *, extra: tuple[str, ...] = (), timeout: float = 
     return [b for b in proc.stdout.decode("utf-8", "replace").split() if b]
 
 
-def ready_cua_executor(*, probe_timeout: float = 4.0, deadline: Optional[float] = None) -> Optional[Any]:
+def ready_executor(*, extra: tuple[str, ...] = (), probe_timeout: float = 4.0,
+                   deadline: Optional[float] = None) -> Optional[Any]:
     """Probe the deployment's terminal environment without starting its desktop."""
     from tools.bot_desktop import placement
 
@@ -300,7 +310,7 @@ def ready_cua_executor(*, probe_timeout: float = 4.0, deadline: Optional[float] 
         deadline = time.monotonic() + _DISCOVERY_BUDGET_S
     try:
         env = placement.terminal_environment(create=True)
-        if env is not None and not missing_binaries(env, extra=("cua-driver",),
+        if env is not None and not missing_binaries(env, extra=extra,
                                                     timeout=probe_timeout, deadline=deadline):
             return env
     except (OSError, RuntimeError, subprocess.SubprocessError):

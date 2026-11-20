@@ -31,8 +31,8 @@ _key_locks: dict[str, threading.Lock] = {}
 # and process spawns outside _lock so one cold session never stalls other keys.
 _lock = threading.Lock()
 _HARNESS_PROBE_TIMEOUT_S = 4.0
-# Registry check_fn probes are abandoned after 10s; discovery uses one absolute budget shared
-# with sandbox_host so env creation plus sequential probes cannot sum past the ceiling.
+# Registry check_fn owns its cache and ceiling. Once the environment is ready,
+# discovery spends only the remaining probe budget on dependency checks.
 _DISCOVERY_BUDGET_S = 8.0
 
 
@@ -161,6 +161,10 @@ def _validated_endpoint(key, env, info, expected=None):
     raise RuntimeError('Executor Chromium changed during setup; retry the command')
 
 
+def _executor_env(home: str) -> dict[str, str]:
+    return {'HOME': home, 'PATH': '/usr/local/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+
+
 def _session(key):
     from agent.memory_provider import spawn_context_thread
     from hermes_constants import hermes_home_key
@@ -193,8 +197,7 @@ def _session(key):
         workspace_root = workspace_root.rstrip('/')
         root = streams.sandbox_temp_dir(env).rstrip('/') + '/bh/' + digest
         child_env = {
-            'HOME': home, 'PATH': '/usr/local/bin:/usr/bin:/bin',
-            'LANG': 'C.UTF-8', 'BH_HOME': root, 'BH_CONFIG_DIR': root,
+            **_executor_env(home), 'BH_HOME': root, 'BH_CONFIG_DIR': root,
             'BH_RUNTIME_DIR': root + '/r', 'BH_TMP_DIR': root + '/t',
             'BH_AGENT_WORKSPACE': root, 'BU_NAME': 's' + digest,
             'BH_DOWNLOAD_DIR': workspace_root + '/downloads',
@@ -230,28 +233,33 @@ def _executor_python():
     return python
 
 
-def _probe_harness(env, python: str, *, probe_timeout: float = _HARNESS_PROBE_TIMEOUT_S,
-                   deadline=None) -> bool:
+def probe_harness(env, *, probe_timeout: float = _HARNESS_PROBE_TIMEOUT_S, deadline=None) -> bool:
+    """Return whether the running executor can import the harness."""
     from tools.bot_desktop import sandbox_host
     from tools.environments import streams
 
-    cache = getattr(env, '_bd_browser_harness', None)
-    if isinstance(cache, dict) and python in cache:
-        return cache[python]
     user = sandbox_host._user_for(env, timeout=sandbox_host.probe_budget(deadline, probe_timeout))
-    # One round-trip: bash supplies the account HOME and the interpreter path, so cold executors
-    # do not pay separate user/home/import probes against the discovery budget.
-    probe = streams.run_in(
-        env, ['bash', '-c', 'PATH=/usr/local/bin:/usr/bin:/bin:$PATH exec "$0" -c '
-              '"import browser_harness.run; import browser_harness.admin"', python],
-        user=user, timeout=sandbox_host.probe_budget(deadline, probe_timeout))
-    ok = probe.returncode == 0
-    if isinstance(cache, dict):
-        cache[python] = ok
-    else:
-        with suppress(AttributeError, TypeError):
-            env._bd_browser_harness = {python: ok}
-    return ok
+    home = sandbox_host.desktop_home(env, timeout=sandbox_host.probe_budget(deadline, probe_timeout))
+    # Use the same interpreter search and Python environment as the runner.
+    shell = 'if command -v "$0" >/dev/null; then exec "$0" -c "$1"; else echo harness-missing; fi'
+    imports = """try:
+    import browser_harness.run
+    import browser_harness.admin
+except ImportError:
+    print("harness-missing")
+else:
+    print("harness-ready")
+"""
+    argv = ['env', '-i', *(f'{name}={value}' for name, value in _executor_env(home).items()),
+            'bash', '-c', shell, _executor_python(), imports]
+    probe = streams.run_in(env, argv,
+                           user=user, timeout=sandbox_host.probe_budget(deadline, probe_timeout))
+    # Container clients and SSH can fail before reaching the interpreter.
+    # Only a response from the remote probe can establish a missing harness.
+    result = probe.stdout.strip()
+    if probe.returncode or result not in (b'harness-ready', b'harness-missing'):
+        raise RuntimeError("Could not inspect browser-harness on the terminal executor")
+    return result == b'harness-ready'
 
 
 def available(*, require_ready=False, env=None, probe_timeout: float = _HARNESS_PROBE_TIMEOUT_S,
@@ -261,13 +269,12 @@ def available(*, require_ready=False, env=None, probe_timeout: float = _HARNESS_
     try:
         if deadline is None:
             deadline = time.monotonic() + _DISCOVERY_BUDGET_S
-        python = _executor_python()
         if env is None:
-            env = (sandbox_host.ready_cua_executor(probe_timeout=probe_timeout, deadline=deadline)
+            env = (sandbox_host.ready_executor(probe_timeout=probe_timeout, deadline=deadline)
                    if require_ready else placement.terminal_environment(create=False))
         if env is None:
             return not require_ready
-        return _probe_harness(env, python, probe_timeout=probe_timeout, deadline=deadline)
+        return probe_harness(env, probe_timeout=probe_timeout, deadline=deadline)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return False
 
