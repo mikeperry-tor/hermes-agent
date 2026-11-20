@@ -351,11 +351,11 @@ def _human_lease_refusal(task_id: str) -> Optional[dict[str, Any]]:
     epoch check only discards the result, and a fill is a side effect, not a result.
     """
     from tools.browser_vault_preview import active_page
-    if active_page() is not None:
+    if active_page() is not None or not _bot_desktop_browser_session(task_id):
         return None
     from tools.bot_desktop import lease as _bd_lease
     try:
-        _assert_browser_lease(task_id, None)
+        _bd_lease.assert_agent_may_act()
     except _bd_lease.HumanHasControl as exc:
         return {"success": False, "error_type": "human_has_control", "error": str(exc)}
     return None
@@ -875,7 +875,7 @@ def _trusted_typing_fill(supervisor: Any, task_id: str, type_fills: list[dict[st
         # The same write-time admissions every secret script gets (_eval_js_secret): the channel the
         # origin check ran on (a plugin page that took the task during the focus check leaves the CDP
         # session and document as they were), and the screen a human can have taken since.
-        if _eval_channel(task_id)[2] is not None:
+        if _eval_channel(task_id)[2] is not None or _ensure_supervisor(task_id) is not supervisor:
             return _abort("supervisor_required", _MOVED_WHILE_TYPING)
         taken = _human_lease_refusal(task_id)
         if taken is not None:
@@ -1300,6 +1300,12 @@ def _vault_browser_session(task_id: Optional[str], supervisor=None) -> dict[str,
         # browser_exec names the task here even for a named daemon or hybrid sidecar.
         return {"features": {"local": local}}
     return session_for_task(task_id)
+
+
+def _bot_desktop_browser_session(task_id: str) -> bool:
+    from tools.browser_session import shares_bot_desktop_browser
+
+    return shares_bot_desktop_browser(_vault_browser_session(task_id))
 
 
 def _assert_browser_lease(task_id: str, supervisor) -> None:

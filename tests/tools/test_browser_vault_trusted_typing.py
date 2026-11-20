@@ -85,7 +85,7 @@ def _fresh_lease(monkeypatch):
     reset_lease()
 
 
-def _fill(sup, tmp_path, *, bot_desktop=False, page=lambda t: None, with_identifier=True):
+def _fill(sup, tmp_path, *, bot_desktop=False, page=lambda t: None, with_identifier=True, owner=None):
     from tools import browser_vault_tool
 
     store = VaultStore(base_dir=tmp_path / "vault")
@@ -94,7 +94,7 @@ def _fill(sup, tmp_path, *, bot_desktop=False, page=lambda t: None, with_identif
                                   "password": PASSWORD, "origin": "https://example.com"})
     with ExitStack() as stack:
         stack.enter_context(patch("agent.vault_store.get_vault_store", return_value=store))
-        stack.enter_context(patch.object(browser_vault_tool, "_ensure_supervisor", return_value=sup))
+        stack.enter_context(patch.object(browser_vault_tool, "_ensure_supervisor", side_effect=owner or (lambda _task_id: sup)))
         stack.enter_context(patch.object(browser_vault_tool, "_page_backend", side_effect=page))
         stack.enter_context(patch.object(browser_vault_tool, "_bot_desktop_browser_session", return_value=bot_desktop))
         stack.enter_context(patch.object(browser_vault_tool, "_FILL_VERIFY_STABLE_S", 0))
@@ -114,6 +114,16 @@ def test_a_redirect_between_the_focus_check_and_the_keystroke_types_nothing(tmp_
     assert out["success"] is False and out["error_type"] == "page_navigated"
     assert sup.typed == []
     assert PASSWORD not in json.dumps(out)
+
+
+def test_a_replaced_executor_after_focus_types_nothing(tmp_path):
+    sup = _Supervisor(_LOGIN)
+    active = {"supervisor": sup}
+    sup.on_focus = lambda: active.update(supervisor=None)
+    out = _fill(sup, tmp_path, owner=lambda _task: active["supervisor"])
+    assert out["success"] is False and out["error_type"] == "supervisor_required"
+    assert sup.typed == []
+    assert IDENTIFIER not in json.dumps(out)
 
 
 def test_without_a_redirect_the_identifier_is_typed(tmp_path):
