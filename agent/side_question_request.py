@@ -49,6 +49,27 @@ class SideQuestionCapture:
     turn_id: str
     runtime: tuple  # runtime_key(parent) at capture
     context: contextvars.Context = field(repr=False)
+    managed_tool_policy: list[str] | str = field(default_factory=list)
+
+    def policy_matches(self, fork: Any) -> bool:
+        from tools.hosted_tool_policy import managed_disabled_tools
+        from toolsets import managed_tool_policy_key, managed_tool_snapshot_key
+
+        live = managed_tool_policy_key(managed_disabled_tools())
+        return self.managed_tool_policy == live == managed_tool_snapshot_key(fork)
+
+    def pin_prefix(self, fork: Any) -> None:
+        """Reuse the captured system/cache breakpoint and schemas under their producing policy."""
+        import copy
+        from tools.mcp_tool_agent import FROZEN_TOOL_SNAPSHOT_GENERATION
+
+        fork._cached_system_prompt = self.system_prompt
+        fork._cached_system_prompt_static = self.system_prompt_static
+        fork._prompt_managed_tools = self.managed_tool_policy
+        fork._prompt_refresh_epoch = 0
+        fork.tools = copy.deepcopy(self.tools)
+        fork.valid_tool_names = {tool["function"]["name"] for tool in fork.tools}
+        fork._tool_snapshot_generation = FROZEN_TOOL_SNAPSHOT_GENERATION
 
 
 def runtime_key(agent: Any) -> tuple:
@@ -112,12 +133,6 @@ def _build_fork(parent: Any, capture: SideQuestionCapture) -> Any:
     fork, _rt, _routed = build_cache_parity_fork(
         parent, {}, max_iterations=1, write_origin=SIDE_QUESTION_ORIGIN,
     )
-    fork._cached_system_prompt = capture.system_prompt
-    # The static tier decides where the system-prompt cache breakpoint splits; rebuilding it on
-    # the fork re-reads prompt files and can land the marker elsewhere.
-    fork._cached_system_prompt_static = capture.system_prompt_static
-    fork.tools = capture.tools
-    fork.valid_tool_names = {tool["function"]["name"] for tool in capture.tools}
     fork.session_id = capture.session_id
     return fork
 
@@ -159,6 +174,9 @@ def _send(fork: Any, capture: SideQuestionCapture, prompt: str, audit: _Audit) -
         tools_for_api=assembled.tools_for_api, system_message=None, api_call_count=1,
         api_request_id=api_request_id, effective_task_id=task_id, turn_id=turn_id,
     )
+    if not capture.policy_matches(fork):
+        audit.outcome = "refused:policy_changed"
+        return None
     if has_server_side_tools(built.api_kwargs):
         audit.outcome = "refused:server_side_tools"
         return None
@@ -266,6 +284,10 @@ def ask_text_only(
         if runtime_key(parent) != capture.runtime:
             audit.outcome = "refused:runtime_changed"
             return None
+        if not capture.policy_matches(fork):
+            audit.outcome = "refused:policy_changed"
+            return None
+        capture.pin_prefix(fork)
         assistant_message = _send(fork, capture, prompt, audit)
         if assistant_message is None:
             return None
