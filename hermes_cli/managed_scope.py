@@ -34,6 +34,9 @@ _CACHE_LOCK = threading.Lock()
 # path_key -> (*file_cache_version, parsed)
 _CONFIG_CACHE: dict[str, tuple] = {}
 _ENV_CACHE: dict[str, tuple] = {}
+# Last dotenv applied by the process. Keep source templates for routed scopes
+# so they never receive values expanded against another profile's environment.
+_APPLIED_ENV: tuple[Path, list[tuple[str, str | None]], dict[str, str]] | None = None
 
 
 def _under_pytest() -> bool:
@@ -57,7 +60,12 @@ def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
         return None
     else:
         p = _DEFAULT_MANAGED_DIR
-    return p if strict or p.is_dir() else None
+    if strict:
+        return p
+    try:
+        return p if p.is_dir() else None
+    except OSError:
+        return None
 
 
 def invalidate_managed_cache() -> None:
@@ -131,16 +139,62 @@ def load_managed_config(*, strict: bool = False) -> dict:
                               strict=strict)
 
 
+def remember_applied_managed_env(path: Path, raw: list[tuple[str, str | None]], values: dict[str, str]) -> None:
+    global _APPLIED_ENV
+    with _CACHE_LOCK:
+        _APPLIED_ENV = (path, raw, values)
+
+
+def applied_managed_env(path: Path | None) -> dict[str, str]:
+    """Return remembered values for the owning process."""
+    with _CACHE_LOCK:
+        saved = _APPLIED_ENV
+        return saved[2].copy() if saved is not None and saved[0] == path else {}
+
+
+def applied_managed_assignments(path: Path | None) -> list[tuple[str, str | None]]:
+    """Return source templates in order for profile-scoped interpolation."""
+    with _CACHE_LOCK:
+        saved = _APPLIED_ENV
+        return saved[1].copy() if saved is not None and saved[0] == path else []
+
+
+def retain_managed_env_claims(path: Path | None, names: frozenset[str]) -> None:
+    """Forget values whose assignments the administrator removed."""
+    global _APPLIED_ENV
+    with _CACHE_LOCK:
+        saved = _APPLIED_ENV
+        if saved is not None and saved[0] == path:
+            path, raw, values = saved
+            _APPLIED_ENV = (
+                path, [(name, value) for name, value in raw if name in names],
+                {name: values[name] for name in names & values.keys()},
+            )
+
+
 def load_managed_env() -> dict[str, str]:
-    """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
-    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
+    """Parsed managed .env, with installed values retained on a read error."""
+    directory = get_managed_dir(strict=True)
+    if directory is None:
+        return {}
+    path = directory / ".env"
+    try:
+        parsed = _cached_read(path, _ENV_CACHE, _parse_managed_env, strict=True) or {}
+    except FileNotFoundError:
+        parsed = {}
+    except OSError:
+        return {name: value for name, value in dict(applied_managed_assignments(path)).items() if value is not None}
+    except UnicodeError as exc:
+        logger.warning("Could not parse managed dotenv %s: %s", path, exc)
+        return {}
+    retain_managed_env_claims(path, frozenset(parsed))
+    return parsed
 
 
 def _parse_managed_env(path: Path) -> dict[str, str]:
-    from agent.secret_scope import load_env_file
+    from agent.secret_scope import _parse_env_text
 
-    path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
-    return load_env_file(path)
+    return _parse_env_text(path.read_text(encoding="utf-8-sig"))
 
 
 def apply_managed_overlay(config: dict, *, managed_snapshot: Optional[dict] = None) -> dict:
