@@ -3094,6 +3094,9 @@ browser:
   user_data_dir: ""              # Persistent profile shared by every session; "" = fresh profile per session
   require_sandbox: false         # true = require Chromium's sandbox and refuse --no-sandbox bypass flags
   chromium_args: []              # Extra Chromium command-line flags, e.g. ["--lang=de-DE"]
+  # Terminal sandbox desktop browser execution (when Bot Desktop runs in terminal.backend: docker/ssh)
+  executor_python: "python3"     # Interpreter with browser-harness inside the terminal sandbox
+  executor_workspace: ""         # Persistent download/workspace root inside the sandbox; "" = ~/.hermes/browser-use
   # Cloud browser selection (written by `hermes tools` → Browser Automation)
   cloud_provider: local          # local | browserbase | browser-use | firecrawl | nous | <provider plugin>; unset = autodetect from credentials
   auto_local_for_private_urls: true  # With a cloud provider, open LAN/localhost URLs in a local Chromium
