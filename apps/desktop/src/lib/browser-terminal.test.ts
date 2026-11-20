@@ -496,7 +496,7 @@ it('keeps the tab owner through slow relayed startup and closes a published shel
   expect(Socket.instances[0].readyState).not.toBe(3)
   Socket.instances[0].metadata()
   await starting
-  expect(Socket.instances[0].sent[0]).toBe(META + '{"attached":true}')
+  expect(Socket.instances[0].sent[0]).toBe(META + '{"attached":"opaque-server-id"}')
   await api.closeSaved!('remote-pending')
   expect(Socket.instances).toHaveLength(2)
   expect(Socket.instances[1].url.searchParams.get('action')).toBe('close')

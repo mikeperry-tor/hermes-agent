@@ -283,7 +283,7 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
 
           if (ackStartup) {
             if (!state.terminalId) {throw new Error('Host terminal returned no reattachment token')}
-            socket.send(META + '{"attached":true}')
+            socket.send(META + JSON.stringify({ attached: state.terminalId }))
           }
           handshakeComplete = true
 

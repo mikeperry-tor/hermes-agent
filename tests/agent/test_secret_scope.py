@@ -252,7 +252,7 @@ class TestScopeSetupRecovery:
         home = tmp_path / "profiles" / "b"
         home.mkdir(parents=True)
 
-        def boom(home, env_overlay=None):
+        def boom(home, env_overlay=None, *, managed_strict=False):
             raise RuntimeError("terminal policy unreadable")
 
         monkeypatch.setattr("tools.terminal_scope.prepare_profile_terminal_scope", boom)

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
@@ -24,6 +24,7 @@ from hermes_cli.pty_session import (
     _VIEWER_SEND_ERRORS, _VIEWER_SEND_TIMEOUT_SECONDS, WS_CLOSE_VIEWER_STALLED,
     WS_CLOSE_VIEWER_STALLED_REASON, PtySession, PtySessionRegistry, RegistryFull, _close_ws, run_reaper,
 )
+from hermes_cli.web_host_terminal import ExecutorTerminalError
 from hermes_cli.web_host_terminal import META_PREFIX
 from hermes_constants import assert_named_profile_home_live, get_hermes_home
 
@@ -73,6 +74,7 @@ class HostOwner:
     home: Path
     shell: str
     cwd: str
+    environment: str = field(default="gateway", kw_only=True)
 
     def current(self) -> bool:
         """Blocking filesystem reads (home, tombstone): call off-loop."""
@@ -110,7 +112,6 @@ def _request_home(profile: str | None) -> Path:
         if requested and requested.lower() != "current" else get_hermes_home()
     ).resolve()
 
-
 class HostTerminalRegistry(PtySessionRegistry):
     # The most exited shells remembered at once: a tab that redials after the reaper took its
     # shell still learns that it exited (``resolve``).
@@ -134,10 +135,23 @@ class HostTerminalRegistry(PtySessionRegistry):
         raise RegistryFull()
 
     async def create(self, ws: WebSocket, identity: tuple[str, str]):
-        from hermes_cli.web_host_terminal import query_dimension, resolve_argv
+        from hermes_cli.web_host_terminal import query_dimension
         from hermes_cli.web_server_chat import PtyBridge
         token = secrets.token_urlsafe(32)
         owner = None
+        prepared = None
+        if getattr(ws.state, "ssh_terminal", None) is None:
+            from hermes_cli.web_host_terminal import prepare, environment
+            def request_live_home():
+                home = _request_home(ws.query_params.get("profile"))
+                if not _home_live(home):
+                    raise TerminalExpired()
+                return home
+
+            home = await asyncio.to_thread(request_live_home)
+            # Remote preparation must never hold the PTY registry's spawn lock.
+            prepared = await prepare(home, ws.query_params.get("cwd"), mode=environment(ws.app),
+                                     ssh_config=getattr(ws.app.state, "executor_ssh_config", ""))
 
         def spawn():
             nonlocal owner
@@ -145,11 +159,10 @@ class HostTerminalRegistry(PtySessionRegistry):
                 from hermes_cli.web_host_terminal_ssh import prepare_shell
                 owner, argv, cwd, env = prepare_shell(ws, identity)
             else:
-                home = _request_home(ws.query_params.get("profile"))
                 if not _home_live(home):
                     raise TerminalExpired()
-                argv, cwd, env, shell = resolve_argv(home=home, requested_cwd=ws.query_params.get("cwd"))
-                owner = HostOwner(identity, home, shell, cwd)
+                argv, cwd, env, shell, terminal_cwd = prepared
+                owner = HostOwner(identity, home, shell, terminal_cwd, environment=environment(ws.app))
             bridge = PtyBridge.spawn(
                 argv, cwd=cwd, env=env,
                 cols=query_dimension(ws.query_params.get("cols"), 80, 2000),
@@ -162,9 +175,12 @@ class HostTerminalRegistry(PtySessionRegistry):
         session, _ = await self.attach_or_spawn(token, spawn=spawn)
         assert owner is not None  # spawn completed
         self.owners[token] = owner
-        if not await asyncio.to_thread(owner.current):
+        try:
+            if not await asyncio.to_thread(owner.current):
+                raise TerminalExpired()
+        except BaseException:
             await self.remove(token)
-            raise TerminalExpired()
+            raise
         return session, owner
 
     async def resolve(self, token: str, ws: WebSocket, identity: tuple[str, str], *, closing=False):
@@ -281,6 +297,7 @@ async def host_terminal_lifespan(app):
 
 def _metadata(token, owner, registry, *, reconnected, truncated):
     return META_PREFIX + json.dumps({
+        **({"environment": owner.environment} if type(owner) is HostOwner else {}),
         "shell": owner.shell, "terminalId": token, "cwd": owner.cwd,
         "reconnected": reconnected, "retentionSeconds": registry._ttl,
         "truncated": truncated,
@@ -300,9 +317,18 @@ async def _admit(ws: WebSocket, registry: HostTerminalRegistry):
     """
     token = ws.query_params.get("attach")
     action = ws.query_params.get("action")
-    identity = _request_identity(ws)
-    if action not in (None, "close") or (action == "close" and token is None):
+    ssh = getattr(ws.state, "ssh_terminal", None) is not None
+    if (action not in (None, "start", "close") or (action == "close" and token is None)
+            or (action == "start" and (token is not None or ssh or "environment" not in ws.query_params))):
         raise TerminalDenied()
+    expected = ws.query_params.get("environment")
+    if not ssh and action != "close":
+        from hermes_cli.web_host_terminal import environment, ExecutorTerminalError
+        if token is None and (error := getattr(ws.app.state, "terminal_config_error", None)):
+            raise ExecutorTerminalError(error)
+        if token is None and expected is not None and expected != environment(ws.app):
+            raise ExecutorTerminalError("Terminal environment changed; reload the WebApp")
+    identity = _request_identity(ws)
     if token is not None and not TOKEN_RE.fullmatch(token):
         raise TerminalExpired()
     if action == "close" and token not in registry._sessions:
@@ -316,6 +342,9 @@ async def _admit(ws: WebSocket, registry: HostTerminalRegistry):
         await registry.remove(token)
         await _send_closed(ws, token)
         return None
+    if not ssh and expected is not None and expected != owner.environment:
+        from hermes_cli.web_host_terminal import ExecutorTerminalError
+        raise ExecutorTerminalError("Terminal environment changed; reload the WebApp")
     return session, owner
 
 
@@ -392,7 +421,14 @@ async def _queue_frame(ws: WebSocket, inbox: asyncio.Queue, ended: asyncio.Futur
     await inbox.put(msg)
 
 
-async def _read_frames(ws: WebSocket, inbox: asyncio.Queue, ended: asyncio.Future) -> None:
+@dataclass
+class _StartupAck:
+    expected: str | None = None
+    received: bool = False
+
+
+async def _read_frames(ws: WebSocket, inbox: asyncio.Queue, ended: asyncio.Future,
+                       startup_ack: _StartupAck | None = None) -> None:
     """Queue inbound frames. The last item is None, or the error that ended reading
     (re-raised by ``_pump_input`` so the route's handlers still see it). ``ended`` gets the same
     item as soon as reading ends, before it is queued, or None as soon as a full inbox finds the
@@ -401,7 +437,11 @@ async def _read_frames(ws: WebSocket, inbox: asyncio.Queue, ended: asyncio.Futur
     end = None
     try:
         while (msg := await ws.receive()).get("type") != "websocket.disconnect":
-            await _queue_frame(ws, inbox, ended, msg)
+            if startup_ack is not None and (msg.get("text") or "").startswith(META_PREFIX):
+                if msg["text"] == startup_ack.expected:
+                    startup_ack.received = True
+            else:
+                await _queue_frame(ws, inbox, ended, msg)
     except RuntimeError:  # a superseding/drain task already closed us
         pass
     # health: allow BLE001 -- forwarded, not swallowed: _pump_input re-raises it, and a reader that died unqueued would hang the pump
@@ -486,7 +526,7 @@ async def _resize(session: PtySession, ws: WebSocket, size: tuple[int, int], und
 
 
 async def _pump_input(ws: WebSocket, registry: HostTerminalRegistry, token: str,
-                      session: PtySession, owner: HostOwner) -> None:
+                      session: PtySession, owner: HostOwner, *, inbound=None) -> None:
     """Forward keystrokes and resizes while ``ws`` is the attached viewer.
 
     Keystrokes reach the shell only inside ``owner.admit``, so input sent after the
@@ -504,9 +544,12 @@ async def _pump_input(ws: WebSocket, registry: HostTerminalRegistry, token: str,
     buffers input itself, so Windows writes land at once and keep the bridge's deadline.
     """
     from hermes_cli.web_server_chat import _RESIZE_RE
-    inbox: asyncio.Queue = _InputQueue()
-    ended = asyncio.get_running_loop().create_future()
-    reader = asyncio.create_task(_read_frames(ws, inbox, ended))
+    if inbound is None:
+        inbox: asyncio.Queue = _InputQueue()
+        ended = asyncio.get_running_loop().create_future()
+        reader = asyncio.create_task(_read_frames(ws, inbox, ended))
+    else:
+        inbox, ended, reader = inbound
     undo = None
     try:
         # No Ctrl-L/redraw input: arbitrary foreground shell programs own stdin.
@@ -548,29 +591,74 @@ async def _pump_input(ws: WebSocket, registry: HostTerminalRegistry, token: str,
             await reader
 
 
+async def _admit_startup(ws, registry, ended):
+    """Keep disconnect observable during preparation and native spawn admission."""
+    admission = asyncio.create_task(_admit(ws, registry))
+    try:
+        await asyncio.wait((admission, ended), return_when=asyncio.FIRST_COMPLETED)
+        if ended.done():
+            if admission.done() and not admission.cancelled() and admission.exception() is None:
+                admitted = admission.result()
+                if admitted is not None:
+                    await registry.remove(admitted[0].key)
+            raise WebSocketDisconnect()
+        return admission.result()
+    finally:
+        if not admission.done():
+            admission.cancel()
+            with suppress(asyncio.CancelledError):
+                await admission
+
+
 async def host_terminal(ws: WebSocket) -> None:
     """Called only after both the existing WS gate and host policy have passed."""
     from hermes_cli.pty_session import WS_CLOSE_PROCESS_EXITED, WS_CLOSE_PROCESS_EXITED_REASON
     from hermes_cli.web_server_chat import _pty_fail
     session = None
+    inbound = None
+    published = False
+    startup_ack = None
     try:
         registry = get_host_terminals(ws.app)
-        admitted = await _admit(ws, registry)
+        if ws.query_params.get("attach") is None:
+            from hermes_cli.web_host_terminal import environment
+
+            if (ws.query_params.get("startup") == "1" and getattr(ws.state, "ssh_terminal", None) is None
+                    and environment(ws.app) == "executor"):
+                startup_ack = _StartupAck()
+                await ws.send_text(META_PREFIX + '{"preparing":true,"ackStartup":true}')
+            inbox = _InputQueue()
+            ended = asyncio.get_running_loop().create_future()
+            reader = asyncio.create_task(_read_frames(ws, inbox, ended, startup_ack))
+            inbound = inbox, ended, reader
+            admitted = await _admit_startup(ws, registry, ended)
+        else:
+            admitted = await _admit(ws, registry)
         if admitted is None:
             return
         session, owner = admitted
         token = session.key
+        if startup_ack is not None:
+            startup_ack.expected = META_PREFIX + json.dumps({"attached": token}, separators=(",", ":"))
         reconnected = ws.query_params.get("attach") is not None
+        published = reconnected
 
         def initial_text(truncated: bool) -> str:
             # Says whether the replay that follows leaves out older output.
             return _metadata(token, owner, registry, reconnected=reconnected, truncated=truncated)
 
-        if not await session.attach(ws, initial_text=initial_text):
+        def mark_published() -> None:
+            nonlocal published
+            # Negotiated clients retain a fresh shell only after receiving its token.
+            published = startup_ack is None
+
+        if not await session.attach(ws, initial_text=initial_text, on_initial_text_sent=mark_published):
             if session._ws is None:
                 await _close_ws(ws, WS_CLOSE_VIEWER_STALLED, WS_CLOSE_VIEWER_STALLED_REASON)
             return
-        await _pump_input(ws, registry, token, session, owner)
+        await _pump_input(ws, registry, token, session, owner, inbound=inbound)
+    except ExecutorTerminalError as exc:
+        await ws.close(code=4411, reason=str(exc))
     except TerminalDenied:
         await ws.close(code=4403, reason="Terminal belongs to another identity or profile")
     except TerminalExited:
@@ -585,5 +673,12 @@ async def host_terminal(ws: WebSocket) -> None:
     except (OSError, RuntimeError) as exc:
         await _pty_fail(ws, exc, surface="Terminal")
     finally:
+        if inbound is not None:
+            inbound[2].cancel()
+            with suppress(asyncio.CancelledError):
+                await inbound[2]
         if session is not None:
-            session.detach(ws)
+            if published or (startup_ack is not None and startup_ack.received):
+                session.detach(ws)
+            else:
+                await registry.remove(session.key)

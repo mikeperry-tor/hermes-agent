@@ -180,19 +180,21 @@ class SshEndpoint:
         return f"{self.user}@{self.host}" if self.user else self.host
 
 
-def base_ssh_options(control_path: str, connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S) -> list[str]:
+def base_ssh_options(control_path: str, connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S, *,
+                     strict_host_key: bool = False) -> list[str]:
     connect_secs = max(1, round(connect_timeout_s))
     mux = ["-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto",
            "-o", f"ControlPersist={CONTROL_PERSIST_S}"] if control_path else []
-    return [*mux, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+    return [*mux, "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes" if strict_host_key else "StrictHostKeyChecking=accept-new",
             "-o", "ExitOnForwardFailure=yes", "-o", f"ConnectTimeout={connect_secs}",
             # 15s keepalive, drop after 3 misses, so NAT/firewall timeouts can't silently kill it.
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "TCPKeepAlive=yes"]
 
 
-def host_args(endpoint: SshEndpoint) -> list[str]:
+def host_args(endpoint: SshEndpoint, *, explicit_port: bool = False) -> list[str]:
     args: list[str] = []
-    if endpoint.port and endpoint.port != 22:
+    if explicit_port or (endpoint.port and endpoint.port != 22):
         args += ["-p", str(endpoint.port)]
     if endpoint.key_path:
         validate_key_path(endpoint.key_path)
@@ -201,8 +203,11 @@ def host_args(endpoint: SshEndpoint) -> list[str]:
 
 
 def build_exec_args(endpoint: SshEndpoint, remote_command: str,
-                    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S) -> list[str]:
-    return [*base_ssh_options(endpoint.control_path, connect_timeout_s), *host_args(endpoint),
+                    connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S, *, ssh_config: str = "") -> list[str]:
+    fixed = ["-F", ssh_config, "-o", "ControlPath=none", "-o", "IdentitiesOnly=yes", "-o", "ForwardAgent=no",
+             "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes", "-o", "EscapeChar=none"] if ssh_config else []
+    return [*fixed, *base_ssh_options(endpoint.control_path, connect_timeout_s, strict_host_key=bool(ssh_config)),
+            *host_args(endpoint, explicit_port=bool(ssh_config)),
             "--", endpoint.target, remote_command]
 
 

@@ -84,6 +84,7 @@ def bind_state(
     terminal: bool = True,
     terminal_policy: Any = None,
     defer_terminal: bool = False,
+    terminal_managed_strict: bool = False,
 ) -> StateToken:
     """Bind *scope* and the profile state derived from its home as one change; return its token
     (``reset()`` or use it as a context manager).
@@ -138,7 +139,8 @@ def bind_state(
         # Under the target's home and secrets: a managed ``${VAR}`` in ``terminal:`` resolves
         # against the profile being bound, never the one bound now or the launch environment.
         with push_state(home=home, secrets=bound_secrets):
-            policy = prepare_profile_terminal_scope(Path(home), env_overlay=env_overlay)
+            policy = prepare_profile_terminal_scope(
+                Path(home), env_overlay=env_overlay, managed_strict=terminal_managed_strict)
     else:
         policy = kept.terminal
     return push_state(scope=scope, home=home if home_override else kept.home,
@@ -148,6 +150,7 @@ def bind_state(
 def _bind_whole_profile(
     scope: Scope, *, secrets: Optional[Mapping[str, str]] = None, hydrate_secrets: bool = True,
     env_overlay: Optional[dict[str, str]] = None, defer_terminal: bool = False,
+    terminal_managed_strict: bool = False,
 ) -> StateToken:
     """Home, secrets and terminal policy for local *scope*, together. The process's own home keeps
     its launch semantics (environment over ``.env``, the frozen launch ``TERMINAL_*`` overlay,
@@ -158,19 +161,22 @@ def _bind_whole_profile(
         from tui_gateway.launch_profile_policy import launch_secret_scope, launch_terminal_env
         return bind_state(scope, secrets=launch_secret_scope(Path(scope.agent)) if secrets is None else secrets,
                           stamp_home=False, env_overlay=launch_terminal_env() if env_overlay is None else env_overlay,
-                          defer_terminal=defer_terminal)
+                          defer_terminal=defer_terminal, terminal_managed_strict=terminal_managed_strict)
     return bind_state(scope, secrets=secrets, hydrate_secrets=hydrate_secrets, env_overlay=env_overlay,
-                      defer_terminal=defer_terminal)
+                      defer_terminal=defer_terminal, terminal_managed_strict=terminal_managed_strict)
 
 
 @contextmanager
-def bind_profile_scope(home: str | Path, *, hydrate_secrets: bool = True) -> Iterator[Scope]:
+def bind_profile_scope(
+    home: str | Path, *, hydrate_secrets: bool = True, terminal_managed_strict: bool = False,
+) -> Iterator[Scope]:
     """Run a body for local profile *home*: home, secrets and terminal policy bound together.
 
     The replacement for calling the legacy setters directly. A turn inside it is marked with
-    :func:`bind_turn`. Refuses inside a hosted scope."""
+    :func:`bind_turn`. Refuses inside a hosted scope. Executor shell admission uses
+    ``terminal_managed_strict`` to refuse invalid managed terminal policy."""
     scope = scope_for_profile(home)
-    with _bind_whole_profile(scope, hydrate_secrets=hydrate_secrets):
+    with _bind_whole_profile(scope, hydrate_secrets=hydrate_secrets, terminal_managed_strict=terminal_managed_strict):
         yield scope
 
 
