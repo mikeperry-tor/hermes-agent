@@ -472,6 +472,273 @@ def test_unavailable_source_summaries_only_probe_and_count_permitted_entries(pol
     denied.assert_not_called()
 
 
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("disable_bridge", [False, True])
+def test_agent_snapshot_replaces_stale_bridge_and_dynamic_tools(policy, monkeypatch, resume, disable_bridge):
+    import model_tools
+    from agent.turn_context import _refresh_mcp_tools_between_turns
+    from tools import bot_mode_dm, mcp_tool_agent, tool_search
+    from tools.mcp_tool_discovery import has_registered_mcp_tools
+    from tools.registry import registry
+    from toolsets import tool_selection_key
+
+    def schema(name, description="Fixture"):
+        return {"name": name, "description": description, "parameters": {}}
+
+    def definition(name, description="Fixture"):
+        return {"type": "function", "function": schema(name, description)}
+
+    allowed, denied = "policy_fixture_allowed", "policy_fixture_denied"
+    names = {allowed, denied}
+    monkeypatch.setattr(model_tools, "_select_tool_names", lambda *args: names)
+    monkeypatch.setattr(tool_search, "load_config", lambda: tool_search.ToolSearchConfig.from_raw(
+        {"enabled": "on", "defer": list(names)}))
+    monkeypatch.setattr(bot_mode_dm, "message_agent_authorized", lambda _agent: True)
+    for name in names:
+        registry.register(name=name, toolset="policy_fixture", schema=schema(name),
+                          handler=lambda args, **kw: "{}")
+    try:
+        assert not has_registered_mcp_tools()
+        previous = [definition("tool_search", f"Search {denied}"), definition("tool_call"),
+                    definition(denied), definition("lcm_hidden"), definition("memory_hidden"),
+                    definition("message_agent")]
+        agent = SimpleNamespace(tools=previous.copy(),
+            valid_tool_names={item["function"]["name"] for item in previous},
+            _tool_snapshot_selection=tool_selection_key(None, None), _skip_mcp_refresh=True,
+            _memory_manager=SimpleNamespace(get_all_tool_schemas=lambda: [schema("memory_hidden")]),
+            context_compressor=SimpleNamespace(get_tool_schemas=lambda: [schema("lcm_hidden")]),
+            _context_engine_tool_names={"lcm_hidden"})
+        disabled = [denied, "lcm_hidden", "memory_hidden", "message_agent"]
+        if disable_bridge:
+            disabled.append("tool_call")
+        policy(f"tools:\n  disabled: {json.dumps(disabled)}\n")
+        fresh = model_tools.get_tool_definitions(quiet_mode=True)
+        fresh_names = {item["function"]["name"] for item in fresh}
+        if disable_bridge:
+            assert fresh_names == {allowed}
+        else:
+            assert "tool_search" in fresh_names and allowed in json.dumps(fresh)
+        assert denied not in json.dumps(fresh)
+        if resume:
+            agent.tools = fresh.copy()
+            agent.valid_tool_names = fresh_names.copy()
+            agent._tool_snapshot_selection = tool_selection_key(None, None)
+            agent._context_engine_tool_names.clear()
+            saved = {"version": mcp_tool_agent.tool_pin_version(), "tools": previous}
+            mcp_tool_agent.restore_agent_tool_prefix(agent, saved)
+        else:
+            _refresh_mcp_tools_between_turns(agent)
+        assert agent.tools == fresh
+        assert agent.valid_tool_names == fresh_names and not agent._context_engine_tool_names
+
+        # The Bot Chat per-turn injection also drops a stale schema and routing entry.
+        agent.tools.append(definition("message_agent"))
+        agent.valid_tool_names.add("message_agent")
+        assert not bot_mode_dm.ensure_message_agent_tool(agent)
+        assert agent.tools == fresh and agent.valid_tool_names == fresh_names
+        if not resume:
+            for invalid in ("tools: [unterminated", "null"):
+                policy(invalid)
+                _refresh_mcp_tools_between_turns(agent)
+                assert not agent.tools and not agent.valid_tool_names and not agent._context_engine_tool_names
+            policy("tools:\n  disabled: []\n")
+            _refresh_mcp_tools_between_turns(agent)
+            assert denied in json.dumps(agent.tools)
+            assert {"memory_hidden", "lcm_hidden", "message_agent"} <= agent.valid_tool_names
+            assert agent._context_engine_tool_names == {"lcm_hidden"}
+    finally:
+        for name in names:
+            registry.deregister(name)
+
+
+def test_managed_pin_keeps_frozen_schema_and_delegation_until_policy_changes(policy, monkeypatch):
+    import model_tools
+    from tools import mcp_tool_agent
+    from tools.registry import registry
+    from toolsets import tool_selection_key
+
+    def definition(name, description):
+        return {"type": "function", "function": {"name": name, "description": description, "parameters": {}}}
+
+    saved_defs = [definition("delegate_task", "Pinned delegation variant"),
+                  definition("tool_search", "Pinned permitted catalog")]
+    policy("tools:\n  disabled: [terminal]\n")
+    db = Mock()
+
+    def agent_with(definitions, backend):
+        return SimpleNamespace(tools=definitions, session_id="pinned-managed-tools",
+            valid_tool_names={item["function"]["name"] for item in definitions}, _session_db=db,
+            _delegation_backend=backend, _tool_snapshot_selection=tool_selection_key(None, None),
+            _tool_snapshot_generation=registry._generation)
+
+    sent = agent_with(saved_defs, "pinned-backend")
+    mcp_tool_agent.persist_agent_tool_names(sent)
+    pin = db.update_session_tool_names.call_args.args[1]
+    assert pin["managed_disabled_tools"] == ["terminal"]
+    db.reset_mock()
+    changed = [definition("delegate_task", "Fresh delegation variant"), definition("tool_search", "Fresh catalog")]
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kw: changed)
+    resident = agent_with(saved_defs, "pinned-backend")
+    mcp_tool_agent.refresh_agent_mcp_tools(resident, preserve_prefix=True, content_aware=True)
+    assert resident.tools == saved_defs and resident._delegation_backend == "pinned-backend"
+
+    resumed = agent_with(changed, "fresh-backend")
+    assert mcp_tool_agent.restore_agent_tool_prefix(resumed, pin)
+    assert resumed.tools == saved_defs and resumed._delegation_backend == "pinned-backend"
+    db.update_session_tool_names.assert_not_called()
+
+    policy("tools:\n  disabled: []\n")
+    resumed = agent_with(changed, "fresh-backend")
+    mcp_tool_agent.restore_agent_tool_prefix(resumed, pin)
+    assert resumed.tools == changed and resumed._delegation_backend == "fresh-backend"
+    new_pin = db.update_session_tool_names.call_args.args[1]
+    assert new_pin["tools"] == changed and "managed_disabled_tools" not in new_pin
+
+
+@pytest.mark.parametrize("competing_refresh", [False, True])
+def test_refresh_discards_a_policy_superseded_mid_build(policy, monkeypatch, competing_refresh):
+    import model_tools
+    from tools import mcp_tool_agent
+    from tools.registry import registry
+    from toolsets import tool_selection_key
+
+    def tool(name, description):
+        return {"type": "function", "function": {"name": name, "description": description}}
+
+    mixed = [tool("allowed", "See policy_fixture_denied"),
+             tool("policy_fixture_denied", "Old capability"), tool("tool_call", "Old bridge")]
+    fresh = [tool("allowed", "Direct allowed tool")]
+    db = Mock()
+    generation = registry._generation
+    agent = SimpleNamespace(tools=mixed.copy(), valid_tool_names={"allowed", "policy_fixture_denied", "tool_call"},
+        _tool_snapshot_selection=tool_selection_key(None, None), _tool_snapshot_generation=generation,
+        _session_db=db, session_id="policy-race")
+    builds = []
+
+    def schema_build(*, managed_policy=None, **_kwargs):
+        builds.append(managed_policy)
+        if not managed_policy:
+            policy("tools:\n  disabled: [policy_fixture_denied, tool_call]\n")
+            if competing_refresh:
+                mcp_tool_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+            return mixed.copy()
+        return fresh.copy()
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", schema_build)
+    mcp_tool_agent.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+    assert registry._generation == generation
+    assert builds[0] == frozenset() and builds[-1] == frozenset({"policy_fixture_denied", "tool_call"})
+    assert agent.tools == fresh and agent.valid_tool_names == {"allowed"}
+    assert agent._tool_snapshot_selection[2] == frozenset({"policy_fixture_denied", "tool_call"})
+    assert db.update_session_tool_names.call_count == 1
+    pin = db.update_session_tool_names.call_args.args[1]
+    assert pin["tools"] == fresh and pin["managed_disabled_tools"] == ["policy_fixture_denied", "tool_call"]
+
+
+def test_concurrent_refresh_wins_over_restoring_a_saved_pin(policy, monkeypatch):
+    import model_tools
+    from tools import mcp_tool_agent
+    from tools.registry import registry
+    from toolsets import tool_selection_key
+
+    def tool(name, description):
+        return {"type": "function", "function": {"name": name, "description": description}}
+
+    old = [tool("allowed", "Old prefix mentioning terminal"), tool("terminal", "Old terminal")]
+    fresh = [tool("allowed", "Current permitted tool")]
+    initial = [tool("allowed", "Initial discovery permit"), old[1]]
+    agent = SimpleNamespace(tools=initial, valid_tool_names={"allowed", "terminal"},
+        _tool_snapshot_selection=tool_selection_key(None, None), _tool_snapshot_generation=registry._generation,
+        _session_db=Mock(), session_id="restore-race", _delegation_backend="fresh")
+    saved = {"version": mcp_tool_agent.tool_pin_version(), "tools": old, "delegation_backend": "old"}
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kwargs: fresh.copy())
+    original_drop = mcp_tool_agent._drop_session_tools
+
+    def concurrent_drop(target, tools, names, permitted):
+        if "terminal" in names:
+            policy("tools:\n  disabled: [terminal]\n")
+            mcp_tool_agent.refresh_agent_mcp_tools(target, preserve_prefix=True)
+        return original_drop(target, tools, names, permitted)
+
+    monkeypatch.setattr(mcp_tool_agent, "_drop_session_tools", concurrent_drop)
+    assert not mcp_tool_agent.restore_agent_tool_prefix(agent, saved)
+    assert agent.tools == fresh and agent.valid_tool_names == {"allowed"}
+    assert agent._tool_snapshot_selection[2] == frozenset({"terminal"})
+    assert agent._delegation_backend != "old"
+
+
+def test_prompt_cannot_observe_names_halfway_through_snapshot_publication(policy, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock, current_thread
+
+    import model_tools
+    from agent.prompt_refresh import build_prompt_with_policy
+    from tools import mcp_tool_agent
+    from toolsets import tool_selection_key
+
+    selection_written, resume_publish, reader_ready = Event(), Event(), Event()
+
+    class PausedAgent(SimpleNamespace):
+        def __setattr__(self, name, value):
+            super().__setattr__(name, value)
+            if name == "_tool_snapshot_selection" and value[2]:
+                selection_written.set()
+                assert resume_publish.wait(5)
+
+    class ObservedLock:
+        def __init__(self):
+            self.lock = Lock()
+
+        def __enter__(self):
+            if current_thread().name.startswith("prompt-reader"):
+                reader_ready.set()
+            return self.lock.__enter__()
+
+        def __exit__(self, *args):
+            return self.lock.__exit__(*args)
+
+    denied = "policy_fixture_retired"
+    old = {"type": "function", "function": {"name": denied, "description": "Old tool"}}
+    agent = PausedAgent(tools=[old], valid_tool_names={denied},
+                        _tool_snapshot_selection=tool_selection_key(None, None))
+    agent._build_system_prompt = lambda _: ",".join(sorted(agent.valid_tool_names))
+    monkeypatch.setattr(mcp_tool_agent, "_agent_tools_lock", ObservedLock())
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kwargs: [])
+    policy(f"tools:\n  disabled: [{denied}]\n")
+
+    def render():
+        result = build_prompt_with_policy(agent, None)
+        reader_ready.set()  # old implementation reads the mixed fields without attempting the lock
+        return result
+
+    with ThreadPoolExecutor(1, thread_name_prefix="tool-publisher") as publisher:
+        with ThreadPoolExecutor(1, thread_name_prefix="prompt-reader") as reader:
+            pending_publish = publisher.submit(mcp_tool_agent.refresh_agent_mcp_tools, agent)
+            try:
+                assert selection_written.wait(5)
+                pending_prompt = reader.submit(render)
+                assert reader_ready.wait(5)
+            finally:
+                resume_publish.set()
+            pending_publish.result(timeout=5)
+            assert pending_prompt.result(timeout=5) == ("", [denied])
+
+
+def test_appended_memory_and_context_engine_schemas_obey_denials(policy):
+    from agent.memory_manager_tools import inject_memory_provider_tools
+    from agent.agent_init import _inject_context_engine_tools
+    schemas = [{'name': name, 'description': name, 'parameters': {}} for name in ['retained', 'denied']]
+    policy('tools:\n  disabled: [denied]\n')
+    agent = SimpleNamespace(_memory_manager=SimpleNamespace(get_all_tool_schemas=lambda: schemas),
+        tools=[], valid_tool_names=set(), enabled_toolsets=None)
+    assert inject_memory_provider_tools(agent) == 1
+    assert agent.valid_tool_names == {'retained'}
+    compressor = Mock(); compressor.get_tool_schemas.return_value = schemas
+    agent.context_compressor = compressor
+    _inject_context_engine_tools(agent)
+    assert agent.valid_tool_names == {'retained'} and agent._context_engine_tool_names == set()
+
+
 def test_remote_backend_retains_native_managed_authority(policy, monkeypatch):
     from hermes_cli import config_backend
     from tools.hosted_tool_policy import tool_refusal
@@ -595,6 +862,68 @@ def test_search_and_describe_project_current_policy_after_connector_request(poli
         tool_search.dispatch_tool_search(search_args, current_tool_defs=definitions, connector_search=connector)
         tool_search.dispatch_tool_describe(describe_args, current_tool_defs=definitions, connector_describe=connector)
         connector.assert_not_called()
+
+
+def test_nonquiet_startup_never_checks_denied_tool_requirements(policy, monkeypatch):
+    import model_tools
+    from agent.agent_init import _load_tools
+    from tools.registry import registry
+
+    denied, allowed = 'managed_fixture_denied_check', 'managed_fixture_allowed_check'
+    deny_probe, allow_probe = Mock(return_value=False), Mock(return_value=True)
+    for name, check in ((denied, deny_probe), (allowed, allow_probe)):
+        registry.register(name=name, toolset='managed-fixture-checks', check_fn=check,
+                          schema={'name': name, 'description': name, 'parameters': {}},
+                          handler=lambda args, **kw: '{}')
+
+    monkeypatch.setattr('hermes_cli.plugins.discover_plugins', lambda: None)
+    monkeypatch.setattr(model_tools, 'get_tool_definitions', lambda **kw: [{'function': {'name': allowed}}])
+    agent = SimpleNamespace(quiet_mode=False, save_trajectories=False, ephemeral_system_prompt=None,
+                            _use_prompt_caching=False, _safe_print=Mock())
+    policy(f'tools:\n  disabled: [{denied}]\n')
+    try:
+        _load_tools(agent, enabled_toolsets=None, disabled_toolsets=None)
+        deny_probe.assert_not_called()
+        allow_probe.assert_called()
+    finally:
+        registry.deregister(denied)
+        registry.deregister(allowed)
+
+
+def test_generated_tool_guidance_respects_partial_schema_selection(monkeypatch, policy):
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.system_prompt import _bot_mode_parts, _tool_guidance_block
+    from tools.bot_mode_dm import ensure_message_agent_tool
+    from tools.bot_mode_probe import BOT_CHAT_TITLE
+    from toolsets import tool_selection_key
+
+    monkeypatch.setenv('HERMES_KANBAN_TASK', 't_worker')
+    monkeypatch.setattr('tools.bot_mode_probe.get_bot_mode_protocol_section', lambda home: 'Send with message_agent')
+    monkeypatch.setattr('tools.bot_mode_probe.epoch_line', lambda home: 'EPOCH')
+    monkeypatch.setattr('tools.bot_mode_dm.message_agent_authorized', lambda agent: True)
+    agent = SimpleNamespace(_session_title_hint=BOT_CHAT_TITLE, tools=[],
+                            valid_tool_names={'kanban_show', 'kanban_create'})
+    policy('tools:\n  disabled: [message_agent]\n')
+    agent._tool_snapshot_selection = tool_selection_key(None, None)
+    bot, marker = _bot_mode_parts(agent)
+    assert 'message_agent' not in bot and 'final response' in bot
+    assert marker == 'EPOCH'
+    assert not ensure_message_agent_tool(agent)
+    kanban = _tool_guidance_block(agent)
+    assert 'kanban_show' in kanban and 'kanban_create' in kanban
+    for denied in ('kanban_heartbeat', 'kanban_complete', 'kanban_block', 'kanban_request_review'):
+        assert denied not in kanban
+
+    import re
+    agent.valid_tool_names.update(re.findall(r'\bkanban_\w+', KANBAN_GUIDANCE))
+    policy('tools:\n  disabled: []\n')
+    agent._tool_snapshot_selection = tool_selection_key(None, None)
+    # Fresh prompts are assembled before the tool is appended for the turn.
+    assert 'message_agent' not in agent.valid_tool_names
+    assert _bot_mode_parts(agent) == ['Send with message_agent', 'EPOCH']
+    assert ensure_message_agent_tool(agent)
+    assert 'message_agent' in agent.valid_tool_names
+    assert _tool_guidance_block(agent) == KANBAN_GUIDANCE
 
 
 def test_cli_banner_probes_only_permitted_tools_in_mixed_and_denied_toolsets(policy):

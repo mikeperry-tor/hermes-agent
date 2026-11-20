@@ -21796,11 +21796,7 @@ def test_prompt_submit_unconfirmed_truncation_refuses_before_target_resolution(
 
 
 def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_path):
-    """Issue #50233: _persist_live_session_system_prompt must re-bind
-    HERMES_HOME to the session's profile before rebuilding the system
-    prompt.  Without this, a /model switch rebuilds the prompt with the
-    root profile's SOUL.md and skills instead of the session's profile.
-    """
+    """A model switch persists the live profile's prompt and policy (#50233)."""
     profile_home = tmp_path / "profile-work"
     profile_home.mkdir()
     (profile_home / "SOUL.md").write_text(
@@ -21808,12 +21804,14 @@ def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_p
     )
 
     built_homes = []
+    persisted = []
 
     class FakeAgent:
         model = "test-model"
         provider = "test"
         _cached_system_prompt = None
         _session_db = None
+        _tool_snapshot_selection = (None, frozenset(), frozenset({"terminal"}))
 
         def _build_system_prompt(self, system_message=None):
             from hermes_constants import get_hermes_home
@@ -21830,8 +21828,8 @@ def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_p
         pass
 
     class FakeSessions:
-        def update_system_prompt(self, session_id, prompt):
-            pass
+        def update_system_prompt(self, session_id, prompt, *, managed_tools=None):
+            persisted.append((session_id, prompt, managed_tools))
 
     persistence = types.SimpleNamespace(sessions=FakeSessions())
     monkeypatch.setattr(
@@ -21853,6 +21851,7 @@ def test_persist_live_session_system_prompt_uses_profile_home(monkeypatch, tmp_p
         f"system prompt built with wrong home: {built_homes[0]}"
     )
     assert "Work persona" in agent._cached_system_prompt
+    assert persisted == [("test-key", agent._cached_system_prompt, ["terminal"])]
 
     # The override must have been reset after the call.
     from hermes_constants import get_hermes_home_override
@@ -21874,7 +21873,7 @@ def test_persist_live_session_system_prompt_no_profile_is_unchanged(monkeypatch)
         pass
 
     class FakeSessions:
-        def update_system_prompt(self, session_id, prompt):
+        def update_system_prompt(self, session_id, prompt, *, managed_tools=None):
             pass
 
     persistence = types.SimpleNamespace(sessions=FakeSessions())
@@ -21925,7 +21924,7 @@ def test_persist_live_session_system_prompt_restores_pre_existing_override(monke
         pass
 
     class FakeSessions:
-        def update_system_prompt(self, session_id, prompt):
+        def update_system_prompt(self, session_id, prompt, *, managed_tools=None):
             pass
 
     persistence = types.SimpleNamespace(sessions=FakeSessions())
@@ -21991,7 +21990,7 @@ def test_persist_live_session_system_prompt_binds_session_cwd(monkeypatch, tmp_p
         pass
 
     class FakeSessions:
-        def update_system_prompt(self, session_id, prompt):
+        def update_system_prompt(self, session_id, prompt, *, managed_tools=None):
             persisted["prompt"] = prompt
 
     persistence = types.SimpleNamespace(sessions=FakeSessions())

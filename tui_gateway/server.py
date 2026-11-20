@@ -1107,6 +1107,8 @@ def _live_session_agent_db(session: dict | None):
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
     """Refresh the stored system prompt after a live runtime identity change."""
+    from agent.prompt_refresh import build_prompt_with_policy
+
     live = _live_session_agent_db(session)
     if live is None or not hasattr(live[0], "_build_system_prompt"):
         return
@@ -1114,15 +1116,18 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     with _persistence_for(db) as persistence:
         if persistence is None:
             return
-        # Re-bind the session's profile runtime scope (the build's finally reset it → root profile's SOUL.md/skills,
-        # #50233) and session context (on the RPC thread _SESSION_CWD is unset → the process TERMINAL_CWD would
-        # persist). The full scope, not HERMES_HOME alone: the external memory provider's system_prompt_block()
-        # reads its credential through get_secret, which fails closed once this process multiplexes (#112927).
+        # The RPC thread needs the session's cwd, profile and secret scope to render the prompt.
         session_tokens = _set_session_context(session_key, cwd=_session_cwd(session))
         try:
             with _session_profile_runtime_scope(session):
-                prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
-            persistence.sessions.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
+                prompt, producing_policy = build_prompt_with_policy(agent, None)
+                agent._cached_system_prompt = prompt
+            session_target = getattr(agent, "session_id", None) or session_key
+            if producing_policy or getattr(agent, "_prompt_managed_tools", []):
+                persistence.sessions.update_system_prompt(session_target, prompt, managed_tools=producing_policy)
+            else:
+                persistence.sessions.update_system_prompt(session_target, prompt)
+            agent._prompt_managed_tools = producing_policy
         except Exception:
             logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
         finally:

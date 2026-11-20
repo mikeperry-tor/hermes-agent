@@ -22,7 +22,7 @@ import pytest
 from tests.e2e.core.history._helpers import NO_BACKGROUND_REVIEW, OFFLINE_CONFIG
 from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
 from tests.fixtures.storage_read import session_row
-from tests.fixtures.storage_seed import seed_session
+from tests.fixtures.storage_seed import seed_messages, seed_session
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 SOUL_V1 = "You are Wren, the operations assistant. Soul revision one."
@@ -62,11 +62,12 @@ def profile(monkeypatch, tmp_path):
         yield srv, home, project
 
 
-def _agent(srv, home, session_id):
+def _agent(srv, home, session_id, *, seed=True):
     from run_agent import AIAgent
 
     store = storage_handle(home)
-    seed_session(store, session_id, "whatsapp")  # the gateway opens the row before the turn
+    if seed:
+        seed_session(store, session_id, "whatsapp")  # the gateway opens the row before the turn
     return AIAgent(provider="custom", base_url=srv.base_url, api_key="sk-fake-e2e", model="fake-model",
                    session_db=store, persistence=store, session_id=session_id, quiet_mode=True, platform="whatsapp")
 
@@ -101,6 +102,85 @@ def _turn(srv, home, session_id, text, history, agent=None):
         if fresh:
             agent.close()
     return messages, _system(srv.main_requests()[-1])
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_managed_tool_change_updates_cached_prompt_once(profile, tmp_path, monkeypatch, warm):
+    from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+
+    srv, home, project = profile
+    with (home / "config.yaml").open("a") as profile_config:
+        profile_config.write('tools:\n  tool_search:\n    enabled: "off"\n')
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    config = managed / "config.yaml"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    session_id = "managed-tool-prompt"
+    agent = _agent(srv, home, session_id) if warm else None
+    try:
+        history, initial = _turn(srv, home, session_id, "one", [], agent=agent)
+        assert SESSION_SEARCH_GUIDANCE in initial
+
+        config.write_text("tools:\n  disabled: [session_search]\n")
+        history, updated = _turn(srv, home, session_id, "two", history, agent=agent)
+        assert SESSION_SEARCH_GUIDANCE not in updated
+        assert "one" in _user_texts(srv.main_requests()[-1])
+
+        (project / "AGENTS.md").write_text("Project rules changed during a stable managed policy.")
+        history, unchanged = _turn(srv, home, session_id, "three", history, agent=agent)
+        assert unchanged == updated
+
+        config.write_text("tools:\n  disabled: true\n")
+        history, unavailable = _turn(srv, home, session_id, "four", history, agent=agent)
+        assert SESSION_SEARCH_GUIDANCE not in unavailable
+        (project / "AGENTS.md").write_text("Project rules changed again under invalid policy.")
+        history, still_unavailable = _turn(srv, home, session_id, "five", history, agent=agent)
+        assert still_unavailable == unavailable
+
+        config.write_text("tools:\n  disabled: []\n")
+        _history, restored = _turn(srv, home, session_id, "six", history, agent=agent)
+        assert SESSION_SEARCH_GUIDANCE in restored
+    finally:
+        if agent is not None:
+            agent.close()
+
+
+def test_prompt_render_retries_after_a_concurrent_tool_refresh(profile, tmp_path, monkeypatch):
+    from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+    from agent.prompt_refresh import MANAGED_TOOLS_KEY
+    from tools.mcp_tool_agent import refresh_agent_mcp_tools
+
+    srv, home, _project = profile
+    with (home / "config.yaml").open("a") as profile_config:
+        profile_config.write('tools:\n  tool_search:\n    enabled: "off"\n')
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    config = managed / "config.yaml"
+    config.write_text("tools:\n  disabled: [terminal]\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    session_id = "prompt-policy-race"
+    agent = _agent(srv, home, session_id)
+    native_build = agent._build_system_prompt
+    rendered = []
+
+    def superseded_build(message):
+        prompt = native_build(message)
+        rendered.append(prompt)
+        if len(rendered) == 1:
+            config.write_text("tools:\n  disabled: [session_search]\n")
+            refresh_agent_mcp_tools(agent, preserve_prefix=True)
+        return prompt
+
+    monkeypatch.setattr(agent, "_build_system_prompt", superseded_build)
+    try:
+        history, initial = _turn(srv, home, session_id, "one", [], agent=agent)
+        assert SESSION_SEARCH_GUIDANCE in rendered[0]
+        assert SESSION_SEARCH_GUIDANCE not in initial and initial == rendered[-1]
+        assert storage_handle(home).sessions.get(session_id).model_config[MANAGED_TOOLS_KEY] == ["session_search"]
+    finally:
+        agent.close()
+    _, refreshed = _turn(srv, home, session_id, "two", history)
+    assert SESSION_SEARCH_GUIDANCE not in refreshed
 
 
 def _refresh_prompts(monkeypatch, home: Path, *extra: str) -> None:
@@ -408,6 +488,92 @@ def _rotate(srv, home, session_id):
         return warm.session_id, compressed
     finally:
         warm.close()
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_managed_prompt_policy_survives_native_row_creation(profile, tmp_path, monkeypatch, rotate):
+    from agent.prompt_refresh import MANAGED_TOOLS_KEY
+
+    srv, home, project = profile
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text("tools:\n  disabled: [session_search]\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    session = "managed-row"
+    if rotate:
+        session, history = _rotate(srv, home, session)
+    else:
+        warm = _agent(srv, home, session, seed=False)
+        try:
+            history, _ = _turn(srv, home, session, "first turn", [], agent=warm)
+        finally:
+            warm.close()
+
+    row = storage_handle(home).sessions.get(session)
+    assert row.model_config[MANAGED_TOOLS_KEY] == ["session_search"]
+    (project / "AGENTS.md").write_text("This later file edit must wait for a native refresh.")
+    _, resumed = _turn(srv, home, session, "after eviction", history)
+    assert resumed == row.system_prompt
+
+
+def test_in_place_compaction_persists_prompt_and_policy_together(profile, tmp_path, monkeypatch):
+    from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+    from agent.prompt_refresh import MANAGED_TOOLS_KEY
+
+    srv, home, _project = profile
+    with (home / "config.yaml").open("a") as profile_config:
+        profile_config.write('tools:\n  tool_search:\n    enabled: "off"\n')
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    config = managed / "config.yaml"
+    config.write_text("tools:\n  disabled: [session_search]\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    session = "managed-in-place"
+    warm = _agent(srv, home, session)
+    history = []
+    try:
+        for i in range(18):
+            history, _ = _turn(srv, home, session, f"turn {i} " + f"lorem ipsum dolor {i} " * 250,
+                               history, agent=warm)
+        config.write_text("tools:\n  disabled: []\n")
+        warm.compression_in_place = True
+        compacted, _ = warm._compress_context(history, None, force=True)
+        assert warm.session_id == session and len(compacted) < len(history)
+    finally:
+        warm.close()
+    saved = storage_handle(home).sessions.get(session)
+    assert SESSION_SEARCH_GUIDANCE in saved.system_prompt
+
+    config.write_text("tools:\n  disabled: [session_search]\n")
+    _, resumed = _turn(srv, home, session, "after eviction", compacted)
+    assert SESSION_SEARCH_GUIDANCE not in resumed
+    assert saved.model_config[MANAGED_TOOLS_KEY] == []
+
+
+def test_adopting_a_rotated_child_checks_the_childs_prompt_policy(profile, tmp_path, monkeypatch):
+    from agent.conversation_compression import _adopt_live_compression_child
+    from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
+
+    srv, home, _project = profile
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text("tools:\n  disabled: [session_search]\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    parent, child = "rotated-policy-parent", "rotated-policy-child"
+    store = storage_handle(home)
+    seed_session(store, parent, "whatsapp", end_reason="compression")
+    seed_session(store, child, "whatsapp", parent_session_id=parent)
+    seed_messages(store, child, {"role": "user", "content": "Previous turn"})
+    store.sessions.update_system_prompt(child, SESSION_SEARCH_GUIDANCE, managed_tools=[])
+    contender = _agent(srv, home, parent)
+    try:
+        history = _adopt_live_compression_child(contender, store, parent, store)
+        assert contender.session_id == child
+        assert history and contender._cached_system_prompt is None
+        _, resumed = _turn(srv, home, child, "follow the rotated child", history, agent=contender)
+        assert SESSION_SEARCH_GUIDANCE not in resumed
+    finally:
+        contender.close()
 
 
 def test_rotated_compression_keeps_the_refresh_epoch_and_session_flag_targets_the_tip(profile, monkeypatch):

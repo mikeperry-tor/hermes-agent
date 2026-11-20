@@ -91,6 +91,8 @@ def inject_memory_provider_tools(agent: Any) -> int:
         agent.valid_tool_names = set()
     existing_tool_names = {_tool_name(tool) for tool in tools if isinstance(tool, dict)}
     added = 0
+    from toolsets import session_tool_discovery_filter
+    permitted = session_tool_discovery_filter(agent)
     for raw_schema in get_schemas():
         schema = normalize_tool_schema(raw_schema)
         if schema is None:
@@ -98,7 +100,7 @@ def inject_memory_provider_tools(agent: Any) -> int:
                 "Memory provider returned a tool schema with no resolvable "
                 "name; skipping to avoid poisoning the request (%r)", raw_schema,
             )
-        elif schema["name"] not in existing_tool_names:
+        elif schema["name"] not in existing_tool_names and permitted(schema["name"]):
             tools.append({"type": "function", "function": schema})
             agent.valid_tool_names.add(schema["name"])
             existing_tool_names.add(schema["name"])
