@@ -3441,16 +3441,20 @@ The gateway can serve the [Desktop workspace in a browser](./desktop.md#use-the-
 
 ```yaml
 webapp:
-  enabled: false     # true: the gateway serves the Webapp
-  host: 127.0.0.1    # 127.0.0.1, ::1 or localhost; or 0.0.0.0 / :: for other machines (dashboard sign-in required)
-  port: 9120         # fixed, so the browser's address stays the same across gateway restarts
-  public_url: ""     # the https:// address a reverse proxy or tunnel serves the Webapp at (sign-in required)
+  enabled: false                 # true: the gateway serves the Webapp
+  host: 127.0.0.1                # 127.0.0.1, ::1 or localhost; or 0.0.0.0 / :: for other machines (dashboard sign-in required)
+  port: 9120                     # fixed, so the browser's address stays the same across gateway restarts
+  public_url: ""                 # the https:// address a reverse proxy or tunnel serves the Webapp at (sign-in required)
+  terminal_environment: gateway  # gateway | executor (open Webapp terminals on each profile's terminal.backend: ssh)
+  executor_ssh_config: ""        # optional absolute OpenSSH -F file for Webapp SSH executor terminals
 ```
 
 - `enabled` — the gateway reads it at start; restart the gateway after changing it (`hermes gateway restart`).
 - `host` — `127.0.0.1`, `::1` or `localhost` keeps the Webapp on this machine. `0.0.0.0` or `::` makes it reachable from other machines and requires a [dashboard sign-in provider](./features/web-dashboard.md#authentication-gated-mode); without one the gateway serves native clients only and `hermes webapp --status` says why. Restart the gateway after adding the provider. Any other value, another loopback address such as `127.0.0.2` included, keeps the Webapp off. In a container, use `0.0.0.0`: a published port or a proxy in another container cannot reach the container's loopback ([Docker → Running the Webapp](./docker.md#running-the-webapp)).
 - `port` — a standalone profile's gateway needs a port other than the default gateway's. **Settings → Web Access → Start** picks one for a standalone profile that sets none (the first free port above 9120 no other profile uses) and saves it here; it never replaces a port you set. When the port is taken, the gateway likewise serves native clients only and `hermes webapp --status` reports why. It also replaces the Webapp's browser sign-in, since another program may have received it, so open tabs need `hermes webapp` again once the port is free.
 - `public_url` — set it when a reverse proxy or tunnel you run serves the Webapp at its own address (forwarding to `host:port`). It turns on dashboard sign-in even on a loopback `host`, where it is also the one outside hostname the Webapp accepts requests for, and sign-in callbacks are built on it. Without a sign-in provider the gateway serves native clients only, as for `0.0.0.0`. It must be an `http://` or `https://` address with no credentials, query or fragment; anything else keeps the Webapp off. `dashboard.public_url` is for `hermes dashboard` and never applies to the Webapp. `dashboard.trusted_proxies` does: the Webapp takes a proxy's `X-Forwarded-*` headers only from loopback and the addresses listed there ([Docker → Behind a tunnel or reverse proxy](./docker.md#webapp-behind-a-proxy)).
+- `terminal_environment` — `gateway` (default) opens Webapp terminal tabs on the serving gateway; `executor` opens them on each selected profile's `terminal.backend: ssh` destination ([Desktop → SSH executor terminals](./desktop.md#ssh-executor-terminals)). Read from the launch profile at Webapp start.
+- `executor_ssh_config` — optional absolute OpenSSH `-F` configuration path used with strict host-key checking and disabled forwarding when `terminal_environment: executor` prepares and opens SSH shells.
 
 Sign-in turns on when `host` is `0.0.0.0` or `::`, or when `public_url` is set, whatever the host. `hermes webapp` then opens the Webapp's address (`public_url` when set, where sign-in returns) for you to sign in with your dashboard account: its one-use links only open a Webapp that needs no sign-in. Native clients (the CLI, TUI and Desktop app) never sign in: the gateway's listener for them never asks for it, whatever the config says.
 

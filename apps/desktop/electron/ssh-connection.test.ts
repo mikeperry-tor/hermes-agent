@@ -236,6 +236,12 @@ test('buildInteractiveSshArgs single-quotes a cwd with quotes safely', () => {
   assert.ok(args[args.length - 1].includes('exec "$SHELL" -l'))
 })
 
+test('interactive SSH preserves literal cwd whitespace', () => {
+  const conn = { user: 'me', host: 'box', port: 22, keyPath: '', controlPath: '/tmp/x.sock' }
+  const args = buildInteractiveSshArgs(conn, '/workspace/trailing ', 15000)
+  assert.equal(args.at(-1), `cd '/workspace/trailing ' 2>/dev/null; exec "$SHELL" -l`)
+})
+
 test('classifySshError detects a changed host key (fail-closed)', () => {
   assert.equal(
     classifySshError('@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@'),

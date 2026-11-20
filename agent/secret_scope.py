@@ -388,11 +388,12 @@ def _parse_env_text(text: str) -> dict[str, str]:
     return secrets
 
 
-def load_env_file(env_path: Path) -> dict[str, str]:
+def load_env_file(env_path: Path, *, strict: bool = False) -> dict[str, str]:
     """THE ``.env`` tokenizer: every reader (profile scope, ``hermes_cli.config.load_env``, the dashboard
     scrub, skill secret capture, managed .env, setup prompts) parses through here so no two boundaries
     disagree on which keys/values a file defines. Dict only — never touches ``os.environ``. ``export``
     prefix, ``#`` comments, quote escapes reversed; a BOM is stripped so it doesn't prefix the first key.
+    Strict readers distinguish an absent file from other read errors.
     Invalid UTF-8 decodes as latin-1, exactly like ``env_loader._load_dotenv_with_fallback`` installs it
     into ``os.environ``. Absent/unreadable → ``{}``.
 
@@ -404,9 +405,11 @@ def load_env_file(env_path: Path) -> dict[str, str]:
     try:
         with open(env_path, "rb") as handle:
             raw = handle.read()
-    except OSError:
+    except OSError as exc:
         # Gone or unreadable: drop any entry so a stale map cannot outlive the file.
         invalidate_env_file_cache(env_path)
+        if strict and not isinstance(exc, FileNotFoundError):
+            raise
         return {}
 
     with _ENV_FILE_CACHE_LOCK:

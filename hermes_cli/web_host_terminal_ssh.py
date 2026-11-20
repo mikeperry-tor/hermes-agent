@@ -61,7 +61,7 @@ def prepare_shell(ws: WebSocket, identity: tuple[str, str]):
 
     connection, path = ws.state.ssh_terminal
     home = get_process_hermes_home().resolve()
-    remote_cwd = (ws.query_params.get("cwd") or "").strip()
+    remote_cwd = (ws.query_params.get("cwd") or "")
     owner = SshOwner(identity, home, "ssh", remote_cwd, path, connection, _profile(ws))
     owner.admit(lambda: None)
     # The remote profile is an attachment scope, never a home resolved on this host.

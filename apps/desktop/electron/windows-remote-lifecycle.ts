@@ -966,7 +966,7 @@ async function connectWindowsRemote(deps) {
 }
 
 function buildWindowsInteractiveCommand(remoteCwd = '') {
-  const cwd = String(remoteCwd || '').trim()
+  const cwd = String(remoteCwd || '')
   const script = ['$ErrorActionPreference="Stop"']
 
   if (cwd) {

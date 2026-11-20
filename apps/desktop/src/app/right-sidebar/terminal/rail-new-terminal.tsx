@@ -35,8 +35,10 @@ type GatewayChoice = Pick<DesktopRegistryConnection, 'id' | 'kind' | 'label'>
 // profile's. The session's cwd is a path on its own host: a tab on another
 // gateway starts in its home instead.
 function openOn(choice: GatewayChoice) {
-  const gateway = shellGatewayFor(choice.id, $activeGatewayProfile.get(), $connectionsRegistry.get())
   const session = defaultTerminalGateway()
+  const gateway = choice.id === session?.connectionId
+    ? session
+    : shellGatewayFor(choice.id, $activeGatewayProfile.get(), $connectionsRegistry.get())
   const sameHost = !session || gateway?.connectionId === session.connectionId
 
   createTerminal(sameHost ? undefined : '', gateway)

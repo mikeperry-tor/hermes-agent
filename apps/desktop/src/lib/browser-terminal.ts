@@ -8,11 +8,15 @@ type TerminalApi = Window['hermesDesktop']['terminal']
 type DataListener = Parameters<TerminalApi['onData']>[1]
 
 interface SavedTerminal {
-  terminalId: string
+  terminalId?: string
   profile: string | null
   /** The gateway the shell runs on. Saved before relayed gateways existed: the serving one. */
   connectionId?: string
+  environment?: TerminalEnvironment
 }
+
+type TerminalEnvironment = 'executor' | 'gateway'
+const isTerminalEnvironment = (value: unknown): value is TerminalEnvironment => value === 'executor' || value === 'gateway'
 
 interface BrowserTerminalOptions {
   basePath: string
@@ -31,6 +35,7 @@ interface TerminalState {
   profile: string | null
   connectionId: string
   terminalId?: string
+  environment?: TerminalEnvironment
   cwd: string
   shell: string
   cols: number
@@ -38,11 +43,14 @@ interface TerminalState {
   socket: WebSocket | null
   generation: number
   stopped: boolean
+  closing?: boolean
   status: HermesTerminalState
   retry: number
   retryTimer: number
   openedAt: number | null
+  cancelStart?: () => void
   cancelDial?: () => void
+  startupCloseReady?: Promise<void>
   started?: Promise<HermesTerminalSession>
   pendingData: Array<{ data: string; replay: boolean }>
   dataListeners: Set<DataListener>
@@ -63,7 +71,7 @@ const START_TIMEOUT = 10_000
 
 // 4401 is what sign-out closes a tab's sockets with; no redial succeeds until the tab signs in again.
 const CLOSE_SIGNALS: Record<number, string> = {
-  4401: 'signed-out', 4403: 'denied', 4409: 'superseded', 4410: 'expired', 1013: 'capacity'
+  4401: 'signed-out', 4403: 'denied', 4409: 'superseded', 4410: 'expired', 4411: 'unavailable', 1013: 'capacity'
 }
 
 class TerminalConnectionError extends Error {
@@ -86,7 +94,10 @@ function sendResumeSize(socket: WebSocket, state: TerminalState, trimmed?: boole
   socket.send(`\u001b[RESIZE:${state.cols};${state.rows}]`)
 }
 
-async function closeSavedShell(saved: SavedTerminal, websocketUrl: BrowserTerminalOptions['websocketUrl']): Promise<boolean> {
+async function closeSavedShell(
+  saved: SavedTerminal & { terminalId: string },
+  websocketUrl: BrowserTerminalOptions['websocketUrl']
+): Promise<boolean> {
   const url = new URL(await websocketUrl(saved.profile, saved.connectionId ?? LOCAL_CONNECTION_ID))
   url.searchParams.set('attach', saved.terminalId)
   url.searchParams.set('action', 'close')
@@ -133,9 +144,54 @@ interface DialContext {
   stopSocket: (state: TerminalState) => void
   emitData: (state: TerminalState, data: string, replay?: boolean) => void
   setStatus: (state: TerminalState, status: HermesTerminalState) => void
-  forget: (state: TerminalState) => void
+  forget: (state: TerminalState, preserveEnvironment?: boolean) => void
   finish: (state: TerminalState, signal: string | null) => void
   reconnect: (state: TerminalState) => void
+}
+
+interface TerminalMetadata {
+  shell?: string
+  cwd?: string
+  terminalId?: string
+  truncated?: boolean
+  environment?: unknown
+  preparing?: boolean
+  ackStartup?: boolean
+}
+
+function applyTerminalMetadata(state: TerminalState, meta: TerminalMetadata, context: DialContext, resuming: boolean): boolean {
+  if (typeof meta.shell !== 'string' || !meta.shell.trim()) {
+    throw new Error('Host terminal returned an empty shell identity')
+  }
+  if (resuming && meta.terminalId !== state.terminalId) {
+    throw new Error('Host terminal did not resume the requested shell')
+  }
+  if (state.connectionId !== LOCAL_CONNECTION_ID) {
+    if (state.environment && meta.environment !== state.environment) {
+      throw new Error('The receiving gateway did not confirm this terminal’s environment')
+    }
+    if (isTerminalEnvironment(meta.environment)) {state.environment = meta.environment}
+  }
+
+  state.shell = meta.shell
+  if (typeof meta.cwd === 'string') {state.cwd = meta.cwd}
+  if (typeof meta.terminalId !== 'string' || !meta.terminalId) {return false}
+
+  state.terminalId = meta.terminalId
+  if (state.restoreKey) {
+    writeJson(context.storageKey(state.restoreKey), {
+      terminalId: state.terminalId,
+      profile: state.profile,
+      connectionId: state.connectionId,
+      environment: state.environment
+    })
+  }
+  if (resuming) {
+    // Rebuild this xterm from the server tail, never append a second copy.
+    state.pendingData = []
+    context.emitData(state, '\u001bc' + (meta.truncated ? '[Earlier terminal output was trimmed from the retained history]\r\n' : ''), true)
+  }
+  return true
 }
 
 async function dialTerminal(state: TerminalState, context: DialContext): Promise<HermesTerminalSession> {
@@ -155,6 +211,18 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
 
   if (state.terminalId) {url.searchParams.set('attach', state.terminalId)}
   const resuming = Boolean(state.terminalId)
+  const relayed = state.connectionId !== LOCAL_CONNECTION_ID
+  if (relayed && state.environment) {
+    url.searchParams.set('environment', state.environment)
+  }
+  // Older receivers ignore the environment query alone and reject unknown
+  // actions. Require placement support before starting a shell with a known mode.
+  if (!resuming && url.searchParams.has('environment')) {
+    url.searchParams.set('action', 'start')
+  }
+  if (!resuming && (relayed || window.__HERMES_TERMINAL_ENVIRONMENT__ === 'executor')) {
+    url.searchParams.set('startup', '1')
+  }
   const socket = state.socket = new WebSocket(url)
   socket.binaryType = 'arraybuffer'
   const decoder = new TextDecoder()
@@ -163,6 +231,15 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
     let settled = false
     let handshakeComplete = false
     let replayNext = false
+    let ackStartup = false
+    let readyToClose: (() => void) | undefined
+    if (relayed && !resuming) {
+      // Before closing a relayed startup, wait for cancellation support, a token, or failure.
+      state.startupCloseReady = new Promise(resolve => {
+        readyToClose = resolve
+        void state.started?.then(() => resolve(), () => resolve())
+      })
+    }
     const current = () => state.generation === generation && !context.isPaused() && !state.stopped
 
     const fail = (error: Error) => {
@@ -173,6 +250,7 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
       reject(error)
     }
 
+    // Bound the initial metadata wait. Executor preparation starts when the receiver says so.
     const timer = window.setTimeout(() => {
       fail(new TerminalConnectionError('Host terminal did not provide startup metadata'))
       socket.onclose = null
@@ -192,43 +270,21 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
 
       if (typeof event.data === 'string' && event.data.startsWith(META)) {
         try {
-          const meta = JSON.parse(event.data.slice(META.length)) as {
-            shell?: string; cwd?: string; terminalId?: string; reconnected?: boolean; truncated?: boolean
+          const meta = JSON.parse(event.data.slice(META.length)) as TerminalMetadata
+          if (!resuming && !handshakeComplete && meta.preparing === true && meta.ackStartup === true) {
+            window.clearTimeout(timer)
+            ackStartup = true
+            readyToClose?.()
+            return
           }
 
-          if (typeof meta.shell !== 'string' || !meta.shell.trim()) {
-            throw new Error('Host terminal returned an empty shell identity')
+          // A token starts with a replay frame, even when the history is empty.
+          replayNext = applyTerminalMetadata(state, meta, context, resuming) || replayNext
+
+          if (ackStartup) {
+            if (!state.terminalId) {throw new Error('Host terminal returned no reattachment token')}
+            socket.send(META + JSON.stringify({ attached: state.terminalId }))
           }
-
-          if (resuming && meta.terminalId !== state.terminalId) {
-            throw new Error('Host terminal did not resume the requested shell')
-          }
-
-          state.shell = meta.shell
-
-          if (typeof meta.cwd === 'string') {state.cwd = meta.cwd}
-
-          if (typeof meta.terminalId === 'string' && meta.terminalId) {
-            state.terminalId = meta.terminalId
-            // The first binary frame is the snapshot, including an empty frame
-            // when there is no history. Suppress replies only while parsing it.
-            replayNext = true
-
-            if (state.restoreKey) {
-              writeJson(context.storageKey(state.restoreKey), {
-                terminalId: state.terminalId,
-                profile: state.profile,
-                connectionId: state.connectionId
-              })
-            }
-
-            if (resuming) {
-              // Rebuild this xterm from the server tail, never append a second copy.
-              state.pendingData = []
-              emitData(state, '\u001bc' + (meta.truncated ? '[Earlier terminal output was trimmed from the retained history]\r\n' : ''), true)
-            }
-          }
-
           handshakeComplete = true
 
           // Resume query dimensions do not resize an existing server PTY.
@@ -240,7 +296,7 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
             settled = true
             window.clearTimeout(timer)
             state.cancelDial = undefined
-            resolve({ id: state.id, cwd: state.cwd, shell: state.shell, persistent: Boolean(state.terminalId) })
+            resolve({ id: state.id, connectionId: state.connectionId, cwd: state.cwd, shell: state.shell, persistent: Boolean(state.terminalId) })
           }
         } catch (error) {
           fail(error instanceof Error ? error : new Error('Host terminal returned invalid startup metadata'))
@@ -271,7 +327,7 @@ async function dialTerminal(state: TerminalState, context: DialContext): Promise
       const signal = CLOSE_SIGNALS[event.code] ?? 'disconnected'
       const exited = event.code === 4410 && event.reason === PROCESS_EXITED_REASON
 
-      if (signal === 'expired') {forget(state)}
+      if (signal === 'expired') {forget(state, true)}
 
       if (!handshakeComplete) {
         fail(new TerminalConnectionError(event.reason || `Host terminal closed (${event.code})`, exited ? EXITED : signal))
@@ -305,14 +361,20 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
   const load = (key?: string): SavedTerminal | null => {
     const saved = key ? readJson<SavedTerminal>(storageKey(key)) : null
 
-    return saved && typeof saved.terminalId === 'string' && saved.terminalId.length > 0 &&
+    return saved && ((typeof saved.terminalId === 'string' && saved.terminalId.length > 0) ||
+      (saved.terminalId === undefined && isTerminalEnvironment(saved.environment))) &&
       (saved.profile === null || typeof saved.profile === 'string') &&
-      (saved.connectionId === undefined || typeof saved.connectionId === 'string') ? saved : null
+      (saved.connectionId === undefined || typeof saved.connectionId === 'string') &&
+      (saved.environment === undefined || isTerminalEnvironment(saved.environment)) ? saved : null
   }
 
-  const forget = (state: Pick<TerminalState, 'restoreKey'> & { terminalId?: string }) => {
-    if (state.restoreKey && (!state.terminalId || load(state.restoreKey)?.terminalId === state.terminalId)) {
-      writeJson(storageKey(state.restoreKey), null)
+  const forget = (state: Pick<TerminalState, 'restoreKey' | 'terminalId'>, preserveEnvironment = false) => {
+    if (state.restoreKey) {
+      const saved = load(state.restoreKey)
+      if (!state.terminalId || saved?.terminalId === state.terminalId || !saved?.terminalId) {
+        writeJson(storageKey(state.restoreKey), preserveEnvironment && saved?.environment
+          ? { ...saved, terminalId: undefined } : null)
+      }
     }
   }
 
@@ -346,6 +408,7 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
     settleOpen(state)
     state.cancelDial?.()
     state.cancelDial = undefined
+    state.startupCloseReady = undefined
     const socket = state.socket
     state.socket = null
 
@@ -407,6 +470,7 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
 
     if (!state) {return false}
     state.stopped = true
+    state.cancelStart?.()
     stopSocket(state)
     terminals.delete(id)
 
@@ -417,9 +481,16 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
     const state = terminals.get(id)
 
     if (!state) {return false}
-    // Closing a tab during startup must wait for its server-minted identity.
-    await state.started?.catch(() => undefined)
+    if (!state.stopped) {state.closing = true}
+    // A receiver that has already been asked to start may publish a PTY
+    // despite disconnecting. Wait for its token unless it negotiated cancellation.
+    if (!state.stopped && !state.terminalId && state.socket && state.connectionId !== LOCAL_CONNECTION_ID) {
+      await state.startupCloseReady
+    }
+    // A negotiated startup belongs to the socket until the client receives
+    // its token. Once it has the token, close that shell directly.
     state.stopped = true
+    state.cancelStart?.()
     stopSocket(state)
 
     try {
@@ -443,6 +514,7 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
   const pause = () => {
     paused = true
     terminals.forEach(state => {
+      state.cancelStart?.()
       stopSocket(state)
 
       if (!state.stopped) {setStatus(state, 'reconnecting')}
@@ -479,7 +551,7 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
       if (state) {return dispose(state.id)}
       const saved = load(restoreKey)
 
-      if (saved) {await closeSavedShell(saved, options.websocketUrl)}
+      if (saved?.terminalId) {await closeSavedShell({ ...saved, terminalId: saved.terminalId }, options.websocketUrl)}
       forget({ restoreKey })
 
       return true
@@ -536,21 +608,27 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
         // StrictMode/remount can overlap startup before a capability is minted.
         // Serialize those starts so a single tab cannot spawn two shells.
         await existing.started?.catch(() => undefined)
+        if (existing.closing) {throw new TerminalConnectionError('Terminal attachment cancelled')}
         await detach(existing.id)
       }
 
       const saved = load(startOptions?.restoreKey)
 
-      if (startOptions?.resumeOnly && !saved) {
+      if (startOptions?.resumeOnly && !saved?.terminalId) {
         throw new TerminalConnectionError('Terminal expired; press Enter to create a new shell', 'expired')
       }
 
+      const selectedConnection = options.currentConnection()
+      const connectionId = saved ? (saved.connectionId ?? LOCAL_CONNECTION_ID) : (startOptions?.connectionId ?? selectedConnection)
+      const profile = saved ? saved.profile : (startOptions?.profile ??
+        (connectionId === selectedConnection ? options.currentProfile() : null))
       const state: TerminalState = {
         id: `browser-${Date.now().toString(36)}-${++sequence}`,
         restoreKey: startOptions?.restoreKey,
-        profile: saved ? saved.profile : options.currentProfile(),
-        connectionId: saved ? (saved.connectionId ?? LOCAL_CONNECTION_ID) : options.currentConnection(),
+        profile,
+        connectionId,
         terminalId: saved?.terminalId,
+        environment: saved?.environment,
         cwd: startOptions?.cwd || '', shell: 'host-shell',
         cols: Math.max(2, Math.round(startOptions?.cols || 80)),
         rows: Math.max(2, Math.round(startOptions?.rows || 24)),
@@ -560,13 +638,19 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
       }
 
       terminals.set(state.id, state)
-      state.started = (async () => {
-        if (!state.cwd && !saved) {
-          state.cwd = await options.defaultCwd(state.profile, state.connectionId).catch(() => '')
-        }
-
-        return dial(state)
-      })()
+      state.started = new Promise<HermesTerminalSession>((resolve, reject) => {
+        state.cancelStart = () => reject(new TerminalConnectionError('Terminal attachment cancelled'))
+        const generation = state.generation
+        void (async () => {
+          if (!state.cwd && !saved?.terminalId) {
+            state.cwd = await options.defaultCwd(state.profile, state.connectionId).catch(() => '')
+          }
+          if (state.stopped || paused || generation !== state.generation) {
+            throw new TerminalConnectionError('Terminal attachment cancelled')
+          }
+          return dial(state)
+        })().then(resolve, reject)
+      }).finally(() => { state.cancelStart = undefined })
 
       try {
         return await state.started
