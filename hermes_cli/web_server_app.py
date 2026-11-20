@@ -238,6 +238,17 @@ async def http_lifespan(app: FastAPI):
 
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
+    from hermes_cli.web_server_surface import policy
+
+    if policy(app.state).host_terminal:
+        from hermes_cli.web_host_terminal import ExecutorTerminalError, configured_terminal
+        app.state.terminal_config_error = None
+        try:
+            app.state.terminal_environment, app.state.executor_ssh_config = configured_terminal()
+        except ExecutorTerminalError as exc:
+            app.state.terminal_environment = None
+            app.state.terminal_config_error = str(exc)
+            logger.warning("Host terminal unavailable: %s", exc)
     lifespan = http_lifespan if getattr(app.state, "gateway_runner", None) is not None else standalone_lifespan
     async with lifespan(app):
         yield

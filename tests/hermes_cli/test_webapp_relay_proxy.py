@@ -171,6 +171,7 @@ def live_other(webapp, monkeypatch):
     import uvicorn
 
     from hermes_cli import gateway_connections
+    from hermes_cli.web_host_terminal_sessions import host_terminal, host_terminal_lifespan
 
     seen = {"cookies": [], "dials": []}
     stop = threading.Event()
@@ -201,11 +202,34 @@ def live_other(webapp, monkeypatch):
         return JSONResponse({"access_token": "fresh-access", "refresh_token": "fresh-refresh",
                              "expires_at": int(time.time()) + 900, "provider": "nous", "user_id": "u1"})
 
+    terminal_ticket = "one-use-terminal-fixture"
+    tickets = set()
+
+    async def mint_terminal(request: Request):
+        if request.headers.get("x-hermes-session-token") != TOKEN or request.query_params.get("socket") != "host-terminal":
+            return JSONResponse({}, status_code=401)
+        tickets.add(terminal_ticket)
+        return JSONResponse({"ticket": terminal_ticket})
+
+    async def terminal_socket(ws: WebSocket):
+        supplied = ws.query_params.get("ticket")
+        if supplied not in tickets:
+            await ws.close(code=4401)
+            return
+        tickets.remove(supplied)
+        ws._hermes_auth_identity = {"provider": "fixture", "user_id": "terminal-owner"}
+        await ws.accept()
+        await host_terminal(ws)
+
     app = Starlette(routes=[Route("/set", set_cookie), Route("/echo", set_cookie), Route("/api/profiles", profiles),
                             Route("/auth/native/refresh", refresh, methods=["POST"]),
-                            WebSocketRoute("/api/audio/speak-stream", speak)])
+                            Route("/api/webapp/socket-ticket", mint_terminal, methods=["POST"]),
+                            WebSocketRoute("/api/audio/speak-stream", speak),
+                            WebSocketRoute("/api/host-terminal", terminal_socket)],
+                    lifespan=host_terminal_lifespan)
+    app.state.terminal_environment = "executor"
     port = _free_port()
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, lifespan="off", log_level="warning",
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, lifespan="on", log_level="warning",
                                            ws="websockets"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -290,6 +314,40 @@ def test_a_relayed_socket_opens_only_with_this_gateways_relay_ticket(live_other)
                 ws.receive_text()
         assert refused.value.code == 4401, query
     assert seen["dials"] == []
+
+
+def test_closing_relayed_executor_propagates_to_pending_admission(live_other, monkeypatch):
+    from hermes_cli import web_host_terminal
+    from hermes_cli.web_host_terminal import META_PREFIX
+
+    webapp, connection_id, _seen, _stop = live_other
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    async def prepare(home, requested_cwd, *, mode, ssh_config):
+        assert mode == "executor"
+        assert requested_cwd is None
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(web_host_terminal, "prepare", prepare)
+    path = f"ws://localhost/api/relay/{connection_id}/api/host-terminal"
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with webapp.browser.websocket_connect(path, headers=_ORIGIN):
+            pytest.fail("terminal relay accepted a browser without a relay ticket")
+    assert refused.value.code == 4401
+    assert not started.is_set()
+
+    url = f"{path}?relay_ticket={_relay_ticket(webapp.browser)}&startup=1"
+    with webapp.browser.websocket_connect(url, headers=_ORIGIN) as ws:
+        assert ws.receive_text() == META_PREFIX + '{"preparing":true,"ackStartup":true}'
+        assert started.wait(10), "remote executor preparation did not start"
+        ws.close()
+        assert cancelled.wait(10), "relay did not deliver the browser close"
+    assert not webapp.shells
 
 
 def test_removing_a_connection_closes_its_relayed_socket(live_other):

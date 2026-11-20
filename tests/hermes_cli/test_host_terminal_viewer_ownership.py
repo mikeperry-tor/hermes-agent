@@ -3,6 +3,7 @@ import asyncio
 from contextlib import contextmanager, suppress
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import select
 import socket
 import threading
@@ -278,7 +279,8 @@ class ClosingTab:
     yet; ``sent`` is every binary frame the tab received."""
 
     app = None
-    query_params: dict = {}
+    state = SimpleNamespace(ssh_terminal=None)
+    query_params: dict = {"attach": "fixture-existing-session"}
 
     def __init__(self, *frames):
         self.inbound = asyncio.Queue()
@@ -621,6 +623,8 @@ def served_host_terminal(monkeypatch, session, owner, ws_ping=(None, None)):
 
     async def route(ws):
         await ws.accept()
+        # This fixture admits an existing retained shell, not a new startup.
+        ws.scope["query_string"] = b"attach=fixture-existing-session"
         try:
             await host_sessions.host_terminal(ws)
         finally:

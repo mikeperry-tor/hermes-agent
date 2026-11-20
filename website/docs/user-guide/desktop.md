@@ -190,7 +190,7 @@ window.
 
 ### Terminal in the Webapp
 
-The terminal rail opens the host's interactive shell, running as a child of the gateway, in your home
+By default, the terminal rail opens the host's interactive shell, running as a child of the gateway, in your home
 folder unless `terminal.cwd` names another. Dropping files onto it uploads them to the host (**16 MiB**
 each) and types their paths. Refreshing the page or losing the connection detaches the terminal
 without ending its shell; the saved terminal tab reattaches to that shell and its profile. Hiding a
@@ -208,6 +208,57 @@ remote SSH login environment, not a same-named profile on the Webapp host. Remov
 re-pointing the saved connection ends its terminals. The remote `serve --isolated` does not
 need Webapp enabled. For an HTTP gateway connection, the remote must itself provide the
 Webapp host-terminal service; a plain `serve` or gateway listener does not expose host shells.
+
+#### SSH executor terminals
+
+Ordinary Webapp terminals run on the serving gateway by default. Set
+`webapp.terminal_environment: executor` in that gateway's launch-profile
+configuration and restart the Webapp to open them on each selected profile's
+configured `terminal.backend: ssh` destination. Native SSH configuration,
+identities and host-key checking remain available. Other executor backends
+currently fail visibly in this mode; they do not select a gateway shell.
+
+Deployments with provisioned host keys can set `webapp.executor_ssh_config`
+to an absolute OpenSSH configuration path with the executor's
+`UserKnownHostsFile`. Both terminal preparation and the interactive connection
+then use that file with strict host-key checking, the configured endpoint and
+identity, and agent, X11 and port forwarding disabled. Keep that file, its
+known-hosts file, and the endpoint settings under the deployer's control.
+The browser acknowledges the exact terminal ID before a new shell can be
+retained after a startup disconnect.
+
+The WebApp serving host needs POSIX OpenSSH, and the selected SSH host needs
+Bash and Python 3. Preparation checks for Bash before starting a PTY.
+The executor's configured cwd or home is used
+unless a terminal supplies or restores an exact remote path. Shell cwd updates preserve
+literal whitespace and metacharacters. Startup labels and metadata identify the
+destination; stale pages must reload after the gateway setting changes. Saved
+remote gateway connections keep their own native terminal routing and ownership,
+including executor startup through an HTTP gateway relay. For an ordinary fresh terminal, the Webapp that
+owns the shell chooses its directory when no directory was requested. Each tab
+keeps its selected gateway and profile across retries. When a receiving gateway
+reports the shell's environment, the tab also keeps that placement. A fresh
+retry refuses a changed environment or an older receiver that cannot honor it.
+Open a new tab to choose a different placement.
+Slow executor preparation runs outside the shared PTY spawn lock. The browser
+uses the normal startup metadata timeout until the authenticated receiver
+announces cancellable executor preparation. Preparation can then continue until
+it finishes or the tab closes. The receiver discards an unacknowledged shell if
+its startup socket closes. Other receivers retain token-based close. Once the
+browser acknowledges the token, native reattachment remains available.
+Each new executor shell reads one managed terminal policy for its environment,
+SSH destination and starting directory. If the terminal section is malformed
+or its configuration backend becomes unavailable, repair it and retry the shell
+in the same WebApp.
+
+If the launch profile or its managed configuration is unavailable or invalid,
+the Webapp still serves and ordinary terminals report a startup refusal. Repair
+the configuration and restart the Webapp to select terminal placement again.
+
+The Webapp operator has administrative agent authority. Selecting an SSH shell
+changes this terminal's placement; it does not confine all browser actions to
+that executor or add per-task isolation.
+
 
 The bundle's npm dependencies install into `.build/webapp-workspace` in the checkout, separately from
 the native Desktop, and reinstall only when the lockfile changes. With lazy installs disabled, a plain
