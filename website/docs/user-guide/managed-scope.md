@@ -107,7 +107,9 @@ to the specific keys the managed layer specifies.
 :::
 
 Managed `.env` assignments stay in force during a profile environment reload.
-A read error leaves already applied assignments in place. For a file-backed
+A read error leaves already applied assignments in place. For a served
+profile, managed templates use that profile's dotenv and instance defaults.
+They never use values published by the launch profile. For a file-backed
 deployment that relies on managed YAML policy, set
 `HERMES_CONFIG_BACKEND=file` in the managed `.env` to pin the backend itself.
 

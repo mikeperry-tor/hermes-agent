@@ -145,18 +145,13 @@ def remember_applied_managed_env(path: Path, raw: list[tuple[str, str | None]], 
         _APPLIED_ENV = (path, raw, values)
 
 
-def applied_managed_env(path: Path | None) -> dict[str, str]:
-    """Return remembered values for the owning process."""
+def applied_managed_env(path: Path | None) -> tuple[list[tuple[str, str | None]], dict[str, str]]:
+    """Return the ordered source and the subset that was published at that path."""
     with _CACHE_LOCK:
         saved = _APPLIED_ENV
-        return saved[2].copy() if saved is not None and saved[0] == path else {}
-
-
-def applied_managed_assignments(path: Path | None) -> list[tuple[str, str | None]]:
-    """Return source templates in order for profile-scoped interpolation."""
-    with _CACHE_LOCK:
-        saved = _APPLIED_ENV
-        return saved[1].copy() if saved is not None and saved[0] == path else []
+        if saved is not None and saved[0] == path:
+            return saved[1].copy(), saved[2].copy()
+        return [], {}
 
 
 def retain_managed_env_claims(path: Path | None, names: frozenset[str]) -> None:
@@ -166,14 +161,12 @@ def retain_managed_env_claims(path: Path | None, names: frozenset[str]) -> None:
         saved = _APPLIED_ENV
         if saved is not None and saved[0] == path:
             path, raw, values = saved
-            _APPLIED_ENV = (
-                path, [(name, value) for name, value in raw if name in names],
-                {name: values[name] for name in names & values.keys()},
-            )
+            active = {name: values[name] for name in names & values.keys()}
+            _APPLIED_ENV = (path, raw, active) if active else None
 
 
 def load_managed_env() -> dict[str, str]:
-    """Parsed managed .env, with installed values retained on a read error."""
+    """Parsed managed .env, retaining templates for applied names on a read error."""
     directory = get_managed_dir(strict=True)
     if directory is None:
         return {}
@@ -183,7 +176,8 @@ def load_managed_env() -> dict[str, str]:
     except FileNotFoundError:
         parsed = {}
     except OSError:
-        return {name: value for name, value in dict(applied_managed_assignments(path)).items() if value is not None}
+        raw, applied = applied_managed_env(path)
+        return {name: value for name, value in dict(raw).items() if value is not None and name in applied}
     except UnicodeError as exc:
         logger.warning("Could not parse managed dotenv %s: %s", path, exc)
         return {}
