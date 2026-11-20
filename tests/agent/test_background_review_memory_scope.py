@@ -60,6 +60,26 @@ def test_stock_review_keeps_only_tasks_supported_by_its_tools():
     assert bg._permitted_review_prompt(review, skills | {"memory"}) == review
 
 
+def test_deferred_memory_keeps_trigger_scope(monkeypatch):
+    import model_tools
+    from agent import tool_executor
+
+    memory = {"function": {"name": "memory"}}
+    bridge = {"function": {"name": "tool_call"}}
+
+    def definitions(*, enabled_toolsets, quiet_mode, skip_tool_search_assembly=False):
+        if "memory" not in enabled_toolsets:
+            return []
+        return [memory] if skip_tool_search_assembly else [bridge]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", definitions)
+    monkeypatch.setattr(tool_executor, "_tool_search_scoped_names", lambda _agent: frozenset({"memory"}))
+    reviewer = _review_agent()
+    reviewer.tools = [bridge]
+    assert bg._review_tool_whitelist(reviewer, None, review_memory=True) == ({"memory"}, {"memory"})
+    assert bg._review_tool_whitelist(reviewer, None, review_memory=False) == (set(), set())
+
+
 class TestSpawnForwardsScope:
     def test_target_passes_review_memory_to_worker(self):
         captured = {}

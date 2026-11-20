@@ -1214,7 +1214,7 @@ def _track_review_fork(agent: Any, review_agent: Any, *, register: bool) -> None
 def _review_tool_whitelist(
     review_agent: Any, task_cfg: Optional[dict[str, Any]], review_memory: bool = False,
 ) -> tuple[set, set]:
-    """``(whitelist, configured_extra_tools)`` for the review fork — DISPATCH-side only, so the
+    """``(whitelist, deferred_names)`` for the review fork — DISPATCH-side only, so the
     advertised ``tools[]`` stays byte-identical to the parent's (prompt-cache parity)."""
     from model_tools import get_tool_definitions
     # Gate the built-in memory tool on BOTH the profile's memory flags and the trigger that fired
@@ -1222,23 +1222,15 @@ def _review_tool_whitelist(
     # act on the memory tool's "consolidate now" hint and delete entries no one reviewed.
     memory_on = review_agent._memory_enabled or review_agent._user_profile_enabled
     review_toolsets = ["memory", "skills"] if memory_on and review_memory else ["skills"]
-    whitelist = {t["function"]["name"] for t in get_tool_definitions(enabled_toolsets=review_toolsets, quiet_mode=True)}
+    whitelist = {t["function"]["name"] for t in get_tool_definitions(
+        enabled_toolsets=review_toolsets, quiet_mode=True, skip_tool_search_assembly=True,
+    )}
     # Read-only file tools: denying read_file/search_files caused a per-review denial storm that
     # starved the loop (read_file also registers the read with the read-before-write guard).
     # Write tools stay denied — autonomous maintenance goes through skill_manage's validation.
     whitelist |= {"read_file", "search_files"}
     # ``extra_tools`` admits named parent tools (e.g. a human-gated proposal tool). The whitelist
     # can only admit, never advertise: a listed tool must already exist in the inherited schema.
-    # Read-only file tools are whitelisted too (#61521, #39996): the model naturally reaches for
-    # read_file/search_files to inspect a skill before patching it. Denying them caused a per-review denial
-    # storm (~142 denials + ~204 read-before-write refusals over 2 days on one deployment) that starved the
-    # self-improvement loop — the model never loaded SKILL.md the way the read-before-write guard requires,
-    # so almost no patch landed. This is a DISPATCH-side change only: the advertised ``tools[]`` stays
-    # byte-identical to the parent's, so prompt-cache parity is untouched. read_file registers the read with
-    # the read-before-write guard (tools/file_tools.py), so a read_file → skill_manage(patch) sequence now
-    # succeeds. Write tools (write_file/patch/terminal) stay denied — autonomous maintenance must go through
-    # skill_manage's validation, and the deny message below names that substitute so one denial redirects
-    # the model instead of a storm.
     # Profile-configured opt-in tools (#44672, salvage #82146 by @BrinShadewater):
     # ``auxiliary.background_review.extra_tools`` admits named parent tools to the review whitelist — e.g. a
     # human-gated proposal tool or a memory-provider write surface. Read from task_cfg (the
@@ -1251,13 +1243,19 @@ def _review_tool_whitelist(
             configured_extra_tools = {name.strip() for name in extra_raw if isinstance(name, str) and name.strip()}
     except Exception:
         logger.debug("background_review extra_tools parse failed", exc_info=True)
+    from agent.tool_executor import _tool_search_scoped_names
+    from tools.hosted_tool_policy import discovery_tool_filter
+    from tools.tool_search_catalog import TOOL_CALL_NAME
     from toolsets import session_tool_discovery_filter
 
     allowed = session_tool_discovery_filter(review_agent)
+    live_allowed = discovery_tool_filter()
     advertised = {tool["function"]["name"] for tool in (getattr(review_agent, "tools", None) or [])}
-    candidates = (whitelist | configured_extra_tools) & advertised
-    permitted = {name for name in candidates if allowed(name)}
-    return permitted, configured_extra_tools & permitted
+    eligible = whitelist | configured_extra_tools
+    deferred = (eligible & (_tool_search_scoped_names(review_agent) - advertised)
+                if TOOL_CALL_NAME in advertised and allowed(TOOL_CALL_NAME) and live_allowed(TOOL_CALL_NAME) else set())
+    permitted = {name for name in (eligible & advertised) | deferred if allowed(name) and live_allowed(name)}
+    return permitted, deferred & permitted
 
 
 def _permitted_review_prompt(prompt: str, allowed: set[str]) -> str:
@@ -1321,10 +1319,14 @@ def _run_review_fork(
     st.review_agent._review_attended = explicit
     _track_review_fork(agent, st.review_agent, register=True)
     from hermes_cli.plugins import set_thread_tool_whitelist, clear_thread_tool_whitelist
-    review_whitelist, _ = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
+    review_whitelist, deferred_names = _review_tool_whitelist(st.review_agent, task_cfg, review_memory)
     prompt = _permitted_review_prompt(prompt, review_whitelist)
     names = ", ".join(sorted(review_whitelist))
     guidance = f"Use only these tools for this review: {names}." if names else "No tools are available for this review."
+    review_message = prompt + "\n\n" + guidance
+    if deferred_names:
+        from tools.tool_search_catalog import deferred_call_note
+        review_message += deferred_call_note(deferred_names)
     set_thread_tool_whitelist(
         review_whitelist,
         deny_msg_fmt="Background review denied {tool_name}. " + guidance + " Do not retry {tool_name}.",
@@ -1337,7 +1339,7 @@ def _run_review_fork(
         if review_run is None or review_run.begin_request(st.review_agent):
             # Routed -> digest (cache cold anyway); same model -> full snapshot (warm cache reads).
             st.review_agent.run_conversation(
-                user_message=prompt + "\n\n" + guidance,
+                user_message=review_message,
                 conversation_history=_digest_history(messages_snapshot) if _routed else messages_snapshot,
             )
     finally:

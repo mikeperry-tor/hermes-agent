@@ -15,6 +15,8 @@ that caused the prefix-cache miss.
 
 from unittest.mock import patch
 
+import pytest
+
 
 def _make_agent_stub(agent_cls):
     """Create a minimal AIAgent-like object with just enough state for _spawn_background_review."""
@@ -206,8 +208,9 @@ def test_read_file_outside_review_does_not_mark(tmp_path):
     assert not _background_review_has_read(target)
 
 
+@pytest.mark.parametrize("route", ["direct", "deferred", "bridge-denied", "stale-snapshot"])
 def test_background_review_whitelist_includes_configured_extra_tools(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, route,
 ):
     """A profile may opt a specific proposal tool into background review.
 
@@ -229,7 +232,10 @@ def test_background_review_whitelist_includes_configured_extra_tools(
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     managed = tmp_path / "managed"
     managed.mkdir()
-    (managed / "config.yaml").write_text("tools:\n  disabled: [denied_proposal, read_file, memory, skill_manage]\n")
+    denied = {"denied_proposal", "read_file", "memory", "skill_manage"}
+    if route == "bridge-denied":
+        denied.add("tool_call")
+    (managed / "config.yaml").write_text("tools:\n  disabled: [" + ", ".join(sorted(denied)) + "]\n")
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
 
     import run_agent
@@ -241,22 +247,32 @@ def test_background_review_whitelist_includes_configured_extra_tools(
 
     captured = {}
 
+    set_review_whitelist = _plugins.set_thread_tool_whitelist
+
     def _capture_whitelist(whitelist, deny_msg_fmt=None):
         captured["whitelist"] = set(whitelist)
-        captured["denial"] = deny_msg_fmt
+        set_review_whitelist(whitelist, deny_msg_fmt=deny_msg_fmt)
 
     def _capture_run_conversation(self, *, user_message, **kwargs):
         captured["review_prompt"] = user_message
+        captured["denial"] = _plugins.resolve_pre_tool_block("unapproved_tool", {})
         return {"final_response": "Nothing to save."}
 
     from agent.background_review import _COMBINED_REVIEW_PROMPT
     agent = _make_agent_stub(run_agent.AIAgent)
     agent._COMBINED_REVIEW_PROMPT = _COMBINED_REVIEW_PROMPT
+    if route in {"deferred", "bridge-denied"}:
+        from agent import tool_executor
+
+        proposals = {"propose_shared_memory", "denied_proposal"}
+        agent.tools = [tool for tool in agent.tools if tool["function"]["name"] not in proposals]
+        agent.tools.append({"function": {"name": "tool_call"}})
+        monkeypatch.setattr(tool_executor, "_tool_search_scoped_names", lambda _agent: frozenset(proposals))
 
     def _no_init(self, *args, **kwargs):
         # The fork's producing snapshot still contains a formerly visible tool.
         self.tools = agent.tools
-        self._tool_snapshot_selection = ((), (), frozenset({"denied_proposal", "read_file", "memory", "skill_manage"}))
+        self._tool_snapshot_selection = ((), (), frozenset() if route == "stale-snapshot" else frozenset(denied))
 
     with patch.object(run_agent.AIAgent, "__init__", _no_init), \
          patch.object(
@@ -274,9 +290,12 @@ def test_background_review_whitelist_includes_configured_extra_tools(
             review_skills=True,
         )
 
-    assert "propose_shared_memory" in captured["whitelist"]
+    assert ("propose_shared_memory" in captured["whitelist"]) == (route != "bridge-denied")
     assert "terminal" not in captured["whitelist"]
-    assert "propose_shared_memory" in captured["review_prompt"]
+    assert ("propose_shared_memory" in captured["review_prompt"]) == (route != "bridge-denied")
+    assert ("through tool_call" in captured["review_prompt"]) == (route == "deferred")
+    assert "tool_call" not in captured["whitelist"]
+    assert "Background review denied unapproved_tool" in captured["denial"]
     for name in ("denied_proposal", "read_file", "skill_manage"):
         assert name not in captured["whitelist"]
         assert name not in captured["review_prompt"]

@@ -482,8 +482,9 @@ auxiliary:
       - propose_shared_memory
 ```
 
-The tool must appear in the fork's effective tool definitions and be allowed by
-the deployment's managed policy. This setting adds the eligible name to the
+The tool must be available directly in the fork or through its Tool Search
+`tool_call` bridge. Managed tool policy applies to the tool and, when needed,
+the bridge. This setting adds the eligible name to the
 review's runtime whitelist. The review prompt and denial message list tools
 from that same whitelist. Automatic review requests memory and skill operations
 only when their required tools are available. Keep the list narrow and prefer tools that stage a
