@@ -50,6 +50,13 @@ def _check_vault_available() -> bool:
     from agent.browser_page_registry import list_providers
     from tools.browser_session_cdp import get_cdp_override_raw
     from tools.browser_use_cli import browser_exec_available
+    from tools.bot_desktop.placement import executor_only
+
+    try:
+        if executor_only():
+            return browser_exec_available()
+    except RuntimeError:
+        return False
     return bool(browser_exec_available() or get_cdp_override_raw() or list_providers())
 
 
@@ -67,7 +74,14 @@ def _page_backend(task_id: str):
     page pinned for a ``target='preview'`` operation, else the plugin browser holding this task's live page
     (e.g. Camofox), else None."""
     from agent.browser_page_registry import backend_for_task
+    from tools.bot_desktop.placement import executor_only
     from tools.browser_vault_preview import active_page
+
+    try:
+        if executor_only():
+            return None
+    except RuntimeError:
+        return None
     return active_page() or backend_for_task(task_id)
 
 
@@ -98,6 +112,11 @@ def _eval_js(task_id: str, expression: str) -> dict[str, Any]:
     if supervisor is None:
         return {"success": False, "error": "no supervised browser session for this task; open the page with "
                                            "browser_exec first"}
+    from tools.bot_desktop import lease
+    try:
+        _assert_browser_lease(task_id, supervisor)
+    except lease.HumanHasControl as exc:
+        return {"success": False, "error_type": "human_has_control", "error": str(exc)}
     sup = supervisor.evaluate_runtime(expression)
     if sup.get("ok"):
         return {"success": True, "result": sup.get("result")}
@@ -108,8 +127,15 @@ def _ensure_supervisor(task_id: str):
     """The supervisor for ``task_id`` (browser_exec attaches one on every call), attaching one on demand to
     the task's session CDP endpoint when none is running. None when no endpoint is known; a fill then
     refuses rather than touching argv."""
+    from tools.bot_desktop.placement import executor_only
     from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_use_executor import task_supervisor
 
+    try:
+        if executor_only():
+            return task_supervisor(task_id)
+    except RuntimeError:
+        return None
     supervisor = SUPERVISOR_REGISTRY.get(task_id)
     if supervisor is not None:
         return supervisor
@@ -162,11 +188,11 @@ def _eval_js_secret(task_id: str, expression: str) -> dict[str, Any]:
     # refuse here, before the credential lands in a page the human is now typing into. The outer
     # epoch check only discards the result, and a fill is a side effect, not a result.
     from tools.browser_vault_preview import active_page
-    if active_page() is None and _bot_desktop_browser_session(task_id):
-        from tools.bot_desktop import lease as _bd_lease
+    from tools.bot_desktop import lease
+    if active_page() is None:
         try:
-            _bd_lease.assert_agent_may_act()
-        except _bd_lease.HumanHasControl as exc:
+            _assert_browser_lease(task_id, supervisor)
+        except lease.HumanHasControl as exc:
             return {"success": False, "error_type": "human_has_control", "error": str(exc)}
 
     if page is not None:
@@ -231,6 +257,7 @@ def _focus_bound_origin(task_id: str, origin: str, kind: str) -> Optional[str]:
         return None
     try:
         supervisor = _ensure_supervisor(task_id)
+        _assert_browser_lease(task_id, supervisor)
     except Exception:
         supervisor = None
     if supervisor is None:
@@ -687,18 +714,34 @@ BROWSER_VAULT_SCHEMA = {
 }
 
 
-def _bot_desktop_browser_session(task_id: Optional[str]) -> bool:
-    from tools.browser_session import session_for_task, shares_bot_desktop_browser
-    return shares_bot_desktop_browser(session_for_task(task_id))
+def _vault_browser_session(task_id: Optional[str], supervisor=None) -> dict[str, Any]:
+    from tools.browser_session import session_for_task
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    if supervisor is None:
+        supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
+    local = getattr(supervisor, "local_browser", None)
+    if isinstance(local, bool):
+        # browser_exec names the task here even for a named daemon or hybrid sidecar.
+        return {"features": {"local": local}}
+    return session_for_task(task_id)
+
+
+def _assert_browser_lease(task_id: str, supervisor) -> None:
+    from tools.bot_desktop import lease
+    from tools.browser_session import shares_bot_desktop_browser
+
+    if shares_bot_desktop_browser(_vault_browser_session(task_id, supervisor)):
+        lease.assert_agent_may_act()
 
 
 def _fenced_page_op(task_id: Optional[str], fn) -> str:
     """Vault operations focus, inspect and fill the page over the supervisor socket, bypassing
     browser_exec; they must honour the Bot Desktop lease like every other page access, or a human
     typing a credential on the taken-over screen could be read or written to."""
-    from tools.browser_session import run_fenced, session_for_task
+    from tools.browser_session import run_fenced
 
-    res = run_fenced(session_for_task(task_id), lambda: {"raw": fn()})
+    res = run_fenced(_vault_browser_session(task_id), lambda: {"raw": fn()})
     return res["raw"] if "raw" in res else json.dumps(res)
 
 
@@ -720,6 +763,13 @@ def _handle_vault(args: dict[str, Any], **kwargs) -> str:
                                                        "enter_code or unlock."})
     target = args.get("target") or "browser"
     if target == "preview":
+        from tools.bot_desktop.placement import executor_only
+
+        try:
+            if executor_only():
+                return json.dumps({"success": False, "error": "The deployment requires a browser in the terminal executor"})
+        except RuntimeError as exc:
+            return json.dumps({"success": False, "error": str(exc)})
         # The in-app browser is not the Bot Desktop browser; its window owns the page and refuses a
         # changed tab or document itself. Never retried on another browser.
         from tools.browser_vault_preview import run_preview_vault

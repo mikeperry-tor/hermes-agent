@@ -48,6 +48,9 @@ BROWSER_ORPHAN_REAP_INTERVAL = 300
 MAX_INACTIVITY_CLEANUP_FAILURES = 3
 
 _active_sessions: dict[str, dict[str, Any]] = {}
+# A sandbox attachment owns its Chromium from the in-lock DevTools observation
+# until the browser record is published or released. Guarded by _cleanup_lock.
+_pending_sandbox_attachments: dict[str, tuple] = {}
 _session_last_activity: dict[str, float] = {}
 # Owner Hermes home per session: the janitor is one process-global thread, so each teardown re-enters the
 # OWNING profile's scope (#86402).
@@ -108,12 +111,24 @@ def run_fenced(session_info: dict[str, Any], fn: Callable[[], dict[str, Any]]) -
     """
     if not shares_bot_desktop_browser(session_info):
         return fn()
+    return run_fenced_dispatch(lambda _check_lease: fn())
+
+
+def run_fenced_dispatch(fn: Callable[[Callable[[], None]], dict[str, Any]]) -> dict[str, Any]:
+    """Fence a desktop action whose preparation can wait before it is sent."""
     from tools.bot_desktop import lease as _bd_lease
+
+    def check_lease():
+        if _bd_lease.get().epoch != admitted.epoch:
+            raise _bd_lease.HumanHasControl(
+                "A human took over the bot's screen before this browser command was sent. "
+                "Tell the user what you need; retry once they hand back.")
+
     try:
         admitted = _bd_lease.assert_agent_may_act()
+        result = fn(check_lease)
     except _bd_lease.HumanHasControl as e:
         return {"success": False, "error": str(e), "code": "human_has_control"}
-    result = fn()
     if _bd_lease.get().epoch != admitted.epoch:
         return {"success": False, "code": "human_has_control",
                 "error": "A human took over the bot's screen while this browser command ran; its result was "
@@ -314,16 +329,17 @@ def _backend_dead(session_info: dict[str, Any]) -> bool:
     return False
 
 
-def _reuse_or_evict(cache_key: str) -> Optional[dict[str, Any]]:
+def _reuse_or_evict(cache_key: str, *, executor_only: bool = False) -> Optional[dict[str, Any]]:
     from tools import browser_session_lifecycle as _lifecycle
     with _cleanup_lock:
         existing = _active_sessions.get(cache_key)
     if existing is None:
         return None
-    if not _lifecycle.session_has_expired(existing) and not _backend_dead(existing):
+    if (not executor_only or (existing.get("features") or {}).get("sandbox")) and (
+            not _lifecycle.session_has_expired(existing) and not _backend_dead(existing)):
         return existing
     logger.info("Replacing expired or dead browser session for %s", cache_key)
-    _lifecycle.cleanup_single_session(cache_key)
+    _lifecycle.cleanup_single_session(cache_key, expected=existing)
     _lifecycle.update_session_activity(cache_key)  # teardown dropped the entry; track the replacement
     with _cleanup_lock:
         replacement = _active_sessions.get(cache_key)  # another thread may already have rebuilt it
@@ -336,6 +352,7 @@ def _publish(cache_key: str, session_info: dict[str, Any], home_key: str) -> dic
     session_info.setdefault("owner_task_id", owner_task_id(cache_key))
     session_info.setdefault("home_key", home_key)  # the profile reaped on /browser connect
     _active_sessions[cache_key] = session_info
+    _pending_sandbox_attachments.pop(session_info.get("session_name"), None)
     return session_info
 
 
@@ -343,19 +360,29 @@ def get_session_info(cache_key: Optional[str] = None) -> dict[str, Any]:
     """Get or create the session for ``cache_key`` (thread-safe); starts the inactivity janitor and touches
     activity. A ``::local`` key forces a local browser even with a cloud provider configured."""
     from tools import browser_session_lifecycle as _lifecycle
+    from tools.bot_desktop import placement, runtime
     from tools.browser_session_cdp import ensure_cdp_supervisor, live_cdp_generation
     key = cache_key or "default"
+    required = placement.executor_only()
     _lifecycle.start_cleanup_thread()
     _lifecycle.update_session_activity(key)
-    reused = _reuse_or_evict(key)
+    reused = _reuse_or_evict(key, executor_only=required) if required else _reuse_or_evict(key)
     if reused is not None:
+        if required and not (reused.get("features") or {}).get("sandbox"):
+            raise RuntimeError("The deployment requires a browser in the terminal executor")
         return reused
 
     force_local = is_local_sidecar_key(key)
     home_key = hermes_home_key()
     for attempt in range(_STALE_ENDPOINT_RETRIES + 1):
         generation = live_cdp_generation(home_key)
-        session_info = _create_session_for_key(key, force_local)
+        if required:
+            from tools.browser_session_sandbox import create_sandbox_session
+
+            runtime.tool_placement(expected_sandbox=True)
+            session_info = create_sandbox_session(key)
+        else:
+            session_info = _create_session_for_key(key, force_local)
         with _cleanup_lock:
             if key in _active_sessions:  # created concurrently during the launch: don't leak ours
                 winner = _active_sessions[key]
@@ -370,6 +397,8 @@ def get_session_info(cache_key: Optional[str] = None) -> dict[str, Any]:
                     break
         if winner is not None:
             _lifecycle.release_session_backend(key, stale_ours)
+            if required and not (winner.get("features") or {}).get("sandbox"):
+                raise RuntimeError("The deployment requires a browser in the terminal executor")
             return winner
         logger.info("Browser endpoint changed during session creation for %s; recreating", key)
         _lifecycle.release_session_backend(key, session_info)

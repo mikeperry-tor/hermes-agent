@@ -24,9 +24,10 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home, hermes_home_key, secure_parent_dir
 
@@ -249,3 +250,10 @@ def assert_agent_may_act(profile_key: Optional[str] = None) -> Lease:
             "A human has taken over this desktop (they may be entering a credential). Screen actions and "
             "captures are refused until they hand control back. Tell the user what you need in your reply.")
     return lease
+
+
+@contextmanager
+def agent_admission(profile_key: Optional[str] = None) -> Iterator[Lease]:
+    """Hold the current lease stable through local dispatch checks. Release before driver I/O."""
+    with _locked(_path(profile_key)):
+        yield assert_agent_may_act(profile_key)

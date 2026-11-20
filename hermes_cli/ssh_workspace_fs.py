@@ -32,6 +32,7 @@ class _SshFsConfig:
     key_path: str
     cwd: str
     timeout: int
+    ssh_config: str = ""
 
 
 # ``_CACHE_LOCK`` guards only the dicts and is never held across a dial or cleanup, so one
@@ -186,6 +187,7 @@ printf '__HERMES_FS_SIZE__:%s\\n' "$size"
         target = self.normalize(path)
         command = f"""
 p={shlex.quote(target)}
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then printf '__HERMES_FS_ERROR__:ENOENT\\n'; exit 44; fi
 target=$(realpath "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null) || {{ printf '__HERMES_FS_ERROR__:ENOENT\\n'; exit 44; }}
 if [ ! -f "$target" ]; then printf '__HERMES_FS_ERROR__:ENOTREG\\n'; exit 45; fi
 size=$(stat -c %s "$target" 2>/dev/null || stat -f %z "$target" 2>/dev/null) || {{ printf '__HERMES_FS_ERROR__:EACCES\\n'; exit 46; }}
@@ -302,6 +304,7 @@ def get_ssh_workspace_fs(profile_key: str, terminal_config: dict[str, Any]) -> S
         key_path=str(terminal_config.get("ssh_key") or "").strip(),
         cwd=str(terminal_config.get("cwd") or "~").strip() or "~",
         timeout=int(terminal_config.get("timeout") or 180),
+        ssh_config=str(terminal_config.get("ssh_config") or ""),
     )
     if not config.host or not config.user:
         raise SshWorkspaceFsError("ECONN", "SSH host and user are required")
@@ -312,8 +315,8 @@ def get_ssh_workspace_fs(profile_key: str, terminal_config: dict[str, Any]) -> S
             if cached and cached[0] == config:
                 return cached[1]
             _BACKENDS.pop(profile_key, None)
-        # Close the replaced connection before dialing: the control socket is keyed on
-        # user@host:port only, so a dial with new credentials would otherwise ride the old master.
+        # Close the replaced connection before dialing. The default SSH route shares a control
+        # socket by endpoint, so a dial with new credentials could otherwise ride the old master.
         if cached:
             with _lock_for(_ENDPOINT_LOCKS, _endpoint(cached[0])):
                 cached[1]._env.cleanup()
@@ -327,6 +330,7 @@ def get_ssh_workspace_fs(profile_key: str, terminal_config: dict[str, Any]) -> S
                     port=config.port,
                     key_path=config.key_path,
                     sync_files=False,
+                    ssh_config=config.ssh_config,
                 )
         except Exception as exc:
             raise SshWorkspaceFsError("ECONN", "Could not connect to the SSH workspace") from exc

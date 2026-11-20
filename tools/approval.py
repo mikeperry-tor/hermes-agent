@@ -1204,13 +1204,20 @@ def _presence(approval_callback=None) -> tuple:
     return approval_callback, is_cli, is_gateway, is_ask
 
 
+def _action_gate_bypasses(allow_mode_bypass: bool) -> bool:
+    if allow_mode_bypass:
+        return _yolo_active() or approval_context._get_approval_mode() == "off"
+    from gateway.session_finite import unattended_turn
+    return unattended_turn()
+
+
 def _run_approval_gate(
     *, pattern_key: str, description: str, display_target: str, approval_callback=None,
     subject: str = "", noun: str = "flagged actions",
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
-    pattern_keys: list[str] | None = None,
+    pattern_keys: list[str] | None = None, allow_mode_bypass: bool = True,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -1220,6 +1227,8 @@ def _run_approval_gate(
     caller's job. ``fail_closed_when_no_human``: a non-interactive, non-gateway, non-cron
     context without an ask bridge BLOCKS instead of auto-approving, so a plugin-flagged action
     never runs ungated.
+    A caller that binds its dispatch to a restricted mode can disallow the
+    bypass here so an intervening escalation cannot approve the action.
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
     an explicit ``*_deny_message`` (the file-tool write gates word their own). ``pattern_keys``
     (default ``[pattern_key]``) are what a session/always answer persists.
@@ -1228,7 +1237,7 @@ def _run_approval_gate(
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    if _action_gate_bypasses(allow_mode_bypass):
         return _approved()
     session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):

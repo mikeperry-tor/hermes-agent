@@ -837,6 +837,31 @@ Use the opt-in only when you intentionally want the container to work on live ho
 
 A host path in `terminal.cwd` (for example `C:\Users\me\project` on Windows, or a desktop/TUI session's workspace) never becomes the container's working directory: when it is the directory mounted at `/workspace`, file tools and terminal commands use `/workspace`; otherwise the container keeps its own working directory. If a file tool still cannot enter its working directory, the error names the invalid `terminal.cwd` for the active backend rather than the shell's raw `cd:` line.
 
+### Verified SSH Host Configuration
+
+Set `terminal.ssh_config` to an absolute path to an OpenSSH configuration
+on the Hermes host. For deployment policy, put the setting in managed
+`config.yaml` and keep the selected file and its known-hosts file under the
+administrator's control. For example:
+
+```yaml
+terminal:
+  backend: ssh
+  ssh_config: /etc/hermes/executor-ssh.conf
+```
+
+Hermes uses the selected file for model shell, browser/display streams,
+workspace operations and file synchronization. It requires a known matching
+host key and uses noninteractive authentication. New verified connections
+use separate multiplexed sessions from the default SSH configuration. Close
+existing sessions before changing keys or the content of the selected file.
+When this setting is absent, the model SSH backend keeps its default
+first-use host-key behavior. The WebApp's optional operator executor terminal
+has separate launch settings.
+If profile dotenv values must not affect a process-wide launch, select the
+same `TERMINAL_SSH_CONFIG` and connection settings in the deployment's managed
+dotenv as well as in managed YAML.
+
 ### Persistent Shell
 
 Every terminal command on the **local** and **SSH** backends runs in a fresh `bash` process. Hermes captures your login shell's environment once (PATH, exports from your profile, functions, aliases) and starts the first command from that snapshot. With the setting off, every command starts from it. With the setting on, each command saves its exported variables for the next one, and that saved copy holds exported variables only, so profile functions and aliases are gone after the first command.
@@ -3067,7 +3092,11 @@ browser:
   # Local Chromium launched by Hermes
   executable_path: ""            # Chromium binary override; "" = the packaged Chromium
   user_data_dir: ""              # Persistent profile shared by every session; "" = fresh profile per session
+  require_sandbox: false         # true = require Chromium's sandbox and refuse --no-sandbox bypass flags
   chromium_args: []              # Extra Chromium command-line flags, e.g. ["--lang=de-DE"]
+  # Terminal sandbox desktop browser execution (when Bot Desktop runs in terminal.backend: docker/ssh)
+  executor_python: "python3"     # Interpreter with browser-harness inside the terminal sandbox
+  executor_workspace: ""         # Persistent download/workspace root inside the sandbox; "" = ~/.hermes/browser-use
   # Cloud browser selection (written by `hermes tools` → Browser Automation)
   cloud_provider: local          # local | browserbase | browser-use | firecrawl | nous | <provider plugin>; unset = autodetect from credentials
   auto_local_for_private_urls: true  # With a cloud provider, open LAN/localhost URLs in a local Chromium

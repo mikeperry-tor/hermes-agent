@@ -148,7 +148,7 @@ def test_browser_exec_records_its_daemons_tab_on_the_vault_supervisor(tmp_path, 
         def set_driven_target(self, target_id):
             recorded.append(target_id)
 
-    class _Registry:
+    class _Registry(browser_supervisor._SupervisorRegistry):
         def get_or_start(self, task_id, cdp_url, **kw):
             return _Sup()
 
@@ -183,7 +183,7 @@ def test_a_call_the_bot_desktop_fence_refuses_leaves_the_driven_tab_alone(tmp_pa
         def set_driven_target(self, target_id):
             recorded.append(target_id)
 
-    class _Registry:
+    class _Registry(browser_supervisor._SupervisorRegistry):
         def get_or_start(self, task_id, cdp_url, **kw):
             return _Sup()
 
@@ -210,3 +210,35 @@ def test_a_call_the_bot_desktop_fence_refuses_leaves_the_driven_tab_alone(tmp_pa
 
     assert json.loads(bu_cli.browser_exec("print(1)", task_id="t"))["code"] == "human_has_control"
     assert recorded == []  # the refused call never ran, so the supervisor keeps the tab it had
+
+
+
+def test_named_desktop_supervisor_fences_vault_reads_and_secret_write(monkeypatch):
+    from unittest.mock import Mock
+    from tools import browser_session as bs, browser_supervisor, browser_vault_tool as vault
+    from tools.bot_desktop import lease
+
+    supervisor = Mock(local_browser=True)
+    registry = browser_supervisor._SupervisorRegistry()
+    registry._by_task["task"] = supervisor
+    monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", registry)
+    monkeypatch.setattr(bs, "session_for_task", lambda _: {})  # no exact named or sidecar record
+    fill = Mock(return_value='{"success": true}')
+    monkeypatch.setattr(vault, "browser_vault_fill", fill)
+    lease.acquire("fixture-viewer")
+    try:
+        refusal = json.loads(vault._handle_vault({"action": "fill", "target": "browser"}, task_id="task"))
+        assert refusal["code"] == "human_has_control"
+        fill.assert_not_called()
+
+        assert vault._eval_js("task", "fixture read")["error_type"] == "human_has_control"
+        assert vault._eval_js_secret("task", "fixture write")["error_type"] == "human_has_control"
+        assert vault._focus_bound_origin("task", "https://example.test", "login") is None
+        supervisor.evaluate_runtime.assert_not_called()
+        supervisor.focus_page.assert_not_called()
+
+        supervisor.local_browser = False  # the task's cloud supervisor is outside the lease
+        assert json.loads(vault._handle_vault({"action": "fill", "target": "browser"}, task_id="task"))["success"]
+        fill.assert_called_once()
+    finally:
+        lease.release("fixture-viewer")

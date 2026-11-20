@@ -106,6 +106,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(f"Invalid dialog_policy {dialog_policy!r}; must be one of {sorted(_VALID_POLICIES)}")
         self.task_id = task_id
+        self.local_browser: Optional[bool] = None
         self.cdp_url = cdp_url
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
@@ -379,8 +380,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return False
         logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
                        self.task_id, failures, _redact_cdp_error_text(e))
-        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
-            SUPERVISOR_REGISTRY._pop(self.task_id)
+        SUPERVISOR_REGISTRY.detach(self.task_id, expected=self)
         return True
 
     async def _run(self) -> None:
@@ -514,6 +514,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     }
 
 
+class SupervisorEndpointConflict(RuntimeError):
+    """The task is currently using a different CDP endpoint."""
+
+
 class _SupervisorRegistry:
     """Process-global (task_id → supervisor) map with idempotent start/stop (``SUPERVISOR_REGISTRY``)."""
 
@@ -521,13 +525,40 @@ class _SupervisorRegistry:
         self._lock = threading.Lock()
         self._by_task: dict[str, CDPSupervisor] = {}
         self._home_by_task: dict[str, str] = {}  # profile home that started it (``stop_home``)
+        self._in_use: dict[str, tuple[str, int]] = {}
+
+    @contextlib.contextmanager
+    def reserve_endpoint(self, task_id: str, cdp_url: str):
+        """Keep the task on its endpoint until the last overlapping command finishes."""
+        with self._lock:
+            self._check_endpoint(task_id, cdp_url)
+            _, users = self._in_use.get(task_id, (cdp_url, 0))
+            self._in_use[task_id] = cdp_url, users + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                _, users = self._in_use[task_id]
+                if users == 1:
+                    del self._in_use[task_id]
+                else:
+                    self._in_use[task_id] = cdp_url, users - 1
+
+    def _check_endpoint(self, task_id: str, cdp_url: str) -> None:
+        endpoint, _ = self._in_use.get(task_id, (cdp_url, 0))
+        if endpoint != cdp_url:
+            raise SupervisorEndpointConflict("This task already has a browser command using a different endpoint")
+
 
     def get(self, task_id: str) -> Optional[CDPSupervisor]:
         with self._lock:
             return self._by_task.get(task_id)
 
-    def _pop(self, task_id: str) -> Optional[CDPSupervisor]:
+    def detach(self, task_id: str, *, expected: Optional[CDPSupervisor] = None) -> Optional[CDPSupervisor]:
+        """Remove the registry entry and hand its exact owner to the caller for teardown."""
         with self._lock:
+            if expected is not None and self._by_task.get(task_id) is not expected:
+                return None
             self._home_by_task.pop(task_id, None)
             return self._by_task.pop(task_id, None)
 
@@ -539,37 +570,52 @@ class _SupervisorRegistry:
         return capture(self, task_id, timeout=timeout)
 
     def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
+                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0,
+                     admission=contextlib.nullcontext, local_browser: Optional[bool] = None) -> CDPSupervisor:
         """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
-        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
+        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced.
+        An executor's admission scope guards registry changes before and after the slow attach."""
         from hermes_constants import hermes_home_key
         home = hermes_home_key()
-        with self._lock:
+        with admission(), self._lock:
+            self._check_endpoint(task_id, cdp_url)
             existing = self._by_task.get(task_id)
             if existing is not None:
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
                 if existing.cdp_url == cdp_url and healthy:
+                    if local_browser is not None and existing.local_browser is not True:
+                        existing.local_browser = local_browser
                     return existing
                 self._by_task.pop(task_id, None)
+                self._home_by_task.pop(task_id, None)
         if existing is not None:
             existing.stop()
 
         supervisor = CDPSupervisor(task_id=task_id, cdp_url=cdp_url,
                                    dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s)
+        supervisor.local_browser = local_browser
         supervisor.start(timeout=start_timeout)
-        with self._lock:
-            # Guard against a concurrent get_or_start from another thread.
-            already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url:
-                supervisor.stop()
-                return already
-            self._by_task[task_id] = supervisor
-            self._home_by_task[task_id] = home
-        return supervisor
+        try:
+            with admission(), self._lock:
+                self._check_endpoint(task_id, cdp_url)
+                already = self._by_task.get(task_id)
+                if already is None:
+                    self._by_task[task_id] = supervisor
+                    self._home_by_task[task_id] = home
+                    return supervisor
+                if already.cdp_url != cdp_url:
+                    raise SupervisorEndpointConflict("A different browser supervisor was published while attaching")
+                if local_browser is not None and already.local_browser is not True:
+                    already.local_browser = local_browser
+        except BaseException:
+            supervisor.stop()
+            raise
+        supervisor.stop()
+        return already
 
     def stop(self, task_id: str) -> None:
-        supervisor = self._pop(task_id)
+        supervisor = self.detach(task_id)
         if supervisor is not None:
             supervisor.stop()
 

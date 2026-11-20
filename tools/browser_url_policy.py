@@ -123,7 +123,7 @@ def _url_policy_error(url: str, *, auto_local: bool = False) -> Optional[dict]:
     from tools.browser_session_cloud import allow_private_urls, is_local_backend
     if is_always_blocked_url(url):  # unconditional: IMDS via any browser exfiltrates host credentials (#16234)
         return _err("Blocked: URL targets a cloud metadata endpoint")
-    if not is_local_backend() and not auto_local and not allow_private_urls() and not is_safe_url(url):
+    if not auto_local and not is_local_backend() and not allow_private_urls() and not is_safe_url(url):
         return _err("Blocked: URL targets a private or internal address")
     blocked = check_website_access(url)
     if blocked:
