@@ -27,6 +27,15 @@ _BOT_MODE_PROTOCOL_VERSION = 3
 # Leads a notify-only DM's body (after the attribution colon, so every sender-card parser keeps it).
 NO_REPLY_MARKER = "[no reply needed]"
 
+INBOUND_BOT_PROTOCOL = (
+    f"{_PROTOCOL_HEADING}\n"
+    'A "Message from 🤖 <name> (@<handle>):" message comes from a teammate agent. '
+    "Address them and give your reply as this turn's final response. The "
+    "transport delivers that response to the sender. "
+    f"If the message is marked {NO_REPLY_MARKER} or has nothing to answer, "
+    "end your turn with [SILENT] or NO_REPLY."
+)
+
 
 def strip_legacy_protocol(text: str) -> str:
     """SOUL text without the plugin-era "## Messaging other agents" section (idempotent)."""

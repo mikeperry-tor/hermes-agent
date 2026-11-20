@@ -1517,11 +1517,7 @@ def _adopt_live_compression_child(
     Resolve and load first, then mutate the agent, so ambiguous lineage or an unreadable handoff fails closed.
     Uses the transitive ``get_compression_tip`` walk; a tip is adopted only while its row is still live.
 
-    Resolution uses the canonical transitive walk ``get_compression_tip`` so a lineage with >=2 compression
-    hops (root -> mid -> tip) recovers to the live tip — the depth-1 ``find_live_compression_child`` lookup
-    this used to call finds no live *direct* child in that shape and skipped recovery (#82001). The tip walk
-    returns the input id when no continuation exists, and a resolved tip is adopted only while its row is
-    still live — both cases fail closed exactly as before. ``store`` is the writer handle beside ``session_db``.
+    ``store`` is the writer handle beside ``session_db``. A tip can be several compression hops away.
     """
     if store is not None:
         def resolver(_db: Any, sid: str) -> str:
@@ -1529,7 +1525,9 @@ def _adopt_live_compression_child(
 
         def row_getter(_db: Any, sid: str) -> Optional[dict[str, Any]]:
             record = store.sessions.get(sid)
-            return None if record is None else {"ended_at": record.ended_at, "system_prompt": record.system_prompt}
+            return None if record is None else {
+                "ended_at": record.ended_at, "system_prompt": record.system_prompt, "model_config": record.model_config,
+            }
 
         def loader(_db: Any, sid: str) -> list[dict[str, Any]]:
             return _read_conversation(store, sid)
@@ -1558,14 +1556,16 @@ def _adopt_live_compression_child(
     _rebind_session_context(child_session_id)
     _hand_off_metrics_segment(parent_session_id, child_session_id)
     agent._session_db_created = True
-    # The turn skips restore/rebuild while this slot is set, so it may hold only the child's own
-    # prompt, and only when that prompt matches the current runtime (otherwise None -> rebuild).
-    # Turn-start adoption runs before _restore_primary_runtime on purpose; a reject here is re-checked by the normal restore.
+    # A seeded prompt bypasses normal restore. It must still match the actor and its live policy.
     from agent.conversation_loop import _stored_prompt_matches_runtime
+    from agent.prompt_refresh import stored_prompt_policy_changed, stored_prompt_refresh_epoch
+    from toolsets import managed_tool_selection_changed
     child_prompt = child.get("system_prompt")
-    agent._cached_system_prompt = (
-        child_prompt if child_prompt and _stored_prompt_matches_runtime(agent, child_prompt) else None
-    )
+    agent._cached_system_prompt = None
+    if (child_prompt and _stored_prompt_matches_runtime(agent, child_prompt)
+            and not stored_prompt_policy_changed(agent, child) and not managed_tool_selection_changed(agent)
+            and not stored_prompt_refresh_epoch(agent, child)):
+        agent._cached_system_prompt = child_prompt
     agent._last_flushed_db_idx = len(recovered)
     agent._flushed_db_message_session_id = child_session_id
     agent._flushed_db_message_ids = {id(message) for message in recovered if isinstance(message, dict)}
@@ -3050,16 +3050,11 @@ def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
             "compaction tool-definition refresh failed; keeping the session's existing tool snapshot", exc_info=True
         )
 
-    # ALWAYS rebuild the prompt here: keeping old bytes meant prompt-builder changes
-    # never reached long sessions. Equal bytes keep KV; preserve object identity.
-    # ALWAYS rebuild the prompt at the admitted-commit boundary (maintainer-directed, #95681 arc). The
-    # previous "keep-prompt" containment branch put the OLD bytes back whenever the reloaded memory blocks
-    # were already embedded — which meant prompt-builder changes (guidance diets, new blocks, renames) NEVER
-    # reached a long-lived session. The cache argument for keeping bytes was hollow: when nothing changed,
-    # the rebuild is byte-identical and local KV prefixes survive on equality; when something changed, the
-    # cache was stale by definition and propagation is the point. Preserve OBJECT identity on byte-equality
-    # for backends that key on it.
-    rebuilt_system_prompt = agent._build_system_prompt(system_message)
+    # Rebuild to propagate prompt changes to long sessions. Preserve object identity when the bytes
+    # are unchanged for backends that use it for their KV cache.
+    from agent.prompt_refresh import build_prompt_with_policy
+    rebuilt_system_prompt, policy = build_prompt_with_policy(agent, system_message)
+    agent._prompt_managed_tools = policy
     if cached_system_prompt is not None and rebuilt_system_prompt == cached_system_prompt:
         new_system_prompt = agent._cached_system_prompt = cached_system_prompt
         from agent.system_prompt import reconstruct_static_prefix
@@ -3226,10 +3221,12 @@ def _publish_rotated_compaction(
                  else agent._session_db.get_session_title(agent.session_id))
     new_session_id = mint_session_id()
     from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.prompt_refresh import with_prompt_policy
     from tools.approval_yolo import with_session_yolo
+    model_config = with_session_yolo(agent._session_init_model_config, old_session_id)
     child = dict(
         source=_compression_child_source(agent, old_session_id), model=agent.model,
-        model_config=with_session_yolo(agent._session_init_model_config, old_session_id),
+        model_config=with_prompt_policy(model_config, getattr(agent, "_prompt_managed_tools", None)),
         system_prompt=new_system_prompt, cwd=getattr(agent, "working_directory", None), profile_name=_profile_for_child,
     )
     lease_terms = dict(
@@ -3632,8 +3629,8 @@ def _commit_compaction(
                 # re-baseline transcript handling.
                 compacted_in_place = True
                 # In-place still updates the current row's prompt; rotation published it atomically above.
-                (store.sessions if store is not None else agent._session_db).update_system_prompt(
-                    agent.session_id, new_system_prompt)
+                from agent.prompt_refresh import write_saved_system_prompt
+                write_saved_system_prompt(agent, new_system_prompt, getattr(agent, "_prompt_managed_tools", None))
                 agent._last_flushed_db_idx = 0
             else:
                 # Bind old_session_id first: it is the rollback key in the handler below.

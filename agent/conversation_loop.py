@@ -23,7 +23,10 @@ from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_su
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_builder import RUNTIME_ENVIRONMENT_END, RUNTIME_ENVIRONMENT_HEADING
-from agent.prompt_refresh import rebuild_for_refresh, requested_epoch, stamp_prompt_epoch, stored_prompt_refresh_epoch
+from agent.prompt_refresh import (
+    build_prompt_with_policy, rebuild_for_refresh, requested_epoch, stamp_prompt_epoch,
+    stored_prompt_policy_changed, stored_prompt_refresh_epoch, write_saved_system_prompt,
+)
 from agent.prompt_caching import (
     build_prompt_cache_plan,
     effective_cache_ttl,
@@ -748,22 +751,23 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
         return False
 
 
-def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False) -> None:
+def _persist_system_prompt(agent, failure_message: str, *, persist_tools: bool = False,
+                           producing_policy=None) -> bool:
     """Persist ``agent._cached_system_prompt`` to the session row; failures log at WARNING
     (with ``failure_message``) because the gateway path (fresh AIAgent per turn) reads
     this row every turn, so a silent failure breaks prefix-cache reuse."""
     if not agent._session_db:
-        return
+        return True
     try:
-        from agent.agent_init_session import agent_interface
-        store = agent_interface(agent)
-        (store.sessions if store is not None else agent._session_db).update_system_prompt(
-            agent.session_id, agent._cached_system_prompt)
+        policy = producing_policy if producing_policy or getattr(agent, "_prompt_managed_tools", []) else None
+        write_saved_system_prompt(agent, agent._cached_system_prompt, policy)
         if persist_tools:
             from tools.mcp_tool_agent import persist_agent_tool_names
             persist_agent_tool_names(agent)
+        return True
     except Exception as exc:
         logger.warning(failure_message, agent.session_id, exc)
+        return False
 
 
 def _restore_pinned_tools(agent, session_row) -> list:
@@ -852,6 +856,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
+    policy_changed = stored_prompt_policy_changed(agent, session_row)
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # NULL/empty rows never reach this probe: they already rebuild below.
         if _bot_chat_prompt_stale(agent, stored_prompt):
@@ -871,27 +876,29 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             except Exception:
                 pass
             _refresh_bot_chat_tools(agent)
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            agent._cached_system_prompt, producing_policy = build_prompt_with_policy(agent, system_message)
             record_cache_break(agent, "toolset_change")
             stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)
             # Persist so the NEXT turn restores the new bytes verbatim (cache break is
             # once per capability change). Tools re-pin too: without it the next
             # turn's pin-restore would resurrect the pre-refresh toolset (#124211).
             # on_session_start not re-fired: continuation.
-            _persist_system_prompt(
+            if _persist_system_prompt(
                 agent,
                 "Session DB update_system_prompt failed after Bot Chat capability refresh "
                 "(session=%s): %s. The refresh will re-fire next turn.",
                 persist_tools=True,
-            )
-            stamp_prompt_epoch(agent, refresh_request)
+                producing_policy=producing_policy,
+            ):
+                stamp_prompt_epoch(agent, refresh_request, producing_policy=producing_policy)
             return
         refresh_epoch = stored_prompt_refresh_epoch(agent, session_row)
-        if refresh_epoch:
+        if refresh_epoch or policy_changed:
             # `hermes sessions refresh-prompts` ran after this prompt was built. Pin tools[] first
             # (the refresh is about instructions; the frozen tool array stays), then rebuild once.
             _restore_pinned_tools(agent, session_row)
-            rebuild_for_refresh(agent, system_message, conversation_history, refresh_epoch)
+            rebuild_for_refresh(agent, system_message, conversation_history, refresh_epoch,
+                                policy_changed=policy_changed)
             return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
@@ -945,7 +952,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     built_for_this_surface = _restore_pinned_tools(agent, session_row)
     # Read before the build: a refresh request landing mid-build still fires next turn.
     refresh_epoch = requested_epoch(agent)
-    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    agent._cached_system_prompt, producing_policy = build_prompt_with_policy(agent, system_message)
     if conversation_history:
         record_prompt_rebuild(agent, stored_prompt, stored_state, agent._cached_system_prompt)
 
@@ -975,13 +982,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     except Exception:
         logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
-    _persist_system_prompt(
+    if _persist_system_prompt(
         agent,
         "Session DB update_system_prompt failed for session %s: %s. Subsequent turns will "
         "rebuild the system prompt and miss the prefix cache.",
         persist_tools=True,
-    )
-    stamp_prompt_epoch(agent, refresh_epoch)
+        producing_policy=producing_policy,
+    ):
+        stamp_prompt_epoch(agent, refresh_epoch, producing_policy=producing_policy)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:

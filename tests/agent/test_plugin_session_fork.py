@@ -149,6 +149,18 @@ def test_session_fork_capability_alone_earns_a_token(forks, consented):
     assert isinstance(issue_side_question_token(parent, [], "turn-1"), str)
 
 
+def test_fork_refuses_stale_captured_policy(forks, consented, tmp_path, monkeypatch):
+    parent = _agent()
+    token = issue_side_question_token(parent, [], "turn-1")
+    assert token
+    (tmp_path / "config.yaml").write_text("tools: {disabled: [cw_offer]}\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path))
+
+    handle = _settled(_ctx(consented).fork_session(token, "q"))
+    assert handle.outcome == "refused:policy_changed"
+    assert not forks.built[0]["fork"].started.is_set()
+
+
 def test_without_the_capability_fork_session_is_none_and_the_token_unspent(forks, consented):
     parent = _agent()
     token = issue_side_question_token(parent, [], "turn-1")

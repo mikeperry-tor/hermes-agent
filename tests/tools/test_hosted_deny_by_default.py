@@ -93,7 +93,7 @@ def test_in_a_local_scope_the_allowlist_is_never_consulted(monkeypatch):
             reached.clear()
             with bind_state(scope) if scope else _null():
                 for name in names:
-                    assert policy.hosted_tool_refusal(name) is None
+                    assert policy.tool_refusal(name) is None
                     registry.dispatch(name, {})
                 for feature in policy.HOST_FEATURES:
                     assert policy.host_feature_enabled(feature)
@@ -412,7 +412,7 @@ def test_failed_write_bookkeeping_does_not_stat_host(provider, tmp_path):
 
 def test_no_checkpoint_preflight_in_a_hosted_scope(tmp_path):
     """The preflight's sandbox-path check and ``CheckpointManager``'s ``checkpoints`` feature consult
-    (mutation-checked in test_hosted_tool_refusals) keep a hosted call from snapshotting anything."""
+    (mutation-checked in test_tool_refusals) keep a hosted call from snapshotting anything."""
     from agent.tool_executor import _ToolCallRef, _begin_tool_execution
     mgr = MagicMock(enabled=True)
     agent = SimpleNamespace(_checkpoint_mgr=mgr, quiet_mode=True, verbose_logging=False, tool_progress_callback=None,

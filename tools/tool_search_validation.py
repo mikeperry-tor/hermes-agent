@@ -82,6 +82,9 @@ def validate_deferred_call_args(name: str, args: dict[str, Any]) -> Optional[str
     This restores the concrete-schema checks that the provider cannot perform through the generic
     ``arguments: object`` bridge. See #5149.
     """
+    from tools.hosted_tool_policy import tool_refusal
+    if refusal := tool_refusal(name):
+        return tool_error(refusal)
     try:
         from tools.registry import registry as _registry
         # The schema tool_describe served, dynamic overrides included (ElevenLabs drops `text`).
@@ -257,8 +260,10 @@ def not_deferrable_error(name: str, session_tool_names: Optional[Iterable[str]] 
                 "Call it directly instead of via tool_call.")
     suffix = f"__{name}"
     try:
+        from tools.hosted_tool_policy import tool_refusal
         from tools.registry import registry
-        candidates = sorted(n for n in registry.get_all_tool_names() if n.endswith(suffix))
+        candidates = sorted(n for n in registry.get_all_tool_names()
+                            if n.endswith(suffix) and tool_refusal(n) is None)
     except Exception:
         candidates = []
     hint = (f" Did you mean {', '.join(repr(c) for c in candidates)}?" if candidates

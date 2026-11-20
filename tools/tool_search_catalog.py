@@ -4,12 +4,13 @@ defs plus the budgeted, byte-stable catalog listing embedded in the bridge."""
 from __future__ import annotations
 
 import functools
+import json
 import math
 import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import snowballstemmer
 
@@ -21,6 +22,21 @@ TOOL_CALL_NAME = "tool_call"
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 # Chars-per-token rule of thumb; 4.0 slightly underestimates (fewer false activations).
 CHARS_PER_TOKEN = 4.0
+
+
+def deferred_call_note(names: Iterable[str]) -> str:
+    """Explain how a restricted fork can call its permitted deferred tools without catalog access."""
+    from tools.registry import registry
+
+    def _parameters(name: str) -> str:
+        schema = registry.get_schema(name) or {}
+        fn = schema.get("function") if schema.get("type") == "function" else schema
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        return json.dumps(params if isinstance(params, dict) else {}, ensure_ascii=False,
+                          separators=(",", ":"), sort_keys=True)
+
+    return (f"\n\nCall {', '.join(sorted(names))} through {TOOL_CALL_NAME} with name=<tool> and arguments "
+            "matching its parameters: " + "; ".join(f"{n} {_parameters(n)}" for n in sorted(names)) + ".")
 
 
 @dataclass
@@ -237,15 +253,17 @@ def _listing_group_label(source_name: str) -> str:
     return label.removeprefix("mcp-")
 
 
-def hidden_declared_sources() -> list[dict[str, Any]]:
+def hidden_declared_sources(*, permitted=None) -> list[dict[str, Any]]:
     """Return deterministic summaries for declared MCP servers hidden by their check."""
     from hermes_platform import declaration
+    from tools.hosted_tool_policy import discovery_tool_filter
     from tools.mcp_liveness import unavailable_details
     from tools.registry import registry
 
+    permitted = permitted or discovery_tool_filter()
     grouped: dict[str, list[Any]] = {}
     for entry in registry.get_all_entries():
-        if entry.toolset.startswith("mcp-"):
+        if entry.toolset.startswith("mcp-") and permitted(entry.name):
             grouped.setdefault(entry.toolset[4:], []).append(entry)
     rows: list[dict[str, Any]] = []
     for server_name in sorted(grouped):
@@ -263,7 +281,7 @@ def hidden_declared_sources() -> list[dict[str, Any]]:
 
 
 def build_catalog_listing_with_form(
-    deferrable: list[dict[str, Any]], *, max_tokens: int = 4000) -> tuple[Optional[str], str]:
+    deferrable: list[dict[str, Any]], *, max_tokens: int = 4000, permitted=None) -> tuple[Optional[str], str]:
     """Render the deferred-catalog manifest: ``- name: short desc`` lines grouped per source.
     Returns ``(text, form)``; form is ``"full"``, ``"names"``, ``"mixed"`` (oversized servers
     collapsed to a name + count line), ``"groups"`` (every server summarized) or ``"none"``
@@ -278,7 +296,7 @@ def build_catalog_listing_with_form(
             # _classify_source gives ("other", "") when unregistered; the label of "" is "other".
             label = _listing_group_label(_classify_source(name)[1])
             groups.setdefault(label, []).append((name, _short_desc(fn.get("description", ""))))
-    unavailable = hidden_declared_sources()
+    unavailable = hidden_declared_sources(permitted=permitted)
     if not groups and not unavailable:
         return None, "none"
 

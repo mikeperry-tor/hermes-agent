@@ -315,8 +315,10 @@ class AIAgent(
     def _session_row_model_config(self) -> Any:
         """``model_config`` for the lazily created session row: the init config plus a live /yolo toggled
         before the first turn (``hermes --resume`` restores it)."""
+        from agent.prompt_refresh import with_prompt_policy
         from tools.approval_yolo import with_session_yolo
-        return with_session_yolo(self._session_init_model_config, self.session_id)
+        config = with_session_yolo(self._session_init_model_config, self.session_id)
+        return with_prompt_policy(config, getattr(self, "_prompt_managed_tools", None) or None)
 
     def _ensure_db_session(self) -> None:
         """Create the session DB row on first use; a transient failure leaves it to retry next turn."""
@@ -330,11 +332,7 @@ class AIAgent(
                 from hermes_cli.profiles import get_active_profile_name
                 profile_for_session = get_active_profile_name()
             except Exception:
-                # Persist the profile name EXPLICITLY, including "default". NULL used to stand in for the
-                # default profile, but the #94724 legacy-owner backfill already stamps literal "default"
-                # onto old rows, and profile-keyed consumers (sidebar scope matching,
-                # @session:<profile>/<id> deep links) treat NULL as unowned — rows minted NULL after the
-                # one-shot backfill vanished from the sidebar (#99222).
+                # Profile-keyed consumers treat NULL as unowned, including on the default profile.
                 profile_for_session = None
             # Carry the gateway routing identity: when the gateway SessionStore degraded to JSONL (corrupt
             # state.db) this lazy create is the ONLY durable write, and an identity-less row is unrecoverable.
@@ -1475,8 +1473,14 @@ _LIST_TOOLS_USAGE = """
 def _print_tool_listing() -> None:
     """``--list_tools``: print toolsets (basic / composite / scenario / legacy), every tool, and usage examples."""
     from model_tools import get_all_tool_names, get_available_toolsets
+    from tools.hosted_tool_policy import MANAGED_TOOL_POLICY_ERROR, discovery_tool_filter, managed_disabled_tools
     from toolsets import get_all_toolsets, get_toolset_info
 
+    policy = managed_disabled_tools()
+    if policy is None:
+        print(MANAGED_TOOL_POLICY_ERROR, file=sys.stderr)
+        return
+    permitted = discovery_tool_filter(policy)
     print("📋 Available Tools & Toolsets:")
     print("-" * 50)
     print("\n🎯 Predefined Toolsets (New System):")
@@ -1485,6 +1489,10 @@ def _print_tool_listing() -> None:
     for name in get_all_toolsets():
         info = get_toolset_info(name)
         if info:
+            resolved = [tool for tool in info["resolved_tools"] if permitted(tool)]
+            if not resolved:
+                continue
+            info = {**info, "resolved_tools": resolved, "tool_count": len(resolved)}
             bucket = basic_toolsets if name in _BASIC_TOOLSETS else composite_toolsets if name in _COMPOSITE_TOOLSETS else scenario_toolsets
             bucket.append((name, info))
     print("\n📌 Basic Toolsets:")
@@ -1501,11 +1509,11 @@ def _print_tool_listing() -> None:
         print(f"  • {name:20} - {info['description']}")
         print(f"    Total tools: {info['tool_count']}")
     print("\n📦 Legacy Toolsets (for backward compatibility):")
-    for name, info in get_available_toolsets().items():
+    for name, info in get_available_toolsets(permitted=permitted).items():
         print(f"  {'✅' if info['available'] else '❌'} {name}: {info['description']}")
         if not info["available"]:
             print(f"    Requirements: {', '.join(info['requirements'])}")
-    all_tools = get_all_tool_names()
+    all_tools = [name for name in get_all_tool_names() if permitted(name)]
     print(f"\n🔧 Individual Tools ({len(all_tools)} available):")
     for tool_name in sorted(all_tools):
         print(f"  📌 {tool_name} (from {get_toolset_for_tool(tool_name)})")

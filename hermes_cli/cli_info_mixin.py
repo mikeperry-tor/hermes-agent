@@ -157,11 +157,21 @@ class CLIInfoMixin:
             self._show_status()
         else:
             # Warm-launch fast path: replay last launch's tool panel when the snapshot fingerprint
-            # (config.yaml + .env + checkout rev + toolsets) is unchanged, skipping the ~0.5-0.9s
+            # (profile inputs, checkout, toolsets and managed policy) is unchanged, skipping the ~0.5-0.9s
             # cold get_tool_definitions walk. The agent's REAL tool list is still computed fresh at
             # first message; a background refresh re-verifies the snapshot so drift self-heals.
             from hermes_cli.banner import (
                 compute_toolset_availability, load_banner_snapshot, save_banner_snapshot)
+            from tools.hosted_tool_policy import managed_disabled_tools
+
+            def _banner_inputs():
+                policy = managed_disabled_tools()
+                tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets,
+                                             disabled_toolsets=self.disabled_toolsets, quiet_mode=True,
+                                             managed_policy=policy)
+                availability = compute_toolset_availability(self.enabled_toolsets, managed_policy=policy)
+                return tools, availability, policy
+
             try:
                 snapshot = load_banner_snapshot(self.enabled_toolsets)
             except Exception:
@@ -182,12 +192,9 @@ class CLIInfoMixin:
                 def _refresh_banner_snapshot() -> None:
                     try:
                         from model_tools import get_toolset_for_tool
-                        tools = get_tool_definitions(
-                            enabled_toolsets=self.enabled_toolsets,
-                            disabled_toolsets=self.disabled_toolsets, quiet_mode=True)
-                        availability = compute_toolset_availability(self.enabled_toolsets)
+                        tools, availability, policy = _banner_inputs()
                         tmap = _toolset_map(tools, availability, get_toolset_for_tool)
-                        save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap)
+                        save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap, managed_policy=policy)
                     except Exception:
                         logger.debug("banner snapshot refresh failed", exc_info=True)
 
@@ -197,13 +204,11 @@ class CLIInfoMixin:
             else:
                 # Cold path: compute live, then persist the snapshot for the next launch.
                 from model_tools import get_toolset_for_tool
-                tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets,
-                                             disabled_toolsets=self.disabled_toolsets, quiet_mode=True)
-                availability = compute_toolset_availability(self.enabled_toolsets)
+                tools, availability, policy = _banner_inputs()
                 build_welcome_banner(tools=tools, availability=availability, **banner_kw)
                 try:
                     tmap = _toolset_map(tools, availability, get_toolset_for_tool)
-                    save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap)
+                    save_banner_snapshot(tools, self.enabled_toolsets, availability, tmap, managed_policy=policy)
                 except Exception:
                     logger.debug("banner snapshot save failed", exc_info=True)
 
