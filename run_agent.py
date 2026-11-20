@@ -1475,8 +1475,14 @@ _LIST_TOOLS_USAGE = """
 def _print_tool_listing() -> None:
     """``--list_tools``: print toolsets (basic / composite / scenario / legacy), every tool, and usage examples."""
     from model_tools import get_all_tool_names, get_available_toolsets
+    from tools.hosted_tool_policy import MANAGED_TOOL_POLICY_ERROR, discovery_tool_filter, managed_disabled_tools
     from toolsets import get_all_toolsets, get_toolset_info
 
+    policy = managed_disabled_tools()
+    if policy is None:
+        print(MANAGED_TOOL_POLICY_ERROR, file=sys.stderr)
+        return
+    permitted = discovery_tool_filter(policy)
     print("📋 Available Tools & Toolsets:")
     print("-" * 50)
     print("\n🎯 Predefined Toolsets (New System):")
@@ -1485,6 +1491,10 @@ def _print_tool_listing() -> None:
     for name in get_all_toolsets():
         info = get_toolset_info(name)
         if info:
+            resolved = [tool for tool in info["resolved_tools"] if permitted(tool)]
+            if not resolved:
+                continue
+            info = {**info, "resolved_tools": resolved, "tool_count": len(resolved)}
             bucket = basic_toolsets if name in _BASIC_TOOLSETS else composite_toolsets if name in _COMPOSITE_TOOLSETS else scenario_toolsets
             bucket.append((name, info))
     print("\n📌 Basic Toolsets:")
@@ -1501,11 +1511,11 @@ def _print_tool_listing() -> None:
         print(f"  • {name:20} - {info['description']}")
         print(f"    Total tools: {info['tool_count']}")
     print("\n📦 Legacy Toolsets (for backward compatibility):")
-    for name, info in get_available_toolsets().items():
+    for name, info in get_available_toolsets(permitted=permitted).items():
         print(f"  {'✅' if info['available'] else '❌'} {name}: {info['description']}")
         if not info["available"]:
             print(f"    Requirements: {', '.join(info['requirements'])}")
-    all_tools = get_all_tool_names()
+    all_tools = [name for name in get_all_tool_names() if permitted(name)]
     print(f"\n🔧 Individual Tools ({len(all_tools)} available):")
     for tool_name in sorted(all_tools):
         print(f"  📌 {tool_name} (from {get_toolset_for_tool(tool_name)})")

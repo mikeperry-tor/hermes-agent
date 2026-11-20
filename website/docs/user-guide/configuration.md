@@ -3467,3 +3467,41 @@ dashboard:
 - `ws_orphan_reap_grace_s` — how long a WS-detached session waits before the orphan reaper collects it. Raise alongside the keepalive values if clients reconnect slowly. Periodic session maintenance also completes cleanup for closed sockets and re-arms a missing orphan timer, so a detached chat cannot keep its ownership lease solely because its initial cleanup or timer was lost. Reconnecting cancels that timer; active delegated work and healthy running turns remain protected by the normal orphan-reaper checks. (`HERMES_TUI_WS_ORPHAN_REAP_GRACE_S` remains as an internal override.)
 - `ws_orphan_activity_stale_s` (default `600`) — how long a detached **running** turn's activity clock (the same clock the `agent.turn_liveness` watchdog samples: API waits, stream tokens, tool heartbeats) must be idle before the orphan reaper interrupts it. A client-absent turn that is still actively producing keeps running to completion detached — closing the laptop, backgrounding the mobile app, or a desktop update no longer cancels healthy long turns; only a genuinely wedged turn is interrupted. Set `0` to interrupt at the grace window regardless of activity (old behavior).
 - `startup_orphan_sweep` (default `true`) — the WS-orphan reap timer above is in-process, so a gateway restart (update, crash, systemd) before it fires leaves the session row open forever — phantom "active" work in `/resume` and dashboards. On every gateway boot — both the stdio TUI (`entry.main`) and the desktop/dashboard WebSocket sidecar (`handle_ws`) — rows with source `tui` / `desktop` / `subagent` / `unknown` (a row the token-accounting guard had to materialize itself) whose start time **and** newest message are both older than the session TTL (`HERMES_TUI_SESSION_TTL_S`, default 6 hours) are closed with `end_reason: startup_orphan_reap`. Messaging-platform sessions (Telegram, Discord, …) are never touched, live in-memory sessions (a client that already resumed) are excluded, and swept sessions remain resumable.
+
+
+### Deployment-owned tool denial
+
+For a deployment using the native managed configuration backend, an administrator
+can place exact tool names in the managed `config.yaml` (normally `/etc/hermes`):
+
+```yaml
+tools:
+  disabled: [browser_exec, computer_use]
+```
+
+This ceiling applies to discovery, including startup readiness, `--list_tools`, Tool Search
+and model-facing MCP setup and catalog install results. It also applies to
+direct and inline dispatch, execute-code RPC and child agents. The setup card
+still shows connection state. A registered MCP server remains selected when
+all its tools are temporarily denied, so a later policy change can expose the
+newly permitted tools on the same connection. Profile toolset selection may narrow availability
+but cannot re-enable these names. Native hosted-mode restrictions still apply
+independently; this list does not activate the hosted allowlist or disable other
+local features. It is a tool-dispatch boundary, not OS isolation or a restriction
+on trusted plugins importing Python handlers directly.
+
+If the policy disables one of the Tool Search bridge tools, Hermes keeps
+permitted tools in the direct tool list so they remain callable.
+Hosted Search and Describe require `manage_connections` in the session and
+permission from the current policy. After a hosted lookup, Hermes applies the
+current policy to the returned tool names, schemas and source counts together.
+
+The administrator owns the managed directory and launch-only `HERMES_MANAGED_DIR`
+selection. Profiles cannot repoint it through `.env` or user configuration. An
+absent managed document or the explicit empty mapping `{}` adds no denial.
+A present blank, null, malformed or unreadable document refuses tool operations
+until repaired. Discovery reports the policy failure without exposing its contents.
+Inspection and repair remain available. Changes follow the native managed-file
+cache and affect subsequent discovery and dispatch.
+Remote configuration backends that do not honor native
+managed files retain their existing authority and ignore this option.
