@@ -2656,17 +2656,17 @@ def save_env_value_secure(key: str, value: str) -> dict[str, Any]:
 
 
 def reload_env() -> int:
-    """Re-read ~/.hermes/.env into os.environ; returns count of vars changed. Removes deleted vars only when
-    known to Hermes (OPTIONAL_ENV_VARS and _EXTRA_ENV_KEYS), and none while the .env exists but is unreadable."""
-    from hermes_cli.env_loader import dotenv_unreadable
+    """Reload the profile dotenv, preserving managed assignments, and count the changes."""
+    from hermes_cli.env_loader import dotenv_unreadable, managed_env_claims
     env_vars = load_env()
+    managed_claims = managed_env_claims()
     count = 0
     for key, value in env_vars.items():
-        if not is_launch_only_env_key(key) and os.environ.get(key) != value:  # launch-only: never from .env (#135200)
+        if key not in managed_claims and not is_launch_only_env_key(key) and os.environ.get(key) != value:
             os.environ[key] = value
             count += 1
     known = set() if dotenv_unreadable(get_env_path()) else set(OPTIONAL_ENV_VARS) | _EXTRA_ENV_KEYS
-    for key in known - set(env_vars):
+    for key in known - env_vars.keys() - managed_claims:
         if os.environ.pop(key, None) is not None:
             count += 1
     return count

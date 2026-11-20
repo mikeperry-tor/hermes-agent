@@ -110,7 +110,7 @@ def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
     return set(load_env_file(path))
 
 
-def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
+def _clear_known_keys_missing_from_dotenv(path: Path, managed_claims: frozenset[str]) -> None:
     """After ``.env`` loaded with override, delete inherited ``_PROFILE_MANAGED_ENV_KEYS`` it does not
     define. Deliberately NARROW: only keys that change *which provider path* is used.
 
@@ -119,7 +119,7 @@ def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
     """
     if not path.exists():
         return
-    defined = _env_keys_defined_in_dotenv(path)
+    defined = _env_keys_defined_in_dotenv(path) | managed_claims
     for key in _PROFILE_MANAGED_ENV_KEYS:
         if key not in defined and key in os.environ:
             del os.environ[key]
@@ -443,16 +443,19 @@ def _resolve_dotenv_assignments(
     return resolved
 
 
-def resolve_home_dotenv(home: Path, *, lookup_env: dict[str, str] | None = None) -> dict[str, str]:
+def resolve_home_dotenv(
+    home: Path, *, lookup_env: dict[str, str] | None = None, managed_only: bool = False,
+) -> dict[str, str]:
     """What ``load_hermes_dotenv`` would publish from *home*'s dotenv layers, read-only: the home's
     ``.env`` then the administrator-managed ``.env``, both with override and ``${VAR}`` expanded by the
     same rules against the process's own environment (this process's dotenv output peeled back), each
     layer seeing the one before. External secret sources and the project ``.env`` are not included.
-    *lookup_env* replaces that environment: another profile's file must not resolve against this one's."""
-    from hermes_cli import managed_scope
+    *lookup_env* replaces that environment for routed profiles. With *managed_only*, only the
+    managed layer is returned, still interpolated against the target's own dotenv."""
+    from hermes_cli.managed_scope import applied_managed_assignments, retain_managed_env_claims
 
-    managed_dir = managed_scope.get_managed_dir()
-    layers = [home / ".env", *([managed_dir / ".env"] if managed_dir is not None else [])]
+    managed_path = _managed_env_path()
+    layers = [home / ".env", *([managed_path] if managed_path is not None else [])]
     if lookup_env is not None:
         lookup_env = dict(lookup_env)
     else:
@@ -462,11 +465,22 @@ def resolve_home_dotenv(home: Path, *, lookup_env: dict[str, str] | None = None)
     for path in layers:
         try:
             assignments = _parse_dotenv_file(path)
-        except OSError:
+        except FileNotFoundError:
+            if path == managed_path:
+                retain_managed_env_claims(path, frozenset())
             continue
+        except OSError:
+            if path != managed_path:
+                continue
+            assignments = applied_managed_assignments(path)
+        else:
+            if path == managed_path:
+                retain_managed_env_claims(path, _claimed_env_names(dict(assignments).items()))
         for name, value in _resolve_dotenv_assignments(assignments, lookup_env, override=True).items():
             if value is not None:
-                lookup_env[name] = out[name] = value
+                lookup_env[name] = value
+                if not managed_only or path == managed_path:
+                    out[name] = value
     return out
 
 
@@ -480,6 +494,7 @@ def _release_bridge_claim(name: str) -> None:
 
 def _load_dotenv_with_fallback(
     path: Path, *, override: bool, load_pass: int | None = None, managed: bool = False,
+    managed_claims: frozenset[str] | None = None, shadowed: dict[str, str] | None = None,
 ) -> None:
     """Load one dotenv file into ``os.environ`` like ``dotenv.load_dotenv`` — same parser, same
     ``${VAR}`` / ``${VAR:-default}`` / precedence rules — except that ``${VAR}`` resolves against the value
@@ -488,13 +503,21 @@ def _load_dotenv_with_fallback(
     ``load_pass`` groups the layered files of one ``load_hermes_dotenv`` call: within a pass a later layer
     (project, managed) still sees the earlier layer's output, as it always did; only OTHER passes' output
     is peeled. A bare call (``hermes send``'s direct reload) is its own pass."""
+    if managed_claims is None:
+        managed_claims = frozenset() if managed else managed_env_claims()
+    if shadowed is None:
+        shadowed = {}
     assignments = _parse_dotenv_file(path)
     with _DOTENV_LOCK:
         if load_pass is None:
             load_pass = next(_DOTENV_PASSES)
-        resolved = _resolve_dotenv_assignments(assignments, _dotenv_lookup_env(load_pass), override=override)
+        lookup = _dotenv_lookup_env(load_pass) | shadowed
+        # For claimed names a previous managed publication must not suppress
+        # the private fallback value that this pass would have interpolated.
+        existing = (os.environ.keys() - managed_claims) | (lookup.keys() & managed_claims) if not override else ()
+        resolved = _resolve_dotenv_assignments(assignments, lookup, override=override)
         for name, value in resolved.items():
-            if value is None or (not override and name in os.environ):
+            if value is None or name in existing:
                 continue
             if is_launch_only_env_key(name):
                 _warn_launch_only_key(f"dotenv {path}", name)
@@ -504,6 +527,9 @@ def _load_dotenv_with_fallback(
             ours = record is not None and current == record[1]
             if name in _SPAWN_CREDENTIAL_KEYS and current and not ours:
                 continue  # parent-minted per-process credential: .env must not split it from the parent
+            if name in managed_claims:
+                shadowed[name] = value  # later layers can interpolate it without changing process policy
+                continue
             # Ours and untouched since → keep the original baseline; anything else is a newer outside value.
             baseline = record[0] if ours else current
             os.environ[name] = value
@@ -515,9 +541,18 @@ def _load_dotenv_with_fallback(
     # Managed keys are recorded separately: they are administrator policy, not launch-profile residue.
     # Launch-only keys are recorded nowhere: they were never published, so a leftover file entry must
     # not strip the launch value from a routed child either (#135200).
-    (_MANAGED_DOTENV_KEYS if managed else _LOADED_DOTENV_KEYS).update(
-        name for name, _value in assignments if not is_launch_only_env_key(name))
     _sanitize_loaded_credentials()  # httpx encodes headers as ASCII
+    if managed:
+        from hermes_cli.managed_scope import remember_applied_managed_env
+
+        names = _claimed_env_names(resolved.items())
+        with _DOTENV_LOCK:
+            current = dict(os.environ)
+            raw = [(name, value) for name, value in assignments if name in names]
+            remember_applied_managed_env(path, raw, {name: current[name] for name in names & current.keys()})
+            _MANAGED_DOTENV_KEYS.update(names)
+    else:
+        _LOADED_DOTENV_KEYS.update(name for name, _value in assignments if not is_launch_only_env_key(name))
 
 
 _LAUNCH_ONLY_WARNED: set[tuple[str, str, str]] = set()
@@ -577,7 +612,43 @@ def _dotenv_assignments(path: Path) -> list:
     return list(DotEnv(dotenv_path=None, stream=io.StringIO(text), interpolate=False).parse())
 
 
-def _bootstrap_env(home: Path | None = None, project_env: Path | None = None) -> dict:
+def _managed_env_path() -> Path | None:
+    from hermes_cli.managed_scope import get_managed_dir
+
+    try:
+        directory = get_managed_dir(strict=True)
+    except OSError:
+        return None  # the optional dotenv layer can be unavailable
+    return directory / ".env" if directory is not None else None
+
+
+def _managed_env_assignments(path: Path | None) -> tuple[list[tuple[str, str | None]], dict[str, str]]:
+    """Return live assignments or previously installed values on a read error."""
+    from hermes_cli.managed_scope import applied_managed_env, retain_managed_env_claims
+
+    try:
+        assignments = _dotenv_assignments(path) if path is not None else []
+    except FileNotFoundError:
+        assignments = []
+    except OSError:
+        return [], applied_managed_env(path)
+    retain_managed_env_claims(path, _claimed_env_names(dict(assignments).items()))
+    return assignments, {}
+
+
+def _claimed_env_names(assignments) -> frozenset[str]:
+    return frozenset(name for name, value in assignments if value is not None and not is_launch_only_env_key(name))
+
+
+def managed_env_claims() -> frozenset[str]:
+    """Assignments protected from lower-precedence writes, even if a reload cannot read the file."""
+    assignments, remembered = _managed_env_assignments(_managed_env_path())
+    return _claimed_env_names(dict(assignments).items()) | frozenset(remembered)
+
+
+def _bootstrap_env(
+    home: Path | None = None, project_env: Path | None = None, *, managed_path: Path | None,
+) -> tuple[dict[str, str], list[tuple[str, str | None]]]:
     """The process env as ``load_hermes_dotenv`` leaves it for the names its dotenv layers define:
     the home's ``.env`` (override), ``.op.env`` (fills gaps, only without a process
     ``OP_SERVICE_ACCOUNT_TOKEN``), the caller's *project_env* (fills gaps when the home has a
@@ -585,21 +656,22 @@ def _bootstrap_env(home: Path | None = None, project_env: Path | None = None) ->
     loader's parser. Read-only: nothing is published and no file is rewritten (sanitizing imports
     hermes_cli.config, whose import-time config read must not run before the backend is decided)."""
     home = Path(home) if home is not None else _process_hermes_home()
-    env = dict(os.environ)
+    managed, remembered = _managed_env_assignments(managed_path)
+    with _DOTENV_LOCK:
+        process_env = dict(os.environ)
+        baseline = _dotenv_lookup_env(None)
+    env = process_env.copy()
+    for name in _claimed_env_names(dict(managed).items()):
+        if name in baseline:
+            env[name] = baseline[name]
+        else:
+            env.pop(name, None)
     user_env = home / ".env"
     layers: list[tuple[Path, bool]] = [(user_env, True)]
     if not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
         layers.append((home / ".op.env", False))
     if project_env is not None:
         layers.append((Path(project_env), not user_env.exists()))
-    try:
-        from hermes_cli import managed_scope
-
-        managed_dir = managed_scope.get_managed_dir()
-    except Exception:  # health: allow BLE001 -- managed scope never blocks startup, as in _apply_managed_env
-        managed_dir = None
-    if managed_dir is not None:
-        layers.append((managed_dir / ".env", True))
     for path, override in layers:
         try:
             assignments = _dotenv_assignments(path)
@@ -609,7 +681,10 @@ def _bootstrap_env(home: Path | None = None, project_env: Path | None = None) ->
         for name, value in resolved.items():
             if value is not None and (override or name not in env):
                 env[name] = value
-    return env
+    env.update({name: value for name, value in _resolve_dotenv_assignments(managed, env, override=True).items()
+                if value is not None})
+    env.update(remembered)
+    return env, managed
 
 
 def selected_config_backend_name(home: Path | None = None) -> str:
@@ -618,7 +693,8 @@ def selected_config_backend_name(home: Path | None = None) -> str:
     config-file migration in remote mode, D12)."""
     from hermes_cli.config_backend import BACKEND_ENV
 
-    return (_bootstrap_env(home).get(BACKEND_ENV) or "").strip().lower() or "file"
+    env, _ = _bootstrap_env(home, managed_path=_managed_env_path())
+    return (env.get(BACKEND_ENV) or "").strip().lower() or "file"
 
 
 def apply_config_bootstrap_env(backend_names, home: Path | None = None, project_env: Path | None = None) -> None:
@@ -636,13 +712,20 @@ def apply_config_bootstrap_env(backend_names, home: Path | None = None, project_
     # its bootstrap supplied the process env explicitly, so nothing is published from the files.
     if worker_config_snapshot() is not None:
         return
-    env = _bootstrap_env(home, project_env)
+    managed_path = _managed_env_path()
+    env, managed = _bootstrap_env(home, project_env, managed_path=managed_path)
     # The selector itself always, so a file deployment is not read as another kind meanwhile.
     names = {BACKEND_ENV} | set(backend_names((env.get(BACKEND_ENV) or "").strip().lower() or "file"))
-    for name in names:
-        value = env.get(name)
-        if value is not None and os.environ.get(name) != value:
-            os.environ[name] = value
+    with _DOTENV_LOCK:
+        for name in names & env.keys():
+            os.environ[name] = env[name]
+        managed_names = _claimed_env_names(dict(managed).items()) & names
+        if managed_path is not None and managed_names:
+            from hermes_cli.managed_scope import applied_managed_env, remember_applied_managed_env
+
+            values = applied_managed_env(managed_path) | {name: env[name] for name in managed_names}
+            remember_applied_managed_env(managed_path, [(k, v) for k, v in managed if k in values], values)
+            _MANAGED_DOTENV_KEYS.update(managed_names)
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:
@@ -726,14 +809,18 @@ def dotenv_unreadable(path: Path) -> bool:
         return False
 
 
-def _load_user_dotenv(path: Path, *, load_pass: int, override: bool = True) -> bool:
+def _load_user_dotenv(
+    path: Path, *, load_pass: int, managed_claims: frozenset[str], shadowed: dict[str, str],
+    override: bool = True,
+) -> bool:
     """Load a profile env file (``.env``, or ``.op.env`` with ``override=False``); False when it exists
     but cannot be read and managed scope pins ``terminal.backend``. A sandbox launcher withholds the
     file, passes the keys it allows in as environment and pins the backend. Without that pin the
     ``PermissionError`` propagates: the file may be the only place the backend is set, and skipping it
     would run terminal commands on the host."""
     try:
-        _load_dotenv_with_fallback(path, override=override, load_pass=load_pass)
+        _load_dotenv_with_fallback(path, override=override, load_pass=load_pass,
+                                  managed_claims=managed_claims, shadowed=shadowed)
     except PermissionError:
         from hermes_cli import managed_scope
 
@@ -797,6 +884,10 @@ def load_hermes_dotenv(
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
     load_pass = next(_DOTENV_PASSES)  # one pass: later layers below see the earlier layers' output
+    # Policy readers run concurrently. A later managed overlay cannot undo a
+    # decision made while a lower layer temporarily owned a managed slot.
+    managed_claims = managed_env_claims()
+    shadowed: dict[str, str] = {}
 
     # Before anything below imports hermes_cli.config (the .env sanitizer does), whose import-time
     # config read selects and boots the backend: publish the deployment and plane credential from
@@ -810,19 +901,20 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists() and _load_user_dotenv(user_env, load_pass=load_pass):
+    dotenv_pass = dict(load_pass=load_pass, managed_claims=managed_claims, shadowed=shadowed)
+    if user_env.exists() and _load_user_dotenv(user_env, **dotenv_pass):
         loaded.append(user_env)
-        _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
+        _clear_known_keys_missing_from_dotenv(user_env, managed_claims)
 
     # .op.env AFTER .env so .env wins, but the bootstrap OP_SERVICE_ACCOUNT_TOKEN reaches
     # apply_onepassword_secrets() even in cron with no shell state; gitignored so the token never enters
     # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_user_dotenv(op_env, load_pass=load_pass, override=False)
+        _load_user_dotenv(op_env, override=False, **dotenv_pass)
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not user_env.exists(), load_pass=load_pass)
+        _load_dotenv_with_fallback(project_env_path, override=not user_env.exists(), **dotenv_pass)
         loaded.append(project_env_path)
 
     # The override=True loads above wrote the raw .env line (``__BITWARDEN_MANAGED__`` placeholder, stale
@@ -831,7 +923,7 @@ def load_hermes_dotenv(
     # source is authoritative for; managed scope, applied last with override=True, still wins on purpose.
     if _SECRET_SOURCE_RESTORE_BY_HOME:
         for name, value in _SECRET_SOURCE_RESTORE_BY_HOME.get(hermes_home_key(home_path), {}).items():
-            if os.environ.get(name) != value:
+            if name not in managed_claims and os.environ.get(name) != value:
                 os.environ[name] = value
 
     # The config backend is selected here — after the .env files, before the first config.yaml read
@@ -862,8 +954,8 @@ def load_hermes_dotenv(
     # updater process or the self-lock preflight will recreate the marker and exit 2 again. Dotenv and
     # managed env still load in both cases; only external source resolution is unnecessary for the updater.
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
-        _apply_external_secret_sources(home_path)
-    _apply_managed_env(load_pass=load_pass)
+        _apply_external_secret_sources(home_path, managed_claims=managed_claims)
+    _apply_managed_env(load_pass=load_pass, shadowed=shadowed)
 
     # config.yaml owns terminal.*, but the override=True loads above let a stale TERMINAL_ENV=docker in
     # ~/.hermes/.env win on every reload and flip the backend mid-session in long-lived processes.
@@ -893,22 +985,19 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
         pass
 
 
-def _apply_managed_env(*, load_pass: int | None = None) -> None:
+def _apply_managed_env(*, load_pass: int | None = None, shadowed: dict[str, str] | None = None) -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell. Does NOT stop the agent
     from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup."""
+    managed_env = _managed_env_path()
+    if managed_env is None:
+        return
     try:
-        from hermes_cli import managed_scope
-
-        managed_dir = managed_scope.get_managed_dir()
-    except Exception:
+        _sanitize_env_file_if_needed(managed_env)
+        _load_dotenv_with_fallback(managed_env, override=True, load_pass=load_pass, managed=True, shadowed=shadowed)
+    except FileNotFoundError:
         return
-    if managed_dir is None:
-        return
-    managed_env = managed_dir / ".env"
-    if not managed_env.exists():
-        return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True, load_pass=load_pass, managed=True)
+    except OSError as exc:
+        logger.warning("Could not load managed dotenv %s: %s", managed_env, exc)
 
 
 def _revoke_secret_source_writes(home_path: Path, *, keep) -> None:
@@ -1032,17 +1121,23 @@ def _refuse_protected_env_from_sources(report, backend=None, environ_before=None
         f"from a secret source; remove the mapping. {outcome}")
 
 
-def _publish_staged_env(staged: dict, environ_before: dict) -> None:
+def _publish_staged_env(staged: dict, environ_before: dict, managed_claims: frozenset[str]) -> None:
     """Copy into ``os.environ`` exactly the names the sources set in *staged* (value differs from
     *environ_before*). Sources only ever set names, so nothing is removed; a name nobody's source
-    touched is left alone even if another thread changed it meanwhile."""
+    touched is left alone even if another thread changed it meanwhile. Leave
+    managed values out of the changes recorded for later source restores."""
+    for name in managed_claims & staged.keys():
+        if name in environ_before:
+            staged[name] = environ_before[name]
+        else:
+            del staged[name]
     for name, value in staged.items():
         if environ_before.get(name) != value:
             os.environ[name] = value
             _release_bridge_claim(name)
 
 
-def _apply_external_secret_sources(home_path: Path) -> None:
+def _apply_external_secret_sources(home_path: Path, *, managed_claims: frozenset[str] = frozenset()) -> None:
     """Pull secrets from every enabled external source into env — AFTER dotenv (sources need .env bootstrap
     tokens), BEFORE Hermes reads credentials; failures never block startup. Precedence/conflicts/provenance
     live in ``registry.apply_all``; this wrapper owns the once-per-home guard, the post-apply ASCII sweep,
@@ -1111,7 +1206,7 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         _publish_live_source_values(home_key, home_path, {})
         return
     _refuse_protected_env_from_sources(report, backend_before, environ_before, env=staged)
-    _publish_staged_env(staged, environ_before)
+    _publish_staged_env(staged, environ_before, managed_claims)
 
     # A real fetch attempt happened (success OR error): mark the home so the 3-5 import-time calls per
     # startup don't re-fetch / re-print (error retries are opt-in via reset_secret_source_cache()).
