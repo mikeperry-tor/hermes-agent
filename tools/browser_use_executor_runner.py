@@ -51,7 +51,9 @@ def _printed_screenshot(stdout, workspace, started):
 
 
 def main(shot_source):
-    # Called through env -i, before importing the harness (which reads workspace .env).
+    # The launcher provides a clean environment via env -i. Keep later harness
+    # changes in this process from leaking into action children.
+    launch_env = dict(os.environ)
     for key in ('BH_HOME', 'BH_RUNTIME_DIR', 'BH_TMP_DIR', 'BH_AGENT_WORKSPACE', 'BH_DOWNLOAD_DIR'):
         Path(os.environ[key]).mkdir(mode=0o700, parents=True, exist_ok=True)
     from browser_harness import admin
@@ -83,7 +85,7 @@ def main(shot_source):
                 command = [sys.executable, '-c', _CHILD]
                 proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, start_new_session=True,  # detached-spawn: ok — awaited; EOF/timeout kills this exact POSIX group
-                                        cwd=workspace, env={**os.environ, 'BH_AGENT_WORKSPACE': workspace})
+                                        cwd=workspace, env={**launch_env, 'BH_AGENT_WORKSPACE': workspace})
                 deadline = time.monotonic() + request['timeout']
                 incoming = json.dumps({**request, 'shot': shot_source})
                 while True:
