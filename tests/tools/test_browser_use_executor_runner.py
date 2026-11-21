@@ -18,7 +18,8 @@ def runner(tmp_path):
     package.mkdir()
     (package / '__init__.py').write_text('')
     (package / 'admin.py').write_text(
-        'def ensure_daemon(): pass\n'
+        'def ensure_daemon():\n'
+        ' import os; os.environ["HERMES_RUNNER_FIXTURE_MUTATION"] = "harness-only"\n'
         'def restart_daemon():\n'
         ' import os,pathlib; pathlib.Path(os.environ["BH_HOME"],"cleaned").touch()\n')
     (package / 'helpers.py').write_text(
@@ -28,6 +29,7 @@ def runner(tmp_path):
         'def main():\n'
         ' import sys; exec(compile(sys.stdin.read(),"<stdin>","exec"),globals())\n')
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tmp_path), str(Path.cwd())]))
+    env.pop('HERMES_RUNNER_FIXTURE_MUTATION', None)
     for key in ('BH_HOME', 'BH_RUNTIME_DIR', 'BH_TMP_DIR', 'BH_AGENT_WORKSPACE', 'BH_DOWNLOAD_DIR'):
         env[key] = str(tmp_path / key)
     proc = subprocess.Popen([sys.executable, '-u', '-c',
@@ -97,11 +99,12 @@ def test_runner_keeps_model_main_namespace_and_reports_model_tracebacks(runner):
     assert result['target_id'] == 'fixture-tab'
 
 
-def test_runner_uses_the_requested_task_workspace_on_one_transport(runner):
+def test_runner_uses_the_requested_task_workspace_and_launch_environment(runner):
     proc, results, root = runner
     code = ('import os\n'
             'from pathlib import Path\n'
             'assert Path.cwd() == Path(os.environ["BH_AGENT_WORKSPACE"])\n'
+            'assert "HERMES_RUNNER_FIXTURE_MUTATION" not in os.environ\n'
             'marker = Path("scratch")\n'
             'print(marker.read_text() if marker.exists() else "empty")\n'
             'marker.write_text(Path.cwd().name)\n')
