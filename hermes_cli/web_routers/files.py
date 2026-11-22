@@ -451,6 +451,7 @@ def _fs_backend(profile: Optional[str] = None):
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
+        "ssh_config": "TERMINAL_SSH_CONFIG",
     }.items():
         if not terminal.get(key) and profile_env.get(env_name):
             terminal[key] = profile_env[env_name]
