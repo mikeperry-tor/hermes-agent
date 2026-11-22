@@ -4,12 +4,13 @@ defs plus the budgeted, byte-stable catalog listing embedded in the bridge."""
 from __future__ import annotations
 
 import functools
+import json
 import math
 import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import snowballstemmer
 
@@ -21,6 +22,21 @@ TOOL_CALL_NAME = "tool_call"
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 # Chars-per-token rule of thumb; 4.0 slightly underestimates (fewer false activations).
 CHARS_PER_TOKEN = 4.0
+
+
+def deferred_call_note(names: Iterable[str]) -> str:
+    """Explain how a restricted fork can call its permitted deferred tools without catalog access."""
+    from tools.registry import registry
+
+    def _parameters(name: str) -> str:
+        schema = registry.get_schema(name) or {}
+        fn = schema.get("function") if schema.get("type") == "function" else schema
+        params = fn.get("parameters") if isinstance(fn, dict) else None
+        return json.dumps(params if isinstance(params, dict) else {}, ensure_ascii=False,
+                          separators=(",", ":"), sort_keys=True)
+
+    return (f"\n\nCall {', '.join(sorted(names))} through {TOOL_CALL_NAME} with name=<tool> and arguments "
+            "matching its parameters: " + "; ".join(f"{n} {_parameters(n)}" for n in sorted(names)) + ".")
 
 
 @dataclass
