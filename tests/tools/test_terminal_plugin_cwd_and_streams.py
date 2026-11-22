@@ -182,7 +182,7 @@ def test_missing_desktop_stack_hint_names_no_config_key_for_a_plugin_backend(mon
     monkeypatch.setattr(placement, "_plugin_host_isolated", lambda: False)
     monkeypatch.setattr(placement, "terminal_environment", lambda *, create=True: _SpaceEnv())
     monkeypatch.setattr(sandbox_host, "missing_binaries", lambda env: ["Xvnc"])
-    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile: {})
+    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile, *, strict: {})
     blocker = runtime.status().blocker
     assert "terminal.spacebox_image" not in blocker
     assert "spacebox plugin" in blocker and "placement: gateway" in blocker

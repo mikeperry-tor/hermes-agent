@@ -59,12 +59,8 @@ export function portalTone(
     return 'unsupported'
   }
 
-  if (!status.installed) {
-    return 'missing'
-  }
-
   if (!status.running) {
-    return 'off'
+    return !status.installed && !status.blocker ? 'missing' : 'off'
   }
 
   if (lease?.holder === 'human') {
@@ -172,7 +168,7 @@ export function ScreenPortal({ bot }: { bot: RosterRow }) {
     live: t.screen.portalWatching,
     human: t.screen.portalYouControl,
     other: t.screen.portalOtherControls,
-    off: t.screen.portalStopped,
+    off: status?.blocker ?? t.screen.portalStopped,
     missing: t.screen.portalNotInstalled,
     unsupported: t.screen.portalUnsupported,
     unavailable: isManagedBackend(bot) ? t.screen.portalUnavailableManaged : t.screen.portalUnavailable,
