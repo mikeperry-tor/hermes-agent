@@ -639,6 +639,8 @@ browser:
   # executable_path: ""
   # user_data_dir: ""
   # chromium_args: ["--lang=de"]
+  # Require Chromium's OS sandbox and refuse --no-sandbox bypass flags.
+  # require_sandbox: false
 
   # With a cloud provider (Browserbase, Browser Use, ...), LAN/localhost URLs
   # open in a local Chromium sidecar on this host instead. The sidecar ignores
