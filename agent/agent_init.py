@@ -1016,16 +1016,9 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     agent.disabled_toolsets = disabled_toolsets  # so the tool_search bridge and delegate children drop them too
     agent._tool_snapshot_selection = tool_selection_key(enabled_toolsets, disabled_toolsets)  # tools[] freeze gate
     agent.tools = agent_tool_surface(agent, model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets, quiet_mode=agent.quiet_mode) or [])
+        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+        quiet_mode=agent.quiet_mode, managed_policy=agent._tool_snapshot_selection[2]) or [])
     agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools} if agent.tools else set()
-    # Kanban guidance is session-static for the dispatcher-owned worker only. Profiles may
-    # expose kanban_show interactively, and children/cron runs inherit the env var, without
-    # owning a task.
-    from agent.delegation_context import owned_kanban_task
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if owned_kanban_task() and "kanban_show" in agent.valid_tool_names else ""
-    )
     if agent.quiet_mode:
         return
     if agent.tools:
@@ -1035,7 +1028,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         if disabled_toolsets:
             print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         import model_tools
-        requirements = model_tools.check_toolset_requirements()
+        requirements = model_tools.check_toolset_requirements(managed_policy=agent._tool_snapshot_selection[2])
         missing_reqs = [name for name, available in requirements.items() if not available]
         if missing_reqs:
             agent._safe_print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}", diagnostic=True)
@@ -1952,10 +1945,7 @@ def _inject_context_engine_tools(agent):
     # Context engine tool schemas (lcm_*), deduped against existing names (plugins may
     # register the same schemas; duplicates 400 provider-side) and gated on enabled_toolsets
     # so `platform_toolsets: telegram: []` can't leak them.
-    # Skip names that are already present — the model_tools.get_tool_definitions() quiet_mode cache returned a
-    # shared list pre-#17335, so a stray mutation here would poison subsequent agent inits in the same
-    # Gateway process and trip provider-side 'duplicate tool name' errors. Even with the cache fix, dedup is
-    # the right defense against plugin paths that may register the same schemas via ctx.register_tool().
+    # Dedupe plugin/cache schemas and preserve deployment denials on this appended surface.
     # Mirrors the memory tools dedup above. Respect the platform's enabled_toolsets configuration (#5544):
     # context engine tools follow the same gating pattern as memory provider tools — without the gate,
     # `platform_toolsets: telegram: []` would still leak lcm_* tools into the tool surface and incur the
@@ -1970,19 +1960,20 @@ def _inject_context_engine_tools(agent):
             t.get("function", {}).get("name") for t in agent.tools if isinstance(t, dict)
         }
         from agent.memory_manager_tools import normalize_tool_schema
+        from toolsets import session_tool_discovery_filter
+        permitted = session_tool_discovery_filter(agent)
         for _raw_schema in agent.context_compressor.get_tool_schemas():
             _schema = normalize_tool_schema(_raw_schema)
             if _schema is None:
                 # A nameless tool makes strict providers 400 and disables the whole toolset.
                 _ra().logger.warning(
-                    # Skip it. See #47707.
                     "Context engine returned a tool schema with no resolvable "
                     "name; skipping to avoid poisoning the request (%r)",
                     _raw_schema,
                 )
                 continue
             _tname = _schema["name"]
-            if _tname in _existing_tool_names:
+            if _tname in _existing_tool_names or not permitted(_tname):
                 continue  # already registered via plugin/cache path
             agent.tools.append({"type": "function", "function": _schema})
             for _names in (agent.valid_tool_names, agent._context_engine_tool_names, _existing_tool_names):

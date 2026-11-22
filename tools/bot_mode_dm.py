@@ -148,7 +148,15 @@ def ensure_message_agent_tool(agent: Any) -> bool:
     try:
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
+        from toolsets import session_tool_discovery_filter
         tools = getattr(agent, "tools", None)
+        valid = getattr(agent, "valid_tool_names", None)
+        if not session_tool_discovery_filter(agent)(MESSAGE_AGENT_TOOL_NAME):
+            if tools:
+                tools[:] = [t for t in tools if t.get("function", {}).get("name") != MESSAGE_AGENT_TOOL_NAME]
+            if isinstance(valid, set):
+                valid.discard(MESSAGE_AGENT_TOOL_NAME)
+            return False
         present = bool(tools) and any(
             isinstance(t, dict) and t.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
             for t in tools
@@ -162,7 +170,6 @@ def ensure_message_agent_tool(agent: Any) -> bool:
         # Success means BOTH halves hold: a tool-surface rebuild (compaction, MCP refresh)
         # can keep the schema while valid_tool_names is republished without it, and an
         # advertised-but-nondispatchable tool sends the model hunting for shellouts (#96105).
-        valid = getattr(agent, "valid_tool_names", None)
         if isinstance(valid, set):
             valid.add(MESSAGE_AGENT_TOOL_NAME)
         return True

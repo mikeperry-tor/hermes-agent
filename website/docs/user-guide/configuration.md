@@ -3503,6 +3503,15 @@ tools:
   counts against the current policy. A registered MCP server stays selected
   when all of its tools are temporarily disabled so a later policy change can
   expose them on the same connection.
+- **Prompt caching & live updates:** Changes follow the managed-file cache.
+  When the policy is unchanged, resumed sessions keep their cached system prompt
+  prefix untouched. When an administrator changes `tools.disabled`, resumed and
+  live sessions (including same-model reviews and `/btw` forks) rebuild affected
+  tool definitions and generated prompt guidance while keeping conversation
+  history. Bot Chat can still reply to incoming messages when outbound messaging
+  is disabled, Kanban workers receive guidance matching their permitted tools,
+  and plugin forks that require captured prompt/tool state return a refusal if
+  their captured policy is stale.
 - **Failure & diagnostics:** An absent managed file or `{}` disables nothing; a
   blank, null, malformed, or unreadable managed file fails tool discovery and
   dispatch closed without leaking file contents, while `hermes doctor` remains
