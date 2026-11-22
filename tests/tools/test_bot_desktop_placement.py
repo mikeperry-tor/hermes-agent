@@ -264,8 +264,12 @@ def test_marker_survives_a_gateway_restart_while_the_container_lives(monkeypatch
 
     def _inspect(argv, **kw):
         inspected.append(argv)
-        return subprocess.CompletedProcess(argv, 0 if alive["running"] else 1, "true\n" if alive["running"] else "", "")
+        return subprocess.CompletedProcess(argv, 0 if alive["running"] else 1, "true\n" if alive["running"] else "", "" if alive["running"] else "no such container")
     monkeypatch.setattr(sandbox_host.subprocess, "run", _inspect)
+    from tools.environments import docker
+    from tools import terminal_tool
+    monkeypatch.setattr(docker, "find_docker", lambda: "docker")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
     sandbox_host._ALIVE_CACHE.clear()
 
     created: list[bool] = []
@@ -281,7 +285,7 @@ def test_marker_survives_a_gateway_restart_while_the_container_lives(monkeypatch
     stopped: list[object] = []
     monkeypatch.setattr(sandbox_host, "stop", lambda env, profile: stopped.append(env) or True)
     assert runtime.stop() is True
-    assert isinstance(stopped[0], _FakeDocker) and created[-1] is True  # re-attached, then stopped THAT sandbox
+    assert stopped[0].container == "c0ffee" and True not in created  # No native planner allocation.
     assert not sandbox_host._marker().exists()
 
     # The container was removed out from under us: the marker is stale and goes; nothing is (re)built.
@@ -290,7 +294,26 @@ def test_marker_survives_a_gateway_restart_while_the_container_lives(monkeypatch
     sandbox_host._ALIVE_CACHE.clear()
     created.clear()
     assert runtime.sandbox_screen_running() is False
-    assert not sandbox_host._marker().exists() and True not in created
+    assert sandbox_host._marker().exists() and True not in created
+    assert not runtime.stop()
+    assert not sandbox_host._marker().exists()
+
+
+def test_warm_docker_view_keeps_the_original_id_when_the_terminal_recovers(monkeypatch, isolated_home):
+    from tools.bot_desktop import sandbox_host
+
+    owner = {"backend": "DockerEnvironment", "container": "c0ffee", "docker": "docker"}
+    monkeypatch.setattr(sandbox_host, "_read_marker", lambda: owner)
+    from tools.environments import docker
+    monkeypatch.setattr(placement, "_terminal_backend", lambda: "docker")
+    monkeypatch.setattr(docker, "find_docker", lambda: "docker")
+    monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda marker: True)
+    existing = _FakeDocker()
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: existing)
+
+    relay_target = runtime._owned_sandbox_env()
+    existing._container_id = "deadbeef"
+    assert streams.exec_prefix(relay_target)[-1] == "c0ffee"
 
 
 def test_stop_and_status_follow_the_recorded_owner_not_the_current_setting(monkeypatch, isolated_home):
@@ -298,9 +321,13 @@ def test_stop_and_status_follow_the_recorded_owner_not_the_current_setting(monke
     screen and stop() takes it down there, instead of both looking at the (empty) host."""
     from tools.bot_desktop import sandbox_host
 
+    from tools import terminal_tool
     _placed(monkeypatch, "gateway", "docker")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "docker"})
     sandbox_host._marker().parent.mkdir(parents=True)
     sandbox_host._marker().write_text('{"display": ":20", "backend": "DockerEnvironment", "container": "c0ffee", "docker": "docker"}')
+    from tools.environments import docker
+    monkeypatch.setattr(docker, "find_docker", lambda: "docker")
     monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda marker: True)
     monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
     monkeypatch.setattr(sandbox_host, "missing_binaries", lambda env: [])
@@ -377,3 +404,93 @@ def test_sandbox_cdp_endpoint_is_rewritten_to_the_forwarded_local_port(monkeypat
     assert info["cdp_url"] == "ws://127.0.0.1:45004/devtools/browser/abc"
     assert info["features"] == {"local": True, "sandbox": True}
     assert host_launches == []
+
+
+
+def test_live_browser_reuses_the_recorded_docker_forward(monkeypatch, isolated_home):
+    from tools import browser_session_sandbox as browser
+    from tools.bot_desktop import sandbox_host
+    from tools.environments import docker
+
+    _placed(monkeypatch, "terminal", "docker")
+    marker = {"backend": "DockerEnvironment", "container": "c0ffee", "docker": "docker"}
+    monkeypatch.setattr(sandbox_host, "_read_marker", lambda: marker)
+    monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda marker: True)
+    monkeypatch.setattr(docker, "find_docker", lambda: "docker")
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
+    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile, **kw: {"DISPLAY": ":20"})
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda env: "pn")
+    monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda env: "/home/pn/browser")
+    monkeypatch.setattr(browser, "_live_devtools", lambda env, user, udd: (9222, "/devtools/browser/live"))
+    monkeypatch.setattr(browser, "_confirmed", {})
+    forwards = {}
+
+    def forwarded(env, port, **kw):
+        return forwards.setdefault(id(env), 45000 + len(forwards))
+
+    monkeypatch.setattr(streams, "forward_port", forwarded)
+    owner, _ = browser._sandbox()
+    session = {"cdp_url": f"ws://127.0.0.1:{forwarded(owner, 9222)}/devtools/browser/live"}
+    assert browser.sandbox_browser_alive(session)
+    browser._confirmed.clear()  # Force real revalidation after the previous confirmation expires.
+    assert browser.sandbox_browser_alive(session)
+    assert list(forwards) == [id(owner)]
+
+
+
+def test_lost_chromium_reply_recovers_owned_browser_and_releases_it(monkeypatch):
+    from tools import browser_session_lifecycle, browser_session_sandbox as browser
+    from tools.bot_desktop import sandbox_host
+
+    env = _FakeDocker()
+    profile = "/executor/browser"
+    pending = Mock(side_effect=[browser.GONE, browser.GONE, (9222, "/devtools/browser/live")])
+    aborted_command = Mock(side_effect=subprocess.TimeoutExpired("chromium", 1))
+    exact_launch = Mock(side_effect=[
+        subprocess.CompletedProcess([], browser._NOT_OURS_RC, b"", b""),
+        subprocess.CompletedProcess([], 0, b"407 8193\n", b""),
+    ])
+    retire = Mock(return_value=True)
+    monkeypatch.setattr(browser, "_sandbox", lambda: (env, {"DISPLAY": ":20"}))
+    monkeypatch.setattr(browser, "_launched", {})
+    monkeypatch.setattr(browser, "_retiring", {})
+    monkeypatch.setattr(browser, "_live_devtools", pending)
+    monkeypatch.setattr(browser, "_start_chromium", aborted_command)
+    monkeypatch.setattr(browser, "_signal_launch", retire)
+    monkeypatch.setattr(browser, "_owns_discovered_browser", lambda launch, user: True)
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda env: None)
+    monkeypatch.setattr(sandbox_host, "chromium_executable", lambda env: "/chromium")
+    monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda env: profile)
+    monkeypatch.setattr(streams, "run_in", exact_launch)
+    monkeypatch.setattr(streams, "forward_port", lambda *args, **kwargs: 45000)
+    _local_sessions(monkeypatch)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        browser.create_sandbox_session("lost-reply")
+    owner = aborted_command.call_args.kwargs["owner"]
+    restored = browser.create_sandbox_session("restored")
+    aborted_command.assert_called_once()
+    assert exact_launch.call_args.args[1][-2:] == [browser._LAUNCH_OWNER_ARG + owner, "pending"]
+    assert restored["sandbox_launch"] == (407, "8193")
+    browser_session_lifecycle.release_session_backend("restored", restored)
+    assert retire.call_args.args[0] == (env, 407, "8193", profile)
+
+
+
+@pytest.mark.platforms("linux")
+def test_pending_chromium_is_discovered_behind_a_stale_singleton(tmp_path, monkeypatch):
+    import sys
+    from tools import browser_session_sandbox as browser
+
+    profile = str(tmp_path)
+    (tmp_path / "SingletonLock").symlink_to("obsolete-executor-99999999")
+    owner = browser._LAUNCH_OWNER_ARG + browser._launch_owner_stamp(profile)
+    monkeypatch.setattr(streams, "run_in", lambda env, argv, **kw: subprocess.run(argv, capture_output=True, check=False))
+    with subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)", owner,
+                           f"--user-data-dir={profile}"], start_new_session=True) as pending:
+        try:
+            recovered = browser._recover_launch(object(), None, profile)
+            assert recovered is not None and recovered.pid == pending.pid
+            assert browser._recover_launch(object(), None, profile, "/devtools/browser/other") is None
+        finally:
+            pending.terminate()

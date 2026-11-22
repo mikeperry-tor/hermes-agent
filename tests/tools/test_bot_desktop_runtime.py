@@ -412,9 +412,12 @@ def _startable_host(monkeypatch, tmp_path, *, running=False):
     from tools.bot_desktop import resources
     monkeypatch.setattr(runtime, "is_supported_host", lambda: True)
     monkeypatch.setattr(runtime, "missing_binaries", list)
-    monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path / "bd")
+    state_dir = tmp_path / "bd"
+    if running:
+        state_dir.mkdir()
+        (state_dir / "env").write_text("DISPLAY=:7\n", encoding="utf-8")
+    monkeypatch.setattr(runtime, "state_dir", lambda: state_dir)
     monkeypatch.setattr(runtime, "_launcher_pid", lambda: 4242 if running else None)
-    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":7"} if running else {})
     monkeypatch.setattr(runtime, "_reap_orphaned_server", lambda sd: None)
     monkeypatch.setattr(resources, "min_free_mb", lambda: 1536)
     monkeypatch.setattr(resources, "memory_info",

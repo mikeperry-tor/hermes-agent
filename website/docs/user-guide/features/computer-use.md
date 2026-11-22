@@ -54,7 +54,9 @@ into driving the host. Details: [Bot Screen → Where the screen
 runs](./bot-screen.md#where-the-screen-runs).
 
 An open driver refuses actions if desktop placement changes or its screen is
-replaced, and gateway CLI retries recheck placement before each attempt. Before
+replaced, and gateway CLI retries recheck placement before each attempt. With
+managed `bot_desktop.executor_only: true`, discovery checks desktop dependencies
+and `cua-driver` inside the terminal executor without starting the screen. Before
 dispatching an action, the driver verifies ownership, permission mode, and the
 human-control lease — releasing the lease before driver I/O so a human can take
 over mid-call, and cancelling timed-out requests before they reach the driver.
