@@ -856,9 +856,9 @@ test('Windows SSH reuse requires the requested remote profile to match the lock'
 })
 
 test('Windows integrated terminal uses encoded PowerShell and preserves cwd as literal data', () => {
-  const command = buildWindowsInteractiveCommand("C:\\Users\\O'Brien\\repo")
+  const command = buildWindowsInteractiveCommand("C:\\Users\\O'Brien\\repo ")
   const script = Buffer.from(command.split(' ').pop()!, 'base64').toString('utf16le')
-  assert.match(script, /Set-Location -LiteralPath 'C:\\Users\\O''Brien\\repo'/)
+  assert.match(script, /Set-Location -LiteralPath 'C:\\Users\\O''Brien\\repo '/)
   assert.match(script, /powershell\.exe -NoLogo/)
 })
 
