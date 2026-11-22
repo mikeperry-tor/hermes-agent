@@ -227,6 +227,15 @@ def _configured_chromium_args() -> list[str]:
     return chromium_args()
 
 
+def chromium_sandbox_required() -> bool:
+    """Opt-in sandbox requirement; default retains native host/container launch behavior."""
+    from tools.browser_session_cloud import browser_section
+    value = browser_section().get("require_sandbox", False)
+    if not isinstance(value, bool):
+        raise ValueError("browser.require_sandbox must be a boolean")
+    return value
+
+
 def build_chromium_argv(executable: str, user_data_dir: str, *, packaged: bool, headed: bool,
                         sandbox_bypass: bool, extra_args=()) -> list[str]:
     """The launch argv (pure in its inputs + host sandbox facts + ``browser.chromium_args``).
@@ -242,7 +251,13 @@ def build_chromium_argv(executable: str, user_data_dir: str, *, packaged: bool, 
     if not headed:
         argv.append("--headless=new")
     configured = _configured_chromium_args()
-    if sandbox_bypass and needs_chromium_sandbox_bypass():
+    required = chromium_sandbox_required()
+    if required and any(str(arg).split("=", 1)[0] in {"--no-sandbox", "--disable-setuid-sandbox",
+                                                      "--disable-seccomp-filter-sandbox", "--disable-namespace-sandbox",
+                                                      "--disable-gpu-sandbox"}
+                        for arg in (*extra_args, *configured)):
+        raise ValueError("browser.require_sandbox conflicts with Chromium sandbox bypass flags")
+    if sandbox_bypass and not required and needs_chromium_sandbox_bypass():
         argv += [flag for flag in CHROMIUM_SANDBOX_BYPASS_ARGS if flag not in configured]
     argv += [str(a) for a in extra_args]
     argv += configured

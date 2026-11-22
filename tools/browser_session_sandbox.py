@@ -219,13 +219,14 @@ def _owns_discovered_browser(launch: _Launch, user) -> bool:
 def _start_chromium(env, user, exe: str, udd: str, child_env: dict, *, owner: str | None = None) -> tuple[int, Optional[str]]:
     """Launch detached in the sandbox; returns its sandbox pid and start time (None when unreadable)."""
     from tools.bot_desktop.browser import SHARED_PROFILE_ARGS
-    from tools.browser_launcher import CHROMIUM_SANDBOX_BYPASS_ARGS, build_chromium_argv
+    from tools.browser_launcher import CHROMIUM_SANDBOX_BYPASS_ARGS, build_chromium_argv, chromium_sandbox_required
     from tools.environments import streams
-    # Container: no user namespaces for Chromium's own sandbox, so the bypass flags always apply (this
-    # host's facts say nothing about the sandbox); the shared-profile flags match the dock's icon.
+    # Preserve container defaults unless the operator requires Chromium sandboxing.
+    # Host sandbox detection cannot tell us whether remote user namespaces work.
     # Deduplicate only our injected standalone flags so two-token flags in user
     # browser.chromium_args (e.g. ["--flag-a", "0", "--flag-b", "0"]) keep their values.
-    extra = list(dict.fromkeys((*SHARED_PROFILE_ARGS, *CHROMIUM_SANDBOX_BYPASS_ARGS)))
+    extra = list(dict.fromkeys((*SHARED_PROFILE_ARGS,
+                                *(() if chromium_sandbox_required() else CHROMIUM_SANDBOX_BYPASS_ARGS))))
     argv = build_chromium_argv(exe, udd, packaged=False, headed=True, sandbox_bypass=False, extra_args=extra)
     if owner is not None:
         owner_arg = _LAUNCH_OWNER_ARG + owner

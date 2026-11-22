@@ -148,6 +148,7 @@ that device.
 browser:
   executable_path: ""     # Chromium binary to launch instead of the packaged one
   user_data_dir: ""       # persistent profile directory; "" = fresh profile per session
+  require_sandbox: false   # true: never launch Chromium with sandbox bypass flags
   chromium_args: []       # extra Chromium command-line flags, e.g. ["--lang=de-DE"]
   headed: false           # true = visible window
   command_timeout: 30     # Chromium launch timeout floor (seconds)
@@ -663,6 +664,26 @@ wait_for_load()
 print(js("[...document.querySelectorAll('article h2 a')].map(a => a.textContent.replace(/\\s+/g, ' ').trim())"))
 """)
 ```
+
+## Requiring Chromium sandboxing
+
+Set `browser.require_sandbox: true` to require Chromium's OS sandbox for both
+agent launches and the Bot Desktop Browser icon (including inside terminal
+sandboxes). When `false` (the default), existing host and container launch
+behavior is unchanged.
+
+When `browser.require_sandbox: true`:
+
+- Hermes omits `--no-sandbox` bypass flags, never retries with sandbox bypass,
+  and rejects conflicting flags in `browser.chromium_args`.
+- The environment must run Chromium as an unprivileged user with working OS
+  sandbox support (for example user namespaces in Linux containers); fix launch
+  failures in that environment before retrying.
+- Only new browser launches are affected — stop any already-running browser or
+  desktop before enabling it.
+- External CDP endpoints and cloud browser providers are outside this setting's
+  control.
+
 
 ## Limitations
 
