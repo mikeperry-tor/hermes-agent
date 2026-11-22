@@ -837,6 +837,34 @@ Use the opt-in only when you intentionally want the container to work on live ho
 
 A host path in `terminal.cwd` (for example `C:\Users\me\project` on Windows, or a desktop/TUI session's workspace) never becomes the container's working directory: when it is the directory mounted at `/workspace`, file tools and terminal commands use `/workspace`; otherwise the container keeps its own working directory. If a file tool still cannot enter its working directory, the error names the invalid `terminal.cwd` for the active backend rather than the shell's raw `cd:` line.
 
+### Explicit OpenSSH Client Configuration
+
+Set `terminal.ssh_config` to an absolute path to an OpenSSH client config file
+on the Hermes host to enforce pre-provisioned host keys instead of
+trust-on-first-use:
+
+```yaml
+terminal:
+  backend: ssh
+  ssh_config: /etc/hermes/executor-ssh.conf
+```
+
+When `terminal.ssh_config` is set:
+
+- Model shell commands, SCP/workspace sync, browser/display streams, and
+  `hermes doctor` all pass `-F <path>` with `StrictHostKeyChecking=yes` and
+  `BatchMode=yes`.
+- Connections and `hermes doctor` use `terminal.ssh_port` (default `22`).
+- ControlMaster sockets are keyed on the config path and identity so verified
+  sessions never reuse default multiplexed connections. Close existing SSH
+  sessions before rotating keys or editing the config file.
+- When unset, the SSH backend keeps its default trust-on-first-use behavior.
+
+In managed deployments, place `terminal.ssh_config` in managed `config.yaml`,
+keep the SSH config and its `UserKnownHostsFile` administrator-owned, and mirror
+`TERMINAL_SSH_CONFIG` (plus the matching `TERMINAL_SSH_*` values) in managed
+`.env` if profile `.env` files must not override process-wide launch settings.
+
 ### Persistent Shell
 
 Every terminal command on the **local** and **SSH** backends runs in a fresh `bash` process. Hermes captures your login shell's environment once (PATH, exports from your profile, functions, aliases) and starts the first command from that snapshot. With the setting off, every command starts from it. With the setting on, each command saves its exported variables for the next one, and that saved copy holds exported variables only, so profile functions and aliases are gone after the first command.

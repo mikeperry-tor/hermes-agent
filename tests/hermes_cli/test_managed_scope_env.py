@@ -70,6 +70,47 @@ def test_running_process_retains_managed_backend_during_full_load(env_homes, mon
     assert observed and set(observed) == {"file"}
 
 
+def test_deployed_ssh_values_win_through_launch_and_profile_reload(env_homes, monkeypatch):
+    from hermes_cli.config import _validate_config_key
+    from hermes_cli.env_loader import load_hermes_dotenv
+    from tools.terminal_tool import _get_env_config
+
+    assert _validate_config_key("terminal.ssh_config") == (True, None)
+
+    home, managed = env_homes
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    flags = {
+        "TERMINAL_ENV": "ssh", "TERMINAL_SSH_HOST": "executor.example", "TERMINAL_SSH_USER": "runner",
+        "TERMINAL_SSH_PORT": "2222", "TERMINAL_SSH_KEY": "/run/pinned/key",
+        "TERMINAL_SSH_CONFIG": "/run/pinned/ssh_config",
+    }
+    for key in flags:
+        monkeypatch.delenv(key, raising=False)
+    (managed / ".env").write_text("".join(f"{key}={value}\n" for key, value in flags.items()))
+    (managed / "config.yaml").write_text("""terminal:
+  backend: ssh
+  ssh_host: executor.example
+  ssh_user: runner
+  ssh_port: 2222
+  ssh_key: /run/pinned/key
+  ssh_config: /run/pinned/ssh_config
+""")
+    # The user YAML omits ssh_config. Its explicit ssh_host must still come
+    # from managed YAML, while the managed dotenv also pins the launch bridge.
+    (home / "config.yaml").write_text("terminal:\n  ssh_host: profile.example\n")
+    for suffix in ("first", "reload"):
+        (home / ".env").write_text(
+            f"TERMINAL_ENV=local\nTERMINAL_SSH_HOST={suffix}.example\n"
+            f"TERMINAL_SSH_CONFIG=/tmp/{suffix}\n",
+        )
+        load_hermes_dotenv(hermes_home=str(home), load_external_secrets=False)
+        assert {key: os.environ.get(key) for key in flags} == flags
+        effective = _get_env_config()
+        assert effective["env_type"] == "ssh"
+        assert effective["ssh_host"] == "executor.example"
+        assert effective["ssh_config"] == "/run/pinned/ssh_config"
+
+
 def test_no_managed_env_is_noop(env_homes, monkeypatch):
     from hermes_cli.env_loader import load_hermes_dotenv
 
