@@ -459,9 +459,38 @@ def session_disabled_toolsets(
 
 
 def tool_selection_key(enabled: Optional[list[str]], disabled: Optional[list[str]]) -> tuple:
-    """The toolset selection a tools[] snapshot was built from, order-free. Recorded next to the registry
-    generation: the tools[] freeze (``tools.mcp_tool_agent``) holds new tools back only while neither moved."""
-    return frozenset(enabled) if enabled is not None else None, frozenset(disabled or ())
+    """The toolsets and managed ceiling a tools[] snapshot was built from, order-free."""
+    from tools.hosted_tool_policy import managed_disabled_tools
+
+    return (frozenset(enabled) if enabled is not None else None,
+            frozenset(disabled or ()), managed_disabled_tools())
+
+
+def managed_tool_selection_changed(agent: Any) -> bool:
+    from tools.hosted_tool_policy import managed_disabled_tools
+
+    selection = getattr(agent, "_tool_snapshot_selection", None)
+    return isinstance(selection, tuple) and selection[2] != managed_disabled_tools()
+
+
+def managed_tool_snapshot_key(agent: Any) -> list[str] | str:
+    """JSON representation of the managed policy that produced this tool snapshot."""
+    selection = getattr(agent, "_tool_snapshot_selection", None)
+    disabled = selection[2] if isinstance(selection, tuple) else frozenset()
+    return managed_tool_policy_key(disabled)
+
+
+def managed_tool_policy_key(disabled: Optional[frozenset[str]]) -> list[str] | str:
+    # A null model_config patch removes its key, so invalid policy needs a value.
+    return "unavailable" if disabled is None else sorted(disabled)
+
+
+def session_tool_discovery_filter(agent: Any):
+    """Use the published selection when appending schemas to an existing agent snapshot."""
+    from tools.hosted_tool_policy import discovery_tool_filter
+
+    selection = getattr(agent, "_tool_snapshot_selection", None)
+    return discovery_tool_filter(selection[2]) if isinstance(selection, tuple) else discovery_tool_filter()
 
 
 def agent_tool_drops(agent: Any) -> frozenset:

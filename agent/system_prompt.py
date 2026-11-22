@@ -21,7 +21,7 @@ from agent.delegation_context import owned_kanban_task
 from agent.prompt_cache_scope import conversation_id
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
-    HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
@@ -299,16 +299,13 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
             getattr(agent, "_user_profile_enabled", True),
             skill_manage_available="skill_manage" in names,
         )
-    # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
-    # fallback paths must also limit task protocol guidance to dispatcher workers.
-    _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
-    if _kanban_guidance is None and "kanban_show" in names and owned_kanban_task():
-        _kanban_guidance = KANBAN_GUIDANCE
+    # Resolve from the current schema even after a policy or model refresh.
+    kanban_guidance = _pb.build_kanban_guidance(names) if owned_kanban_task() else None
     tool_guidance = [
         memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
-        _kanban_guidance,
+        kanban_guidance,
     ]
     return " ".join(g for g in tool_guidance if g) or None
 
@@ -362,7 +359,8 @@ def _bot_mode_parts(agent: Any) -> list[str]:
     date pinned in a months-long session is misinformation."""
     parts: list[str] = []
     try:
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, epoch_line, get_bot_mode_protocol_section
+        from tools.bot_mode_probe import BOT_CHAT_TITLE, INBOUND_BOT_PROTOCOL, epoch_line, get_bot_mode_protocol_section
+        from toolsets import session_tool_discovery_filter
         _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
         if not _title:
             from agent.agent_init_session import agent_interface
@@ -374,7 +372,10 @@ def _bot_mode_parts(agent: Any) -> list[str]:
                               else _sdb.get_session_title(_sid)) or "").strip()
         _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
         if _bot_section:
-            parts.append(_bot_section)
+            # This prompt can be built before the turn injects the DM schema.
+            # Use the same producing policy as that later injection.
+            can_send = session_tool_discovery_filter(agent)("message_agent")
+            parts.append(_bot_section if can_send else INBOUND_BOT_PROTOCOL)
             # Capability epoch lets the restore path rebuild ONCE per
             # user-initiated capability change in an eternal session.
             parts.append(epoch_line(_agent_home(agent)))

@@ -1011,7 +1011,7 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
     assert [message["content"] for message in conversation(db, session_id)] == [
         message["content"] for message in compressed
     ]
-    assert json.loads(session_row(db, session_id)["model_config"]) == {"keep": "value"}
+    assert json.loads(session_row(db, session_id)["model_config"]) == {"keep": "value", "prompt_managed_disabled_tools": []}
 
 def test_rotation_child_starts_without_durable_prune_runway(tmp_path: Path) -> None:
     db = storage_handle(tmp_path)

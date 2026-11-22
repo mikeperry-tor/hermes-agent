@@ -317,8 +317,10 @@ class AIAgent(
     def _session_row_model_config(self) -> Any:
         """``model_config`` for the lazily created session row: the init config plus a live /yolo toggled
         before the first turn (``hermes --resume`` restores it)."""
+        from agent.prompt_refresh import with_prompt_policy
         from tools.approval_yolo import with_session_yolo
-        return with_session_yolo(self._session_init_model_config, self.session_id)
+        config = with_session_yolo(self._session_init_model_config, self.session_id)
+        return with_prompt_policy(config, getattr(self, "_prompt_managed_tools", None) or None)
 
     def _ensure_db_session(self) -> None:
         """Create the session DB row on first use; a transient failure leaves it to retry next turn."""
@@ -332,11 +334,7 @@ class AIAgent(
                 from hermes_cli.profiles import get_active_profile_name
                 profile_for_session = get_active_profile_name()
             except Exception:
-                # Persist the profile name EXPLICITLY, including "default". NULL used to stand in for the
-                # default profile, but the #94724 legacy-owner backfill already stamps literal "default"
-                # onto old rows, and profile-keyed consumers (sidebar scope matching,
-                # @session:<profile>/<id> deep links) treat NULL as unowned — rows minted NULL after the
-                # one-shot backfill vanished from the sidebar (#99222).
+                # Profile-keyed consumers treat NULL as unowned, including on the default profile.
                 profile_for_session = None
             # Carry the gateway routing identity: when the gateway SessionStore degraded to JSONL (corrupt
             # state.db) this lazy create is the ONLY durable write, and an identity-less row is unrecoverable.

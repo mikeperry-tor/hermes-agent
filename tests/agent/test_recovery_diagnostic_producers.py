@@ -72,7 +72,10 @@ def test_missing_requirements_keeps_tool_inventory(policy, monkeypatch, capsys):
     agent.ephemeral_system_prompt = None
     monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
     monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: [{"function": {"name": "offline_tool"}}])
-    monkeypatch.setattr(model_tools, "check_toolset_requirements", lambda: {"fixture_dependency": False})
+    monkeypatch.setattr(
+        model_tools, "check_toolset_requirements",
+        lambda *, managed_policy: {"fixture_dependency": False},
+    )
     _load_tools(agent, None, None)
     output = capsys.readouterr().out + "\n".join(agent.printed)
     assert ("Some tools may not work due to missing requirements" in output) is not policy
