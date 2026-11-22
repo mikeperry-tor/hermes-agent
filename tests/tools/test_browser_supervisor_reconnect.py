@@ -21,7 +21,7 @@ def unregister():
     task_ids: list[str] = []
     yield task_ids
     for task_id in task_ids:
-        bs.SUPERVISOR_REGISTRY._pop(task_id)
+        bs.SUPERVISOR_REGISTRY.detach(task_id)
 
 
 def test_post_attach_reconnects_stop_at_budget_and_unregister(monkeypatch, unregister, caplog):

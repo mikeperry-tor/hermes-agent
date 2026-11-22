@@ -8,24 +8,35 @@ stream; Chromium's DevTools accepts any loopback ``Host`` header, port included.
 
 from __future__ import annotations
 
+from hashlib import sha256
 import logging
+import os
 import shlex
 import subprocess
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
 _LAUNCH_TIMEOUT_S = 60.0
-# Sandbox Chromium this process launched, per shared key: ``(sandbox env, pid, start time, user-data-dir)``.
-# Every session in that container attaches to it, whichever profile it serves, so it is stopped only when the
-# LAST of them tears down (release_session_backend's in-use check on the shared ``launcher_key``); the env is
-# kept so a teardown outside the owner's scope hits the right sandbox. The start time (``/proc/<pid>/stat``
-# field 22, read inside the sandbox at launch) and the ``--user-data-dir`` token are the identity a stop
-# re-checks there before signalling: a crashed Chromium's pid may name another job by then.
-_launched: dict[str, tuple[Any, int, Optional[str], str]] = {}
+class _Launch(NamedTuple):
+    """The sandbox, process identity, profile and endpoint this launcher owns."""
+    env: Any
+    pid: int
+    start: Optional[str]
+    profile: str
+    devtools_path: Optional[str] = None
+
+
+_launched: dict[str, _Launch] = {}
+# Lock hierarchy: _key_lock(key) -> _cleanup_lock or _launched_lock. Never acquire
+# _key_lock(key) while holding _cleanup_lock or _launched_lock.
 _launched_lock = threading.Lock()
+# TERM can return while DevTools still listens. Keep the exact retiring endpoint
+# until a probe sees it gone or a replacement endpoint appears. Key lock owns this map.
+_retiring: dict[str, tuple[Optional[str], tuple[int, str, str]]] = {}
 # Per shared key: held across "is a browser running?" + launch + claim, and across the stop, so two sessions
 # first using one container never both see no browser and both launch.
 _key_locks: dict[str, threading.Lock] = {}
@@ -43,36 +54,52 @@ GONE = "gone"
 
 def _sandbox():
     from tools.bot_desktop import runtime as _bd_runtime
-    env = _bd_runtime._sandbox_env(create=True)
-    if env is None:
-        raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run the browser")
-    published = _bd_runtime.published_env()
-    if not published.get("DISPLAY"):
-        # The sandbox died under a live screen: fail here rather than run headless in a dead sandbox or,
-        # worse, fall back to the host.
-        raise RuntimeError("the screen inside the terminal backend's sandbox is gone; start it again")
-    return env, published
+    return _bd_runtime.tool_sandbox()
 
 
-def _read_devtools(env, user, udd: str) -> Optional[tuple[int, str]]:
-    from tools.environments import streams
-    proc = streams.run_in(env, ["cat", f"{udd}/DevToolsActivePort"], user=user, timeout=10)
-    lines = proc.stdout.decode("utf-8", "replace").splitlines() if proc.returncode == 0 else []
-    if len(lines) >= 2 and lines[0].strip().isdigit() and lines[1].startswith("/devtools/browser/"):
-        return int(lines[0].strip()), lines[1].strip()
-    return None
+_DEVTOOLS_PROBE = f"""
+import json
+import sys
+from http.client import HTTPConnection, HTTPException
+from urllib.parse import urlsplit
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as active:
+        lines = active.read(4096).splitlines()
+except FileNotFoundError:
+    raise SystemExit({_GONE_RC})
+if len(lines) < 2 or not lines[0].strip().isdigit():
+    raise SystemExit({_GONE_RC})
+port, path = int(lines[0]), lines[1].strip()
+if not 0 < port < 65536 or not path.startswith("/devtools/browser/"):
+    raise SystemExit({_GONE_RC})
+conn = HTTPConnection("127.0.0.1", port, timeout=2)
+try:
+    conn.request("GET", "/json/version")
+    response = conn.getresponse()
+    version = json.loads(response.read(65536)) if response.status == 200 else {{}}
+    endpoint = urlsplit(str(version.get("webSocketDebuggerUrl", ""))) if isinstance(version, dict) else None
+except TimeoutError:
+    raise SystemExit(1)
+except (OSError, HTTPException, ValueError):
+    raise SystemExit({_GONE_RC})
+finally:
+    conn.close()
+if endpoint is None or endpoint.scheme not in ("ws", "wss") or endpoint.path != path:
+    raise SystemExit({_GONE_RC})
+print(port)
+print(path)
+"""
 
 
 def _live_devtools(env, user, udd: str):
-    """One exec: ``(port, path)`` of the Chromium on ``udd`` while its DevTools port answers; ``GONE`` when the
-    sandbox says it is not running (a crashed Chromium leaves a stale ``DevToolsActivePort`` behind); None
-    when the exec itself failed or timed out, which proves nothing either way."""
+    """One exec verifies Chromium's reported browser path matches the profile's endpoint file.
+    GONE means the recorded endpoint is missing or invalid. None leaves transport errors and
+    response timeouts inconclusive."""
     from tools.environments import streams
-    active = shlex.quote(f"{udd}/DevToolsActivePort")
-    script = (f'[ -s {active} ] || exit {_GONE_RC}; p=$(head -n1 {active}); '
-              f'( exec 3<>"/dev/tcp/127.0.0.1/$p" ) 2>/dev/null || exit {_GONE_RC}; cat {active}')
     try:
-        proc = streams.run_in(env, ["bash", "-c", script], user=user, timeout=10)
+        proc = streams.run_in(env, ["python3", "-c", _DEVTOOLS_PROBE, f"{udd}/DevToolsActivePort"],
+                              user=user, timeout=10)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         logger.debug("sandbox browser liveness probe failed: %s", exc)
         return None
@@ -93,33 +120,122 @@ def _shared_key(env, udd: str) -> str:
     return f"sandbox:{id(env):x}:{udd}"
 
 
-# ``$p``'s start time (clock ticks since boot): field 22 of /proc/<pid>/stat, counted after the ``(comm)``
-# field, which may itself hold spaces and parentheses. Empty when the sandbox has no /proc.
+# After stripping ``pid (comm) `` from /proc/<pid>/stat, positional field $4 is
+# ``sid`` (proving setsid session leadership) and ${20} is ``starttime`` (clock
+# ticks since boot, /proc/<pid>/stat field 22). Empty when /proc is absent.
 _START_TIME_OF_P = 's=$(cat /proc/"$p"/stat 2>/dev/null) && s=${s##*")"} && set -- $s && printf %s "${20}"'
 # Exit code of the stop script when the pid is gone or no longer the browser this process launched.
 _NOT_OURS_RC = 4
-# Signal "$1" only while it is still the launched browser: same start time ("$2"), and its argv carries the
-# launch's exact --user-data-dir token ("$3"). Check and signal in one exec inside the sandbox.
+_LAUNCH_OWNER_NONCE = uuid4().hex
+_LAUNCH_OWNER_ARG = "--hermes-chromium-launch-owner="
+
+
+def _launch_owner_stamp(profile: str) -> str:
+    # Forked workers share imported modules but have distinct launch authority.
+    return sha256(f"{_LAUNCH_OWNER_NONCE}:{os.getpid()}:{profile}".encode()).hexdigest()
+
+
+_RECOVER_LAUNCH = r"""
+profile=$1
+owner=$2
+match_launch() {
+    p=$1
+    case "$p" in ""|*[!0-9]*) return 1 ;; esac
+    [ "$p" != "$$" ] || return 1
+    # Chromium may rewrite argv as one string. Normalize the NUL separators
+    # and check the opaque marker as a complete flag in either representation.
+    args=$(tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null) || return 1
+    case " $args " in *" $owner "*) ;; *) return 1 ;; esac
+    case " $args " in *" --user-data-dir=$profile "*) ;; *) return 1 ;; esac
+    stat=$(cat "/proc/$p/stat" 2>/dev/null) || return 1
+    # After stripping "pid (comm) ", $4 is sid (setsid leader) and ${20} is starttime.
+    set -- ${stat##*) }
+    [ "$4" = "$p" ] && [ -n "${20}" ] || return 1
+    printf '%s %s\n' "$p" "${20}"
+}
+singleton="$1/SingletonLock"
+if lock=$(readlink -- "$singleton") && launch=$(match_launch "${lock##*-}") &&
+        [ "$(readlink -- "$singleton")" = "$lock" ]; then
+    printf '%s\n' "$launch"
+    exit 0
+fi
+# Before the endpoint is ready, a detached process can already be running
+# with this stamp while SingletonLock is absent or still names a dead process.
+if [ "$3" = pending ]; then
+    for file in /proc/[0-9]*/cmdline; do
+        [ -r "$file" ] || continue
+        pid=${file#/proc/}
+        if match_launch "${pid%/cmdline}"; then exit 0; fi
+    done
+fi
+exit 4
+"""
+
+
+def _recover_launch(env, user, profile: str, devtools_path: str | None = None) -> _Launch | None:
+    """Recover this process's launch if a transport lost the detached PID reply."""
+    from tools.environments import streams
+
+    owner = _LAUNCH_OWNER_ARG + _launch_owner_stamp(profile)
+    state = "pending" if devtools_path is None else "ready"
+    proc = streams.run_in(env, ["bash", "-c", _RECOVER_LAUNCH, "--", profile, owner, state],
+                          user=user, timeout=10)
+    if proc.returncode == _NOT_OURS_RC:
+        return None
+    words = proc.stdout.decode("utf-8", "replace").strip().split()
+    if proc.returncode != 0 or len(words) != 2 or not all(word.isdigit() for word in words):
+        raise RuntimeError("Could not verify the sandbox Chromium launcher; retry the browser command")
+    return _Launch(env, int(words[0]), words[1], profile, devtools_path)
+
+
+_MATCH_START = f'p=$1; t=$({_START_TIME_OF_P}); [ -n "$t" ] && [ "$t" = "$2" ] || exit {_NOT_OURS_RC}; '
+_MATCH_SINGLETON = (
+    f'lock=$(readlink -- "$3/SingletonLock") || exit {_NOT_OURS_RC}; '
+    f'case "$lock" in *-"$p") ;; *) exit {_NOT_OURS_RC};; esac; '
+)
+# Before profile initialization the original argv can prove the profile. A
+# running Chromium can flatten its title; the native lock still names its PID.
 _STOP_SCRIPT = (
-    f'p=$1; t=$({_START_TIME_OF_P}); [ -n "$t" ] && [ "$t" = "$2" ] || exit {_NOT_OURS_RC}; '
-    f'ok=; while IFS= read -r -d "" a; do [ "$a" = "$3" ] && ok=1; done < /proc/"$p"/cmdline; '
-    f'[ -n "$ok" ] || exit {_NOT_OURS_RC}; kill -TERM "$p"'
+    _MATCH_START
+    + 'ok=; while IFS= read -r -d "" a; do [ "$a" = "--user-data-dir=$3" ] && ok=1; done < /proc/"$p"/cmdline; '
+    + 'if [ -z "$ok" ]; then ' + _MATCH_SINGLETON + 'fi; kill -TERM "$p"'
 )
 
 
-def _start_chromium(env, user, exe: str, udd: str, child_env: dict) -> tuple[int, Optional[str]]:
+def _owns_discovered_browser(launch: _Launch, user) -> bool:
+    """Check the recorded process and Chromium's native profile singleton."""
+    from tools.environments import streams
+
+    if launch.start is None:
+        return False
+    command = ["bash", "-c", _MATCH_START + _MATCH_SINGLETON, "hermes-sandbox-browser-owner",
+               str(launch.pid), launch.start, launch.profile]
+    proc = streams.run_in(launch.env, command, user=user, timeout=10)
+    if proc.returncode not in (0, _NOT_OURS_RC):
+        raise RuntimeError("The sandbox did not confirm Chromium's profile owner; retry the browser command")
+    return proc.returncode == 0
+
+
+def _start_chromium(env, user, exe: str, udd: str, child_env: dict, *, owner: str | None = None) -> tuple[int, Optional[str]]:
     """Launch detached in the sandbox; returns its sandbox pid and start time (None when unreadable)."""
     from tools.bot_desktop.browser import SHARED_PROFILE_ARGS
     from tools.browser_launcher import CHROMIUM_SANDBOX_BYPASS_ARGS, build_chromium_argv
     from tools.environments import streams
     # Container: no user namespaces for Chromium's own sandbox, so the bypass flags always apply (this
     # host's facts say nothing about the sandbox); the shared-profile flags match the dock's icon.
-    argv = build_chromium_argv(exe, udd, packaged=False, headed=True, sandbox_bypass=False,
-                               extra_args=(*SHARED_PROFILE_ARGS, *CHROMIUM_SANDBOX_BYPASS_ARGS))
-    argv = list(dict.fromkeys(argv))
+    # Deduplicate only our injected standalone flags so two-token flags in user
+    # browser.chromium_args (e.g. ["--flag-a", "0", "--flag-b", "0"]) keep their values.
+    extra = list(dict.fromkeys((*SHARED_PROFILE_ARGS, *CHROMIUM_SANDBOX_BYPASS_ARGS)))
+    argv = build_chromium_argv(exe, udd, packaged=False, headed=True, sandbox_bypass=False, extra_args=extra)
+    if owner is not None:
+        owner_arg = _LAUNCH_OWNER_ARG + owner
+        if owner_arg not in argv:
+            argv.insert(-1, owner_arg)
     # setsid execs in place (a background child of a non-interactive shell leads no process group), so $! is
     # Chromium itself, and its start time is fixed from the fork on.
-    script = (f"mkdir -p {shlex.quote(udd)} && rm -f {shlex.quote(udd)}/DevToolsActivePort && "
+    # Do not delete DevToolsActivePort before launch: Chromium owns that file, and
+    # the dock Browser icon may publish a live endpoint while this launch starts.
+    script = (f"mkdir -p {shlex.quote(udd)} && "
               f"(setsid {shlex.join(argv)} >/dev/null 2>&1 & p=$!; echo \"$p $({_START_TIME_OF_P})\")")
     proc = streams.run_in(env, ["bash", "-c", script], child_env=child_env, user=user, timeout=30)
     last = proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1:] if proc.returncode == 0 else []
@@ -133,11 +249,8 @@ def _start_chromium(env, user, exe: str, udd: str, child_env: dict) -> tuple[int
 def _wait_for_port(env, user, udd: str) -> tuple[int, str]:
     deadline = time.monotonic() + _LAUNCH_TIMEOUT_S
     while time.monotonic() < deadline:
-        try:
-            found = _read_devtools(env, user, udd)
-        except subprocess.TimeoutExpired:
-            found = None  # one slow exec is another not-ready answer; the deadline decides readiness
-        if found:
+        found = _live_devtools(env, user, udd)
+        if found is not None and found is not GONE:
             return found
         time.sleep(0.5)
     raise RuntimeError("Chromium in the sandbox did not expose a DevTools endpoint in time")
@@ -157,16 +270,16 @@ def _spawn_owned(env, user, udd: str, key: str, published: dict) -> int:
     if not exe:
         raise RuntimeError("the sandbox image has no Chromium to run the browser")
     child_env = {**published, "TMPDIR": streams.sandbox_temp_dir(env)}
-    pid, start = _start_chromium(env, user, exe, udd, child_env)
+    pid, start = _start_chromium(env, user, exe, udd, child_env, owner=_launch_owner_stamp(udd))
     with _launched_lock:
-        _launched[key] = (env, pid, start, udd)
+        _launched[key] = _Launch(env, pid, start, udd)
     return pid
 
 
 def create_sandbox_session(cache_key: str) -> dict[str, Any]:
     """Session on the sandbox Chromium (attach to the running one, else launch it)."""
     from tools.bot_desktop import sandbox_host
-    from tools.browser_session import _session_record
+    from tools.browser_session import _cleanup_lock, _pending_sandbox_attachments, _session_record
     from tools.environments import streams
     env, published = _sandbox()
     user = sandbox_host._user_for(env)
@@ -174,25 +287,78 @@ def create_sandbox_session(cache_key: str) -> dict[str, Any]:
     key = _shared_key(env, udd)
     with _key_lock(key):
         found = _live_devtools(env, user, udd)
+        _check_retiring_endpoint(key, found, env)
         if found is None:
-            # Launching blind would wipe a live browser's DevToolsActivePort and lose to its singleton.
+            # An unresponsive probe proves nothing about the active desktop.
             raise RuntimeError("the terminal backend's sandbox did not answer whether its browser is running; "
                                "try again")
+        with _launched_lock:
+            existing = _launched.get(key)
+        if (existing is not None and (found is GONE or existing.devtools_path != found[1])
+                and _owns_discovered_browser(existing, user)):
+            # A missing or changed endpoint cannot transfer ownership of a live profile.
+            raise RuntimeError("The existing Chromium still owns the profile but its DevTools endpoint "
+                               "is unavailable; close its browser session and retry")
         spawned: Optional[int] = None
         try:
             if found is GONE:
-                spawned = _spawn_owned(env, user, udd, key, published)
+                recovered = _recover_launch(env, user, udd)
+                if recovered is None:
+                    spawned = _spawn_owned(env, user, udd, key, published)
+                else:
+                    # Its profile is already locked. A second launch would be
+                    # forwarded to that process and could open another window.
+                    spawned = recovered.pid
+                    with _launched_lock:
+                        _launched[key] = recovered
                 found = _wait_for_port(env, user, udd)
+                with _launched_lock:
+                    candidate = _launched[key]
+                if _owns_discovered_browser(candidate, user):
+                    with _launched_lock:
+                        _launched[key] = candidate._replace(devtools_path=found[1])
+            with _launched_lock:
+                launched = _launched.get(key)
+            if launched is None or launched.devtools_path != found[1]:
+                # A transport may have lost the PID reply after detaching.
+                # A dock browser has no stamp from this launcher and stays borrowed.
+                launched = _recover_launch(env, user, udd, found[1])
+                if launched is not None and _live_devtools(env, user, udd) != found:
+                    raise RuntimeError("Chromium changed while recovering its launcher; retry the browser command")
+                with _launched_lock:
+                    if launched is None:
+                        _launched.pop(key, None)
+                    else:
+                        _launched[key] = launched
             local_port = streams.forward_port(env, found[0], user=user)
+            info = _session_record("sb", f"ws://127.0.0.1:{local_port}{found[1]}", {"local": True, "sandbox": True})
+            _confirm(info["cdp_url"], env, found[0])
+            info.update(shared_profile=True, launcher_key=key)
+            if launched is not None:
+                info["sandbox_launch"] = launched[1:3]
+                with _cleanup_lock:
+                    _pending_sandbox_attachments[info["session_name"]] = (key, info["sandbox_launch"])
         except BaseException:
             if spawned is not None:  # a timeout, a failed forward or an interrupt must not leave it running unowned
                 _stop_launched(key)
             raise
-    info = _session_record("sb", f"ws://127.0.0.1:{local_port}{found[1]}", {"local": True, "sandbox": True})
-    _confirm(info["cdp_url"], env, found[0])
-    info.update(shared_profile=True, launcher_key=key)
     logger.info("Created sandbox browser session %s for %s", info["session_name"], cache_key)
     return info
+
+
+def _check_retiring_endpoint(key: str, found, env) -> None:
+    retiring = _retiring.get(key)
+    if retiring is None:
+        return
+    path, launch = retiring
+    endpoint = found[1] if isinstance(found, tuple) else None
+    # The previous stop may have lost its connection. A different endpoint
+    # cannot confirm that the exact retired launch has released the profile.
+    still_owned = _signal_launch((env, *launch))
+    if still_owned or (path is not None and endpoint == path):
+        raise RuntimeError("The previous Chromium is still shutting down; retry the browser command")
+    if found is not None:
+        _retiring.pop(key, None)
 
 
 def _confirm(cdp_url: str, env, port: int) -> None:
@@ -207,7 +373,7 @@ def sandbox_browser_alive(session_info: dict[str, Any]) -> bool:
     a probe that cannot reach the sandbox keeps the session."""
     from tools.bot_desktop import runtime as _bd_runtime, sandbox_host
     from tools.environments import streams
-    env = _bd_runtime._sandbox_env(create=False)
+    env = _bd_runtime._owned_sandbox_env(reattach=False)
     if env is None:
         return False
     cdp_url = session_info.get("cdp_url") or ""
@@ -232,34 +398,55 @@ def sandbox_browser_alive(session_info: dict[str, Any]) -> bool:
 
 
 def stop_sandbox_browser(session_info: dict[str, Any]) -> None:
-    """SIGTERM the sandbox Chromium this process launched on the session's shared key (best effort; the
-    sandbox's lifetime bounds it). The caller guarantees no other live session uses it."""
-    _confirmed.pop(session_info.get("cdp_url") or "", None)
+    """Release this record and stop only its own Chromium when it has no other users."""
+    from tools.browser_session import _active_sessions, _cleanup_lock, _pending_sandbox_attachments
+
     key = session_info.get("launcher_key") or ""
+    launch = session_info.get("sandbox_launch")
     with _key_lock(key):
+        with _cleanup_lock:
+            _pending_sandbox_attachments.pop(session_info.get("session_name"), None)
+            if (key, launch) in _pending_sandbox_attachments.values() or any(
+                info is not session_info and info.get("launcher_key") == key
+                and info.get("sandbox_launch") == launch for info in _active_sessions.values()
+            ):
+                return
+        with _launched_lock:
+            launched = _launched.get(key)
+        if launched is None or launched[1:3] != launch:
+            return
+        _confirmed.pop(session_info.get("cdp_url") or "", None)
         _stop_launched(key)
 
 
 def _stop_launched(key: str) -> None:
     with _launched_lock:
         launched = _launched.pop(key, None)
-    if launched is None:
-        return
+    if launched is not None:
+        if launched.start is not None:
+            _retiring[key] = (launched.devtools_path, (launched.pid, launched.start, launched.profile))
+        _signal_launch(launched[:4])
+
+
+def _signal_launch(launched: tuple[Any, int, Optional[str], str]) -> bool:
+    """Signal the exact launch. False only when it cannot still own this retirement."""
     from tools.bot_desktop import sandbox_host
     from tools.environments import streams
     env, pid, start, udd = launched
     if start is None:
         logger.warning("browser: leaving sandbox Chromium pid %s running: its start time could not be read at "
                        "launch, so the pid cannot be proven to still be that browser", pid)
-        return
-    argv = ["bash", "-c", _STOP_SCRIPT, "hermes-sandbox-browser-stop", str(int(pid)), start, f"--user-data-dir={udd}"]
+        return False
+    argv = ["bash", "-c", _STOP_SCRIPT, "hermes-sandbox-browser-stop", str(int(pid)), start, udd]
     try:
         proc = streams.run_in(env, argv, user=sandbox_host._user_for(env), timeout=15)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         logger.debug("sandbox browser stop for pid %s failed: %s", pid, exc)
-        return
+        return True
     if proc.returncode == _NOT_OURS_RC:
         logger.info("browser: not signalling sandbox pid %s: it is gone or no longer the Chromium launched on %s",
                     pid, udd)
-    elif proc.returncode != 0:
+        return False
+    if proc.returncode != 0:
         logger.debug("sandbox browser stop for pid %s exited %s", pid, proc.returncode)
+    return True

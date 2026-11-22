@@ -62,6 +62,8 @@ def test_live_cloud_session_is_reused(monkeypatch):
 
 
 def test_expired_cloud_session_is_replaced_without_reusing_dead_cdp(monkeypatch):
+    from tools import browser_supervisor
+
     _isolate_browser_state(monkeypatch)
     bs._active_sessions["task-1"] = {
         "session_name": "expired",
@@ -82,13 +84,18 @@ def test_expired_cloud_session_is_replaced_without_reusing_dead_cdp(monkeypatch)
     }
     monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: provider)
     monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-    monkeypatch.setattr("tools.browser_session_cdp.stop_cdp_supervisor", lambda key: events.append(("stop", key)))
+    registry = browser_supervisor._SupervisorRegistry()
+    supervisor = Mock()
+    supervisor.stop.side_effect = lambda: events.append(("stop", "task-1"))
+    registry._by_task["task-1"] = supervisor
+    monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", registry)
 
     session = bs.get_session_info("task-1")
 
     assert session["bb_session_id"] == "browser-session-new"
     assert session["cdp_url"] == "ws://browser-use.example/devtools/browser/new"
     assert bs._active_sessions["task-1"] is session
+    assert registry.get("task-1") is None
     assert "task-1" in bs._session_last_activity
     # The supervisor WebSocket on the dead endpoint closes first, then the provider session, and only
     # then is the replacement created: nothing keeps driving the expired CDP URL.
