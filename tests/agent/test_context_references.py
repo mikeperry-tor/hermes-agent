@@ -818,3 +818,235 @@ async def test_refused_url_reference_explains_the_refusal(tmp_path: Path, monkey
     assert "private or internal network address" in result.warnings[0]
     assert "API key or token" in result.warnings[1]
     assert "no content extracted" not in result.message
+
+
+@pytest.mark.parametrize("setting", [None, True, False])
+@pytest.mark.asyncio
+async def test_url_fetch_selection_keeps_text_and_other_references(tmp_path, monkeypatch, setting):
+    from agent.context_references import preprocess_context_references_async
+    from hermes_cli import config_effective
+    options = {} if setting is None else {"context_references": {"fetch_urls": setting}}
+    monkeypatch.setattr(config_effective, "load_user_config_effective", lambda **_: options)
+    calls = []
+    async def fetch(url):
+        calls.append(url)
+        return "URL-CONTENT"
+    (tmp_path / "note.txt").write_text("FILE-CONTENT")
+    urls = " ".join(f"@url:https://example.com/{n}" for n in range(20 if setting is False else 1))
+    message = urls + " @file:note.txt"
+    result = await preprocess_context_references_async(message, cwd=tmp_path, context_length=100_000, url_fetcher=fetch)
+    assert result.message.startswith(message)
+    assert "FILE-CONTENT" in result.message
+    assert not result.blocked and not result.warnings
+    assert calls == ([] if setting is False else ["https://example.com/0"])
+    assert ("URL-CONTENT" in result.message) is (setting is not False)
+
+
+@pytest.mark.asyncio
+async def test_disabled_url_only_message_is_unchanged(tmp_path, monkeypatch):
+    from agent.context_references import preprocess_context_references_async
+    from hermes_cli import config_effective
+    monkeypatch.setattr(config_effective, "load_user_config_effective", lambda **_: {"context_references": {"fetch_urls": False}})
+    async def forbidden(_url):
+        pytest.fail("disabled URL reached the fetcher")
+    message = "Keep @url:https://example.com unchanged"
+    result = await preprocess_context_references_async(message, cwd=tmp_path, context_length=100_000, url_fetcher=forbidden)
+    assert result.message == message and not result.expanded and not result.warnings
+
+
+@pytest.mark.asyncio
+async def test_config_bypass_url_reference_keeps_native_defaults(tmp_path, monkeypatch):
+    from agent.context_references import preprocess_context_references_async
+    from hermes_cli import config_effective
+    def forbidden(**_):
+        pytest.fail("config-bypass read profile config")
+    monkeypatch.setattr(config_effective, "load_user_config_effective", forbidden)
+    async def fetch(_url): return "NATIVE-CONTENT"
+    result = await preprocess_context_references_async("@url:https://example.com", cwd=tmp_path,
+        context_length=100_000, url_fetcher=fetch, plugins=False)
+    assert "NATIVE-CONTENT" in result.message
+
+
+def test_url_fetch_option_is_selected_profile_scoped(tmp_path):
+    from agent.context_references import preprocess_context_references
+    from agent.runtime_scope import bind_profile_scope
+    from tui_gateway.launch_profile_policy import activate_multi_profile_hosting
+    disabled, enabled, malformed = (tmp_path / name for name in ("disabled", "enabled", "malformed"))
+    for home, value in ((disabled, "false"), (enabled, "true"), (malformed, "'false'")):
+        home.mkdir()
+        (home / "config.yaml").write_text("context_references:\n  fetch_urls: " + value + "\n")
+    activate_multi_profile_hosting()
+    calls = []
+    def fetch(url):
+        calls.append(url)
+        return "PROFILE-CONTENT"
+    for home, expected in ((disabled, False), (enabled, True), (malformed, None), (disabled, False)):
+        with bind_profile_scope(home):
+            result = preprocess_context_references("@url:https://example.com", cwd=tmp_path,
+                context_length=100_000, url_fetcher=fetch)
+        assert result.blocked is (expected is None)
+        assert ("PROFILE-CONTENT" in result.message) is bool(expected)
+    assert calls == ["https://example.com"]
+
+
+@pytest.mark.parametrize("options", [True, 42, "invalid", ["fetch_urls"],
+                                     {"fetch_urls": "false"}, {"fetch_urls": None}])
+def test_malformed_profile_url_options_require_repair_before_fetch(tmp_path, monkeypatch, options):
+    from agent.context_references import preprocess_context_references
+    from hermes_cli import config_effective
+
+    monkeypatch.setattr(config_effective, "load_user_config_effective", lambda **_: {"context_references": options})
+    (tmp_path / "note.txt").write_text("retained file body")
+
+    def fetch(_url):
+        pytest.fail("invalid URL settings reached the fetcher")
+
+    message = "@url:https://example.test @file:note.txt"
+    result = preprocess_context_references(message, cwd=tmp_path, context_length=10000, url_fetcher=fetch)
+    assert result.blocked and result.message == message
+    assert "configuration" in result.warnings[0]
+    local = preprocess_context_references("@file:note.txt", cwd=tmp_path, context_length=10000)
+    assert "retained file body" in local.message and not local.blocked
+
+
+@pytest.mark.asyncio
+async def test_unavailable_configuration_blocks_url_expansion_without_defaults_and_recovers(tmp_path, monkeypatch):
+    from hermes_cli import config_effective
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from agent.context_references import preprocess_context_references_async
+    from unittest.mock import Mock
+    loader = Mock(side_effect=ConfigBackendUnavailable('SYNTHETIC-PRIVATE-CONFIG-DETAILS'))
+    monkeypatch.setattr(config_effective, 'load_user_config_effective', loader)
+    fetched = []
+    async def fetch(url):
+        fetched.append(url)
+        return 'URL BODY'
+    (tmp_path / 'note.txt').write_text('FILE BODY')
+    message = '@url:https://example.test @file:note.txt'
+    result = await preprocess_context_references_async(message, cwd=tmp_path, context_length=10000, url_fetcher=fetch)
+    assert result.blocked and result.message == message and not result.expanded
+    assert fetched == []
+    assert 'configuration' in result.warnings[0] and 'SYNTHETIC-PRIVATE' not in result.warnings[0]
+    loader.reset_mock()
+    file_only = await preprocess_context_references_async('@file:note.txt', cwd=tmp_path, context_length=10000)
+    assert 'FILE BODY' in file_only.message and not file_only.blocked
+    loader.assert_not_called()
+    loader.side_effect = None
+    loader.return_value = {'context_references': {'fetch_urls': False}}
+    result = await preprocess_context_references_async(message, cwd=tmp_path, context_length=10000, url_fetcher=fetch)
+    assert not result.blocked and not result.warnings and fetched == []
+    assert 'FILE BODY' in result.message
+    loader.return_value = {'context_references': {'fetch_urls': True}}
+    result = await preprocess_context_references_async(message, cwd=tmp_path, context_length=10000, url_fetcher=fetch)
+    assert not result.blocked and fetched == ['https://example.test']
+
+
+@pytest.mark.parametrize("contents", ["context_references: [unterminated", "false", "[]", "0", "''"])
+def test_unreadable_selected_profile_does_not_default_to_fetching(tmp_path, contents):
+    from agent.context_references import preprocess_context_references
+    from agent.runtime_scope import bind_profile_scope
+    from hermes_cli import config
+    from tui_gateway.launch_profile_policy import activate_multi_profile_hosting
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    settings = home / "config.yaml"
+    settings.write_text(contents)
+    activate_multi_profile_hosting()
+    message = "@url:https://example.test"
+    with bind_profile_scope(home):
+        # A permissive read may already have cached a normalized mapping.
+        config.read_raw_config_readonly()
+        result = preprocess_context_references(
+            message, cwd=tmp_path, context_length=100_000,
+            url_fetcher=lambda _url: pytest.fail("unreadable profile authorized a fetch"))
+        assert result.blocked and result.message == message
+        settings.write_text("context_references:\n  fetch_urls: true\n")
+        result = preprocess_context_references(
+            message, cwd=tmp_path, context_length=100_000, url_fetcher=lambda _url: "RECOVERED-CONTENT")
+    assert "RECOVERED-CONTENT" in result.message
+
+
+@pytest.mark.parametrize("invalid", ["context_references: [unterminated", "[]", "null",
+                                     "context_references: {fetch_urls: 'false'}"])
+def test_managed_no_fetch_is_authoritative_and_invalid_policy_refuses(tmp_path, monkeypatch, invalid):
+    from agent.context_references import preprocess_context_references
+    from hermes_cli import config_effective
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setattr(config_effective, "load_user_config_effective", lambda **_: {"context_references": {"fetch_urls": True}})
+    settings = managed / "config.yaml"
+    message = "@url:https://example.test @file:note.txt"
+    (tmp_path / "note.txt").write_text("FILE BODY")
+    def preprocess():
+        return preprocess_context_references(message, cwd=tmp_path, context_length=100_000,
+            url_fetcher=lambda _url: pytest.fail("managed policy did not authorize fetching"))
+
+    settings.write_text(invalid)
+    assert preprocess().blocked
+    settings.write_text("context_references:\n  fetch_urls: false\n")
+    result = preprocess()
+    assert not result.blocked and "FILE BODY" in result.message
+
+
+def test_unsearchable_managed_path_cannot_authorize_default_fetch(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from agent.context_references import preprocess_context_references
+    from hermes_cli import config_effective
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setattr(config_effective, "load_user_config_effective", lambda **_: {})
+    stat = Path.stat
+
+    def unsearchable(path, *args, **kwargs):
+        if path in (managed, managed / "config.yaml"):
+            raise PermissionError("SYNTHETIC-PRIVATE-MANAGED-LOCATION")
+        return stat(path, *args, **kwargs)
+
+    fetch = Mock(return_value="FETCHED")
+    url = "@url:https://example.test"
+    with monkeypatch.context() as scoped:
+        is_dir = Path.is_dir
+        scoped.setattr(Path, "is_dir", lambda path: False if path == managed else is_dir(path))
+        scoped.setattr(Path, "stat", unsearchable)
+        result = preprocess_context_references(url, cwd=tmp_path, context_length=10000, url_fetcher=fetch)
+        assert result.blocked and result.message == url
+        fetch.assert_not_called()
+    available = preprocess_context_references(url, cwd=tmp_path, context_length=10000, url_fetcher=fetch)
+    assert "FETCHED" in available.message and not available.blocked
+
+
+def test_url_preference_uses_the_validated_managed_snapshot(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+    from agent.context_references import preprocess_context_references
+
+    path = tmp_path / "config.yaml"
+    path.write_text("tools:\n  disabled: []\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path))
+    native_read = managed_scope.load_managed_config
+    reads = []
+
+    def edited_after_read(*, strict=False):
+        reads.append(strict)
+        config = native_read(strict=strict)
+        if len(reads) == 1:
+            path.write_text("context_references:\n  fetch_urls: false\n")
+        return config
+
+    monkeypatch.setattr(managed_scope, "load_managed_config", edited_after_read)
+    url = "@url:https://example.test"
+    first = preprocess_context_references(url, cwd=tmp_path, context_length=10000, url_fetcher=lambda _: "FETCHED")
+    assert "FETCHED" in first.message and reads == [True]
+    second = preprocess_context_references(url, cwd=tmp_path, context_length=10000,
+                                           url_fetcher=lambda _: pytest.fail("current policy forbids fetch"))
+    assert not second.blocked and second.message == url
+
+
+def test_context_references_fetch_urls_config_key_is_registered():
+    from hermes_cli.config import _validate_config_key
+
+    assert _validate_config_key("context_references.fetch_urls") == (True, None)

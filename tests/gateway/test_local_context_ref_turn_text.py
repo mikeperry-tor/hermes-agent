@@ -229,3 +229,24 @@ async def test_a_bypass_session_expands_built_in_references_only(tmp_path, monke
     finally:
         _context_reference_providers.pop('probe', None)
     assert 'PROJECT-NOTES' in sent[0]['text'] and 'PLUGIN-RAN' not in sent[0]['text']
+
+
+@pytest.mark.asyncio
+async def test_bypass_sessions_obey_managed_no_fetch(tmp_path, monkeypatch):
+    from agent import context_references
+    from gateway.session_managed_worker import ManagedExecutionUnknown
+
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    settings = managed / "config.yaml"
+    settings.write_text("context_references:\n  fetch_urls: false\n")
+    (tmp_path / 'notes.txt').write_text('PROJECT-NOTES', encoding='utf-8')
+    async def forbidden(_url):
+        pytest.fail("bypass fetched a URL disabled by the deployment")
+    monkeypatch.setattr(context_references, '_default_url_fetcher', forbidden)
+    message = '@url:https://example.test @file:notes.txt'
+    run, _authority, sent, _spawned = _managed(tmp_path, monkeypatch, message)
+    with pytest.raises(ManagedExecutionUnknown):
+        await run
+    assert sent[0]['text'].startswith(message) and 'PROJECT-NOTES' in sent[0]['text']
