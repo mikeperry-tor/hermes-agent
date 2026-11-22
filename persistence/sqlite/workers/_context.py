@@ -24,14 +24,19 @@ def worker_context(holder, conn, session_id, payload):
     return {'session': _session_row_dict(row)}
 
 
+def _valid_managed_tools(value):
+    return value == 'unavailable' or isinstance(value, list) and all(isinstance(name, str) and name for name in value)
+
+
 def worker_prompt(holder, conn, session_id, payload):
-    if set(payload) != {'system_prompt'} or not (
+    if set(payload) - {'managed_tools'} != {'system_prompt'} or not (
             payload['system_prompt'] is None or isinstance(payload['system_prompt'], str)):
         raise AuthorityRefusal('invalid_params')
-    conn.execute('UPDATE sessions SET system_prompt_hash=?, system_prompt=NULL WHERE id=?',
-                 (holder._store_system_prompt(conn, payload['system_prompt']), session_id))
-    from ..conversation._store.core import _delete_unreferenced_system_prompts
-    _delete_unreferenced_system_prompts(conn)
+    if 'managed_tools' in payload and not _valid_managed_tools(payload['managed_tools']):
+        raise AuthorityRefusal('invalid_params')
+    from ..conversation._store.sessions import write_system_prompt
+
+    write_system_prompt(holder, conn, session_id, payload['system_prompt'], managed_tools=payload.get('managed_tools'))
     return {'value': None}
 
 
@@ -58,9 +63,12 @@ def worker_tool_names(holder, conn, session_id, payload):
             raise AuthorityRefusal('invalid_params')
         # ``delegation_backend``: the backend the pinned delegate_task was built from (agent/delegation_backends.py).
         backend = pin.get('delegation_backend', '') if isinstance(pin, dict) else ''
-        if isinstance(pin, dict) and (not {'version', 'tools'} <= set(pin) <= {'version', 'tools', 'delegation_backend'}
+        if isinstance(pin, dict) and (not {'version', 'tools'} <= set(pin) <= {
+                'version', 'tools', 'delegation_backend', 'managed_disabled_tools'}
                                       or not isinstance(pin['version'], str) or not isinstance(pin['tools'], list)
                                       or not isinstance(backend, str) or len(backend) > 64):
+            raise AuthorityRefusal('invalid_params')
+        if isinstance(pin, dict) and 'managed_disabled_tools' in pin and not _valid_managed_tools(pin['managed_disabled_tools']):
             raise AuthorityRefusal('invalid_params')
     encoded = None if pin is None else json.dumps(pin)
     if encoded is not None and len(encoded) > 4 * 1024 * 1024:

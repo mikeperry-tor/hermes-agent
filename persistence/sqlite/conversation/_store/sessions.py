@@ -657,15 +657,27 @@ def update_session_meta(
     )
 
 
-def update_system_prompt(holder: StoreHolder, session_id: str, system_prompt: Optional[str]) -> None:
+def update_system_prompt(holder: StoreHolder, session_id: str, system_prompt: Optional[str], *,
+                         managed_tools: list[str] | str | None = None) -> None:
     """Store the full assembled system prompt snapshot."""
     def _do(conn):
-        conn.execute(
-            "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
-            (holder._store_system_prompt(conn, system_prompt), session_id),
-        )
-        _delete_unreferenced_system_prompts(conn)
+        write_system_prompt(holder, conn, session_id, system_prompt, managed_tools=managed_tools)
     holder._execute_write(_do)
+
+
+def write_system_prompt(holder: StoreHolder, conn, session_id: str, system_prompt: Optional[str], *,
+                        managed_tools: list[str] | str | None = None) -> None:
+    """Update the prompt and any producing policy in the caller's write transaction."""
+    if managed_tools is not None:
+        from persistence.conversation.sessions import PROMPT_MANAGED_TOOLS_KEY
+
+        merged = _merge_model_config_json(holder, conn, session_id, {PROMPT_MANAGED_TOOLS_KEY: managed_tools})
+        if merged is _MODEL_CONFIG_ROW_MISSING:
+            return
+        conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (merged, session_id))
+    conn.execute("UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
+                 (holder._store_system_prompt(conn, system_prompt), session_id))
+    _delete_unreferenced_system_prompts(conn)
 
 
 def update_session_tool_names(holder: StoreHolder, session_id: str, pin: Any) -> None:
