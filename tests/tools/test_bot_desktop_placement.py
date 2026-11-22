@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from unittest.mock import Mock
 
 import pytest
 
@@ -353,18 +354,20 @@ def test_forward_port_carries_bytes_both_ways_through_the_exec_stream(monkeypatc
 def test_sandbox_cdp_endpoint_is_rewritten_to_the_forwarded_local_port(monkeypatch):
     """The sandbox Chromium's DevTools port is the sandbox's loopback: the session hands browser_exec the
     forwarded LOCAL port, keeping Chromium's browser id path."""
-    from tools import browser_session
+    from tools import browser_session, browser_session_sandbox
     from tools.bot_desktop import sandbox_host
 
     host_launches = _local_sessions(monkeypatch)
     _placed(monkeypatch, "terminal", "docker")
     monkeypatch.setattr(runtime, "sandbox_screen_running", lambda: True)
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":20"})
-    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
+    monkeypatch.setattr(runtime, "tool_sandbox", lambda: (_FakeDocker(), {"DISPLAY": ":20"}))
     monkeypatch.setattr(sandbox_host, "_user_for", lambda e: "pn")
     monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda e: "/home/pn/.hermes/bot-desktop/browser-profile")
 
     def run_in(env, argv, **_kw):
+        if browser_session_sandbox._RECOVER_LAUNCH in argv:
+            return subprocess.CompletedProcess(argv, browser_session_sandbox._NOT_OURS_RC, b"", b"")
         out = b"9223\n/devtools/browser/abc\n" if "DevToolsActivePort" in " ".join(argv) else b""
         return subprocess.CompletedProcess(argv, 0, out, b"")
     monkeypatch.setattr(streams, "run_in", run_in)

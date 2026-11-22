@@ -97,10 +97,14 @@ def _forget_session_tracking(cache_key: str, *, activity: bool = True, session: 
     with bs._cleanup_lock:
         if session:
             bs._active_sessions.pop(cache_key, None)
-        if activity:
-            bs._session_last_activity.pop(cache_key, None)
-        bs._session_owner_homes.pop(cache_key, None)
-        bs._cleanup_failures.pop(cache_key, None)
+        _forget_tracking_locked(bs, cache_key, activity=activity)
+
+
+def _forget_tracking_locked(bs, cache_key: str, *, activity: bool = True) -> None:
+    if activity:
+        bs._session_last_activity.pop(cache_key, None)
+    bs._session_owner_homes.pop(cache_key, None)
+    bs._cleanup_failures.pop(cache_key, None)
 
 
 # ── Teardown ─────────────────────────────────────────────────────────────────────────────────────────
@@ -134,24 +138,29 @@ def release_session_backend(cache_key: str, session_info: dict[str, Any]) -> Non
         from tools.browser_lightpanda import stop_lightpanda
         stop_lightpanda(session_info.get("session_name", ""))
     launcher_key = session_info.get("launcher_key")
-    if not launcher_key or _launcher_key_in_use(launcher_key, session_info):
-        return  # nothing launched for it, or a shared browser another live session still uses
+    if not launcher_key:
+        return
     if features.get("sandbox"):
+        # The sandbox checks use under the same lock as attaching to Chromium.
         from tools.browser_session_sandbox import stop_sandbox_browser
         stop_sandbox_browser(session_info)
-    elif not features.get("real_profile"):  # outlives its sessions: stopped at exit / on consent-off
+    elif not features.get("real_profile") and not _launcher_key_in_use(launcher_key, session_info):
         from tools.browser_launcher import stop_browser
-        stop_browser(launcher_key)
+        stop_browser(launcher_key, expected_cdp_url=session_info.get("cdp_url"))
 
 
-def cleanup_single_session(cache_key: str) -> None:
-    """Tear down one session by its exact key."""
-    from tools.browser_session_cdp import stop_cdp_supervisor
-    stop_cdp_supervisor(cache_key)  # close our WebSocket BEFORE the backend tears the endpoint down
+def cleanup_single_session(cache_key: str, *, expected: Optional[dict[str, Any]] = None) -> None:
+    """Tear down one session. Liveness probes can retire only the record they inspected."""
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
     bs = _bs()
     with bs._cleanup_lock:
+        if expected is not None and bs._active_sessions.get(cache_key) is not expected:
+            return
         session_info = bs._active_sessions.pop(cache_key, None)
-    _forget_session_tracking(cache_key)
+        supervisor = SUPERVISOR_REGISTRY.detach(cache_key)
+        _forget_tracking_locked(bs, cache_key)
+    if supervisor is not None:
+        _best_effort("CDP supervisor stop", supervisor.stop)
     if session_info:
         release_session_backend(cache_key, session_info)
         logger.debug("Closed browser session %s", cache_key)
