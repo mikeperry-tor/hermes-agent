@@ -40,7 +40,9 @@ the managed files but cannot edit them.
 
 Either file is optional. A missing managed directory or missing file simply
 means "no managed scope," and configuration resolves exactly as it does without
-the feature.
+the feature. When `/etc/hermes/config.yaml` is present, it must contain a YAML
+mapping (use `{}` for an empty policy); strict policy readers treat a blank,
+null, or non-mapping file as an error until it is repaired.
 
 ### Relocating the directory
 
