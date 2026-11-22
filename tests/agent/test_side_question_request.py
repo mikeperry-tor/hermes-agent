@@ -73,7 +73,10 @@ class _FakeProvider:
 
 @pytest.fixture
 def provider(tmp_path, monkeypatch):
+    from model_tools import get_tool_definitions
+
     fake = _FakeProvider()
+    fake.native_tool_definitions = get_tool_definitions
     monkeypatch.setattr("agent.title_generator.maybe_auto_title", lambda *a, **k: None)
     # Every agent built during the test (parent and fork) talks to the same fake.
     patches = [
@@ -402,6 +405,60 @@ def test_runtime_changed_since_the_turn_is_refused(provider, issued):
     sent = len(provider.requests)
     assert redeem_side_question(issued[-1], SIDE_PROMPT, plugin_id="next-prompt") is None
     assert len(provider.requests) == sent
+
+
+def test_managed_change_since_the_turn_refuses_the_captured_request(provider, issued, tmp_path, monkeypatch):
+    parent = _make_parent()
+    _run_parent_turn(parent, provider, tool_round=False)
+    assert issued[-1]
+    (tmp_path / "config.yaml").write_text("tools: {disabled: [web_search]}\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path))
+    sent = len(provider.requests)
+    provider.replies.append(_response("Stale capture escaped the policy ceiling."))
+    assert redeem_side_question(issued[-1], SIDE_PROMPT, plugin_id="next-prompt") is None
+    assert len(provider.requests) == sent
+
+
+@pytest.mark.parametrize("edit_before_build", [False, True])
+def test_same_model_fork_adopts_new_managed_policy(provider, tmp_path, monkeypatch, edit_before_build):
+    import model_tools
+    from agent.background_review import build_cache_parity_fork
+
+    parent = _make_parent()
+    parent.tools = _tool_defs("web_search")
+    parent.valid_tool_names = {"web_search"}
+    parent._cached_system_prompt = "Fixture prompt recommending the now-denied search tool."
+
+    def change_policy():
+        (tmp_path / "config.yaml").write_text("tools: {disabled: [web_search]}\n")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path))
+
+    if edit_before_build:
+        change_policy()
+    with patch.object(model_tools, "get_tool_definitions", provider.native_tool_definitions):
+        fork, _, routed = build_cache_parity_fork(parent, {}, max_iterations=1, write_origin="side_question")
+    assert not routed
+    if not edit_before_build:
+        assert fork.tools == parent.tools
+        change_policy()
+
+    def read_once(*args, **kwargs):
+        # Fail the old frozen-generation spin promptly, even when the pre-turn seam catches it.
+        reads.append(None)
+        assert len(reads) == 1, "a frozen fork kept retrying against an unreachable generation"
+        return provider.native_tool_definitions(*args, **kwargs)
+
+    reads = []
+    try:
+        provider.replies.append(_response("Fork read the current policy."))
+        with patch.object(model_tools, "get_tool_definitions", read_once):
+            fork.run_conversation("Answer briefly.")
+        assert provider.requests
+        outbound = provider.requests[-1]
+        assert all(tool["function"]["name"] != "web_search" for tool in outbound.get("tools", []))
+        assert parent._cached_system_prompt not in str(outbound["messages"])
+    finally:
+        fork.close()
 
 
 def test_server_side_tool_in_final_request_is_refused(provider, issued, monkeypatch):
