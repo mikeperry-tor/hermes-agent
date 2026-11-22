@@ -480,7 +480,7 @@ def _check_tool_availability(should_fix: bool, f: Finding) -> None:
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
     from model_tools import check_tool_availability
-    available, unavailable = _apply_doctor_tool_availability_overrides(*check_tool_availability())
+    available, unavailable = _apply_doctor_tool_availability_overrides(*check_tool_availability(include_denied=True))
     # Web is split into search/extract readiness rows so an explicitly
     # selected but unconfigured backend cannot look healthy.
     web_rows = []

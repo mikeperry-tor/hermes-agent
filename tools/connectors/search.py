@@ -105,12 +105,12 @@ def connector_entries_by_group(
 
 def remote_schemas_for(
     names: list[str],
-    current_tool_defs: list[dict[str, Any]],
+    connections_allowed: bool,
     connector_describe: Optional[Any] = None,
     call: Optional[Any] = None,
 ) -> tuple[dict[str, dict[str, Any]], Optional[str]]:
     connector_names = [n for n in names if is_connector_name(n)]
-    if not connector_names or not connections_in_scope(current_tool_defs):
+    if not connector_names or not connections_allowed:
         return {}, None
     try:
         if connector_describe is None:

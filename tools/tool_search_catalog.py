@@ -237,15 +237,17 @@ def _listing_group_label(source_name: str) -> str:
     return label.removeprefix("mcp-")
 
 
-def hidden_declared_sources() -> list[dict[str, Any]]:
+def hidden_declared_sources(*, permitted=None) -> list[dict[str, Any]]:
     """Return deterministic summaries for declared MCP servers hidden by their check."""
     from hermes_platform import declaration
+    from tools.hosted_tool_policy import discovery_tool_filter
     from tools.mcp_liveness import unavailable_details
     from tools.registry import registry
 
+    permitted = permitted or discovery_tool_filter()
     grouped: dict[str, list[Any]] = {}
     for entry in registry.get_all_entries():
-        if entry.toolset.startswith("mcp-"):
+        if entry.toolset.startswith("mcp-") and permitted(entry.name):
             grouped.setdefault(entry.toolset[4:], []).append(entry)
     rows: list[dict[str, Any]] = []
     for server_name in sorted(grouped):
@@ -263,7 +265,7 @@ def hidden_declared_sources() -> list[dict[str, Any]]:
 
 
 def build_catalog_listing_with_form(
-    deferrable: list[dict[str, Any]], *, max_tokens: int = 4000) -> tuple[Optional[str], str]:
+    deferrable: list[dict[str, Any]], *, max_tokens: int = 4000, permitted=None) -> tuple[Optional[str], str]:
     """Render the deferred-catalog manifest: ``- name: short desc`` lines grouped per source.
     Returns ``(text, form)``; form is ``"full"``, ``"names"``, ``"mixed"`` (oversized servers
     collapsed to a name + count line), ``"groups"`` (every server summarized) or ``"none"``
@@ -278,7 +280,7 @@ def build_catalog_listing_with_form(
             # _classify_source gives ("other", "") when unregistered; the label of "" is "other".
             label = _listing_group_label(_classify_source(name)[1])
             groups.setdefault(label, []).append((name, _short_desc(fn.get("description", ""))))
-    unavailable = hidden_declared_sources()
+    unavailable = hidden_declared_sources(permitted=permitted)
     if not groups and not unavailable:
         return None, "none"
 

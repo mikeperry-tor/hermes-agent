@@ -13,6 +13,7 @@ from hermes_cli.source_check import _github_compare_behind
 from hermes_constants import get_hermes_home
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from hermes_cli._startup_fast import project_root_str
+from tools.hosted_tool_policy import CURRENT_MANAGED_POLICY
 
 # rich and prompt_toolkit are imported lazily: this module sits on the TUI gateway's critical
 # startup path purely for the lightweight update-check helpers, and eager rich/prompt_toolkit
@@ -395,7 +396,7 @@ def _short_label(name: str) -> str:
 
 # === Banner snapshot — warm-launch fast path ===
 # The tool panel needs the full tool registry (~0.5-0.9s cold, the largest chunk of time-to-
-# banner). The list is a pure function of (config.yaml, .env, code checkout, enabled toolsets),
+# banner). The list depends on config.yaml, .env, code checkout, enabled toolsets and managed policy,
 # so the rendered inputs are snapshotted to disk and replayed when the fingerprint matches. The
 # agent's REAL tool list is still computed fresh at first message; the snapshot only feeds the
 # cosmetic panel, and a background refresh (cli.show_banner) re-verifies it right after render.
@@ -407,16 +408,21 @@ def _banner_snapshot_path() -> Path:
     return get_hermes_home() / "cache" / "banner_snapshot.json"
 
 
-def banner_snapshot_fingerprint() -> Optional[str]:
+def banner_snapshot_fingerprint(*, managed_policy=CURRENT_MANAGED_POLICY) -> Optional[str]:
     """Fingerprint the inputs the banner tool panel depends on."""
     import hashlib
+    from tools.hosted_tool_policy import managed_disabled_tools
+
+    if managed_policy is CURRENT_MANAGED_POLICY:
+        managed_policy = managed_disabled_tools()
     def _inputs():
         from hermes_cli.config import get_config_path
         return (get_config_path(), get_hermes_home() / ".env")
     paths = _quiet(_inputs)
     if paths is None:
         return None
-    parts = [f"v{_BANNER_SNAPSHOT_VERSION}"]
+    policy_key = None if managed_policy is None else sorted(managed_policy)
+    parts = [f"v{_BANNER_SNAPSHOT_VERSION}", json.dumps(policy_key)]
     for p in paths:
         st = _quiet(p.stat)
         parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}" if st else f"{p.name}:absent")
@@ -445,9 +451,9 @@ def load_banner_snapshot(enabled_toolsets: list[str] | None = None) -> Optional[
 
 
 def save_banner_snapshot(tools: list[dict], enabled_toolsets: list[str], availability: dict[str, Any],
-                         toolset_map: dict[str, str]) -> None:
+                         toolset_map: dict[str, str], *, managed_policy=CURRENT_MANAGED_POLICY) -> None:
     """Persist the banner tool panel inputs for next launch (best-effort)."""
-    fp = banner_snapshot_fingerprint()
+    fp = banner_snapshot_fingerprint(managed_policy=managed_policy)
     if not fp:
         return
     payload = {
@@ -468,14 +474,16 @@ def save_banner_snapshot(tools: list[dict], enabled_toolsets: list[str], availab
     _quiet(_write)
 
 
-def compute_toolset_availability(enabled_toolsets: list[str] | None = None) -> dict[str, Any]:
+def compute_toolset_availability(
+    enabled_toolsets: list[str] | None = None, *, managed_policy=CURRENT_MANAGED_POLICY,
+) -> dict[str, Any]:
     """Compute ``{"unavailable_toolsets", "lazy_tools", "disabled_tools"}`` for the banner.
 
     Split out so the result can be snapshotted and replayed without importing ``model_tools``.
     """
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
     enabled_toolsets = enabled_toolsets or []
-    _, unavailable_toolsets = check_tool_availability(quiet=True)
+    _, unavailable_toolsets = check_tool_availability(quiet=True, managed_policy=managed_policy)
     # The availability check walks the GLOBAL registry, so it includes toolsets outside this
     # agent's platform set (e.g. `discord` on a CLI session) which must never surface in
     # "Available Tools". Restrict to enabled toolsets; an enabled toolset with unmet deps
