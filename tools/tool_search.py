@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from tools.registry import tool_error
+from tools.hosted_tool_policy import discovery_tool_filter, discovery_tool_refusal, tool_refusal
 from toolsets import CLIENT_SURFACE_TOOLSETS, TOOLSET_SESSION_PLATFORMS
 from tools.tool_search_catalog import (
     BRIDGE_TOOL_NAMES, CHARS_PER_TOKEN, TOOL_CALL_NAME, TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME,
@@ -345,12 +346,17 @@ class AssemblyResult:
 
 
 def assemble_tool_defs(tool_defs: list[dict[str, Any]], *, context_length: Optional[int] = None,
-                       config: Optional[ToolSearchConfig] = None) -> AssemblyResult:
+                       config: Optional[ToolSearchConfig] = None, permitted=None) -> AssemblyResult:
     """Tool-defs the model should see: passthrough when inactive, else deferrable tools
     replaced by the three bridge tools. Idempotent — existing bridge tools are stripped first."""
-    config = config or load_config()
+    permitted = permitted or discovery_tool_filter()
     incoming = [td for td, name in zip(tool_defs, _tool_def_names(tool_defs))
-                if name not in BRIDGE_TOOL_NAMES]
+                if name not in BRIDGE_TOOL_NAMES and permitted(name)]
+    if not all(map(permitted, BRIDGE_TOOL_NAMES)):
+        # These schemas describe and rely on each other. Keep the permitted
+        # tools callable directly when a deployer disables part of the bridge.
+        return AssemblyResult(tool_defs=incoming, activated=False)
+    config = config or load_config()
     visible, deferrable = classify_tools(incoming, config.effective_defer_tools)
     connections_granted = connections_in_scope(incoming)
     if not deferrable:
@@ -368,7 +374,7 @@ def assemble_tool_defs(tool_defs: list[dict[str, Any]], *, context_length: Optio
     listing_budget = listing_token_budget(config, context_length)
     if config.listing != "off":
         listing, listing_form = build_catalog_listing_with_form(
-            deferrable, max_tokens=listing_budget)
+            deferrable, max_tokens=listing_budget, permitted=permitted)
     bridge = bridge_tool_schemas(len(deferrable), listing=listing, listing_form=listing_form,
                                  connections_granted=connections_granted)
     tier = 1 if listing_form in ("full", "names", "mixed") else 2
@@ -410,13 +416,13 @@ def _shared_tool_record(entry: CatalogEntry) -> dict[str, Any]:
                          if isinstance(r, str)][:32]}
 
 
-def _available_source_summary(catalog: list[CatalogEntry]) -> list[dict[str, Any]]:
+def _available_source_summary(catalog: list[CatalogEntry], *, permitted=None) -> list[dict[str, Any]]:
     """Deterministic summaries of connected and declared unavailable sources."""
     from tools.tool_search_catalog import hidden_declared_sources
 
     counts = Counter(_listing_group_label(entry.source_name) for entry in catalog)
     rows = [{"name": name, "tool_count": counts[name]} for name in sorted(counts)]
-    return sorted(rows + hidden_declared_sources(), key=lambda row: row["name"])
+    return sorted(rows + hidden_declared_sources(permitted=permitted), key=lambda row: row["name"])
 
 
 def _string_list_arg(args: dict[str, Any], key: str, *, dedupe: bool, max_items: int,
@@ -451,17 +457,22 @@ def dispatch_tool_search(args: dict[str, Any], *, current_tool_defs: list[dict[s
     raw_limit = args.get("limit")
     limit = (config.search_default_limit if raw_limit is None
              else _clamped_int(raw_limit, config.search_default_limit, 1, config.max_search_limit))
-    catalog = build_catalog(_deferrable_in(current_tool_defs))
     remote_entries: list[list[CatalogEntry]] = [[] for _ in queries]
     hosted_failure: Optional[str] = None
-    if connections_in_scope(current_tool_defs):
+    hosted = connections_in_scope(current_tool_defs) and tool_refusal("manage_connections") is None
+    if hosted:
         remote_entries, hosted_failure = connector_entries_by_group(
             queries, connector_search=connector_search, call=call)
+    # Use one policy after the hosted request for local hits, remote hits and source counts.
+    permitted = discovery_tool_filter()
+    if not permitted("manage_connections"):
+        remote_entries, hosted_failure = [[] for _ in queries], None
+    catalog = [entry for entry in build_catalog(_deferrable_in(current_tool_defs)) if permitted(entry.name)]
     results: list[dict[str, Any]] = []
     tools_map: dict[str, dict[str, Any]] = {}
-    available_sources = _available_source_summary(catalog)
+    available_sources = _available_source_summary(catalog, permitted=permitted)
     for position, query in enumerate(queries):
-        corpus = catalog + remote_entries[position]
+        corpus = catalog + [entry for entry in remote_entries[position] if permitted(entry.name)]
         hits = search_catalog(corpus, query, limit=limit)
         for h in hits:
             tools_map.setdefault(h.name, _shared_tool_record(h))
@@ -480,18 +491,17 @@ def dispatch_tool_search(args: dict[str, Any], *, current_tool_defs: list[dict[s
                                "results": results, "tools": tools_map}
     if hosted_failure:
         payload["connectors"] = connectors_unavailable(hosted_failure, verb="searched")
-    _record_search_metric(current_tool_defs, catalog=catalog, hits=len(tools_map),
+    _record_search_metric(current_tool_defs, catalog=catalog, hosted=hosted, hits=len(tools_map),
                           outcome="connector_unavailable" if hosted_failure else "hits" if tools_map else "no_hits")
     return json.dumps(payload, ensure_ascii=False)
 
 
 def _record_search_metric(current_tool_defs: list[dict[str, Any]], *, hits: int, outcome: str,
-                          catalog: Optional[list[CatalogEntry]] = None) -> None:
+                          catalog: Optional[list[CatalogEntry]] = None, hosted: bool = False) -> None:
     """One ``hermes.tool_search.count`` row: which corpora the search read, never the query."""
     from hermes_cli.observability.shared_metrics_events import record_tool_search
 
     local = bool(catalog if catalog is not None else _deferrable_in(current_tool_defs))
-    hosted = connections_in_scope(current_tool_defs)
     scope = "both" if local and hosted else "connector" if hosted else "local"
     record_tool_search(scope=scope, hits=hits, outcome=outcome)
 
@@ -507,7 +517,13 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
         return err
     deferrable = _deferrable_in(current_tool_defs)
     by_name = {name: _fn(td) for td, name in zip(deferrable, _tool_def_names(deferrable)) if name}
-    remote_schemas, hosted_failure = remote_schemas_for(names, current_tool_defs, connector_describe, call=call)
+    initial_refusal = discovery_tool_refusal()
+    permitted_names = [name for name in names if initial_refusal(name) is None]
+    connections_allowed = connections_in_scope(current_tool_defs) and initial_refusal("manage_connections") is None
+    remote_schemas, hosted_failure = remote_schemas_for(permitted_names, connections_allowed, connector_describe, call=call)
+    refusal_for = discovery_tool_refusal()
+    if refusal_for("manage_connections") is not None:
+        remote_schemas, hosted_failure = {}, None
 
     tools: dict[str, dict[str, Any]] = {}
     not_found: list[str] = []
@@ -515,6 +531,9 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
     errors: dict[str, str] = {}
     session_names = session_tool_names(current_tool_defs)
     for name in names:
+        if refusal := refusal_for(name):
+            errors[name] = refusal
+            continue
         fn = by_name.get(name)
         remote_fn = remote_schemas.get(name)
         if fn is not None:
@@ -577,6 +596,14 @@ def scope_block_reason(name: str) -> str:
             or (unavailable_in_session_reason(name)
                 if name in _core_tool_names() and _registry_entry(name) is not None else None)
             or f"'{name}' is not available in this session. Use tool_search to find tools you can call.")
+
+
+def can_unwrap_call(function_name: str) -> bool:
+    """Whether *function_name* is the ``tool_call`` bridge and permitted by tool policy."""
+    if function_name != TOOL_CALL_NAME:
+        return False
+    from tools.hosted_tool_policy import tool_refusal
+    return tool_refusal(function_name) is None
 
 
 def resolve_underlying_call(args: dict[str, Any], session_tool_names: Optional[Iterable[str]] = None,

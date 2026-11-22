@@ -411,7 +411,7 @@ def _unwrap_tool_search_call(
     scope_block: Optional[str] = None
     try:
         from tools import tool_search as _ts
-        if function_name != _ts.TOOL_CALL_NAME:
+        if not _ts.can_unwrap_call(function_name):
             return function_name, function_args, None
         underlying, underlying_args, err = _ts.resolve_underlying_call(function_args)
         if err or not underlying:
@@ -707,11 +707,11 @@ def _dispatch_authorized_once(
         elif callback is not None:
             callback()
 
-    # Deny-by-default for a hosted scope, before plugin hooks, guardrails or any executor: every
+    # Managed denials and hosted allowlist, before hooks, guardrails or any executor: every
     # sequential, concurrent and batched call reaches its executor (inline, memory provider, context
     # engine, registry) only through here.
-    from tools.hosted_tool_policy import hosted_tool_refusal
-    block_message, block_error_type = hosted_tool_refusal(ref.name), "hosted_tool_refused"
+    from tools.hosted_tool_policy import tool_refusal
+    block_message, block_error_type = tool_refusal(ref.name), "tool_policy_refused"
     if block_message is None:
         block_message, block_error_type = scope_block, "tool_scope_block"
     if block_message is None:
@@ -790,8 +790,8 @@ def _run_agent_tool_execution_middleware(
 
     trace = middleware_trace if middleware_trace is not None else []
     state = _ManagedToolResult(result=None, args=function_args, middleware_trace=trace, blocked=False, dispatched=False)
-    from tools.hosted_tool_policy import hosted_tool_refusal
-    if hosted_tool_refusal(function_name) is not None:
+    from tools.hosted_tool_policy import tool_refusal
+    if tool_refusal(function_name) is not None:
         # Refused in a hosted scope before Relay and every request/execution middleware: no
         # host-side callback sees, rewrites or acts on a call that will not run.
         state.dispatched = True

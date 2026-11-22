@@ -81,3 +81,32 @@ def test_baked_banner_uses_live_identity(monkeypatch):
 
     monkeypatch.setattr(version_info, "get_code_identity", lambda: {"short_sha": "a1b2c3d4"})
     assert banner._baked_banner_state() == {"upstream": "a1b2c3d4", "local": "a1b2c3d4", "ahead": 0}
+
+
+def test_banner_snapshot_keeps_the_policy_producing_its_tool_panel(tmp_path, monkeypatch):
+    from tools.hosted_tool_policy import managed_disabled_tools
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    monkeypatch.setattr(banner, "get_git_banner_state", lambda: None)
+    monkeypatch.setattr(banner, "get_available_skills", dict)
+    config = managed / "config.yaml"
+    config.write_text("tools: {disabled: []}\n")
+    policy = managed_disabled_tools()
+    tools = [{"function": {"name": "read_file"}}]
+
+    def save():
+        banner.save_banner_snapshot(tools, ["file"], {}, {"read_file": "file"}, managed_policy=policy)
+
+    save()
+    assert banner.load_banner_snapshot(["file"])["tools"] == tools
+    config.write_text("tools: {disabled: [read_file]}\n")
+    assert banner.load_banner_snapshot(["file"]) is None
+
+    # An old in-flight refresh cannot stamp its panel with the new policy.
+    save()
+    assert banner.load_banner_snapshot(["file"]) is None
+    config.write_text("tools: {disabled: []}\n")
+    assert banner.load_banner_snapshot(["file"])["tools"] == tools

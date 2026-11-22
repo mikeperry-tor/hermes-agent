@@ -146,7 +146,7 @@ class TestDoctorToolAvailabilitySummary:
         monkeypatch.setattr(doctor_tools, "_apply_doctor_tool_availability_overrides", lambda a, u: (a, u))
         monkeypatch.setattr(doctor_tools, "_doctor_web_capability_rows", list)
         fake_model_tools = types.SimpleNamespace(
-            check_tool_availability=lambda: ([], unavailable),
+            check_tool_availability=lambda *, include_denied: ([], unavailable) if include_denied else ([], []),
         )
         monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
 
