@@ -45,7 +45,8 @@ def test_op_env_is_the_file_the_loader_bootstraps_from(home, monkeypatch):
 
     monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
     (home / ".op.env").write_text("OP_SERVICE_ACCOUNT_TOKEN=FAKE-op-token\n", encoding="utf-8")
-    assert _bootstrap_env(home).get("OP_SERVICE_ACCOUNT_TOKEN") == "FAKE-op-token"
+    env, _ = _bootstrap_env(home, managed_path=None)
+    assert env.get("OP_SERVICE_ACCOUNT_TOKEN") == "FAKE-op-token"
 
 
 def test_every_surface_refuses_the_stores(home, monkeypatch):

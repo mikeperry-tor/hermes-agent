@@ -102,7 +102,7 @@ def test_dotenv_loading_is_preserved_when_external_secrets_are_skipped(
     monkeypatch.setattr(
         env_loader,
         "_apply_external_secret_sources",
-        lambda path: applied.append(path),
+        lambda path, *, managed_claims: applied.append((path, managed_claims)),
     )
 
     loaded = env_loader.load_hermes_dotenv(
@@ -112,7 +112,7 @@ def test_dotenv_loading_is_preserved_when_external_secrets_are_skipped(
 
     assert loaded == [env_file]
     assert os.environ["UPDATE_TEST_VALUE"] == "from-dotenv"
-    assert applied == ([home] if external_secrets else [])
+    assert applied == ([(home, frozenset())] if external_secrets else [])
 
 
 @pytest.mark.platforms("posix")  # the 'command' secret source is POSIX-only

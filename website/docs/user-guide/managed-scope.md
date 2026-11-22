@@ -106,6 +106,14 @@ usual "an environment variable overrides config.yaml" rule, and it applies only
 to the specific keys the managed layer specifies.
 :::
 
+Managed `.env` values stay in effect across profile environment reloads, and a
+transient read error leaves already-applied managed assignments in place. When
+serving a routed profile, `${VAR}` templates in managed `.env` expand against
+that profile's `.env` and original process environment rather than values
+published by the launch profile. In file-backed deployments that rely on
+managed YAML policy, pin `HERMES_CONFIG_BACKEND=file` in managed `.env` so a
+profile cannot switch the config backend.
+
 When the managed `config.yaml` pins a non-empty `terminal.backend`, a profile
 `.env` or `.op.env` that exists but cannot be read (a sandbox launcher withholds
 them and passes the keys as environment) loads as absent with a warning; without
