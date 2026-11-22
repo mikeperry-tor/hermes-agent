@@ -92,13 +92,13 @@ def test_sandbox_status_offers_the_image_switch_instead_of_a_config_hint(monkeyp
     monkeypatch.setattr(placement, "_terminal_backend", lambda: "docker")
     monkeypatch.setattr(placement, "terminal_environment", lambda *, create=True: _FakeDocker())
     monkeypatch.setattr(sandbox_host, "missing_binaries", lambda env: ["Xvnc"])
-    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile: {})
+    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile, **_: {})
 
     monkeypatch.setattr(sw, "pending", lambda: sw.PendingSwitch("old/base:1", "nousresearch/hermes-sandbox:desktop", ["hermes-a"]))
     st = runtime.status()
     assert st.image_switch == {"current_image": "old/base:1", "target_image": "nousresearch/hermes-sandbox:desktop", "containers": 1}
     assert "old/base:1" in st.blocker and "/root and /workspace" in st.blocker
-    assert st.installed and not st.running
+    assert not st.installed and not st.running and st.missing == ["Xvnc"]
 
     monkeypatch.setattr(sw, "pending", lambda: None)
     st = runtime.status()
@@ -303,7 +303,7 @@ def test_stop_and_status_follow_the_recorded_owner_not_the_current_setting(monke
     monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda marker: True)
     monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
     monkeypatch.setattr(sandbox_host, "missing_binaries", lambda env: [])
-    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile: {"DISPLAY": ":20"})
+    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile, **_: {"DISPLAY": ":20"})
 
     st = runtime.status()
     assert st.running and st.display == ":20" and st.placement.startswith("terminal:")

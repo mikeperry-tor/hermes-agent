@@ -42,6 +42,9 @@ vi.mock('./i18n', () => ({
       stoppedTitle: 'Stopped',
       stoppedBody: 'Body',
       start: 'Start',
+      notInstalledTitle: 'Desktop not installed',
+      noPackageManager: 'No package manager',
+      installHint: 'Install desktop packages',
       agentControls: 'Bot controls',
       takeOver: 'Take over',
       reconnect: 'Reconnect',
@@ -119,5 +122,32 @@ it('a stopped pane learns of an external start from the pushed display.status ev
   act(() => emitGatewayEvent({ type: 'display.status', connectionId: 'host-a', profile: 'ops', payload: running }))
   await waitFor(() => expect(vi.mocked(displayRequest)).toHaveBeenCalledWith(bot, 'display.observe', expect.anything()))
   expect(view.queryByText('Stopped')).toBeNull()
+  view.unmount()
+})
+
+
+it('shows failed inspection as a connection blocker and recovers on a successful status event', async () => {
+  const blocker = 'Could not inspect desktop dependencies; check the terminal sandbox connection and retry.'
+  vi.mocked(displayRequest).mockResolvedValue({ ...stopped, installed: false, blocker })
+  const view = render(<BotScreenPane bot={bot} />)
+  await waitFor(() => expect(view.getByText(blocker)).toBeTruthy())
+  expect(view.queryByText('Desktop not installed')).toBeNull()
+  expect(view.queryByText('No package manager')).toBeNull()
+  expect(view.queryByText('Install desktop packages')).toBeNull()
+  expect((view.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(false)
+  act(() => emitGatewayEvent({ type: 'display.status', connectionId: 'host-a', profile: 'ops', payload: stopped }))
+  await waitFor(() => expect(view.queryByText(blocker)).toBeNull())
+  expect((view.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(false)
+  view.unmount()
+})
+
+it.each([{ missing: [] }, { missing: ['Xvnc'] }])('allows retry after display inspection when packages are present ($missing)', async ({ missing }) => {
+  const blocker = missing.length ? 'The sandbox image lacks Xvnc.' : 'Could not inspect the desktop display.'
+  vi.mocked(displayRequest).mockResolvedValue({
+    ...stopped, placement: 'terminal:ssh', installed: !missing.length, missing, blocker
+  })
+  const view = render(<BotScreenPane bot={bot} />)
+  await waitFor(() => expect(view.getByText(blocker)).toBeTruthy())
+  expect((view.getByRole('button', { name: 'Start' }) as HTMLButtonElement).disabled).toBe(Boolean(missing.length))
   view.unmount()
 })
