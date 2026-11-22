@@ -70,6 +70,13 @@ def browser_dialog(
     task_id: Optional[str] = None,
 ) -> str:
     """Respond to a pending dialog on the active task's CDP supervisor."""
+    from tools.bot_desktop.placement import executor_only
+
+    try:
+        if executor_only():
+            return json.dumps({"success": False, "error": "The deployment does not allow direct CDP dialog commands"})
+    except RuntimeError as exc:
+        return json.dumps({"success": False, "error": str(exc)})
     supervisor = SUPERVISOR_REGISTRY.get(task_id or "default")
     if supervisor is None:
         return json.dumps({

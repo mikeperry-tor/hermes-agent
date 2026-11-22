@@ -132,6 +132,8 @@ def _close_cloud_session(session_info: dict[str, Any]) -> None:
 
 def release_session_backend(cache_key: str, session_info: dict[str, Any]) -> None:
     """Release ``session_info``'s browser BY OBJECT (an unpublished session releases through this alone)."""
+    from tools.browser_use_executor import close
+    close(cache_key=cache_key, session_info=session_info)
     _close_cloud_session(session_info)
     features = session_info.get("features") or {}
     if features.get("lightpanda"):

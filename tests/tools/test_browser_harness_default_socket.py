@@ -28,7 +28,7 @@ def harness_env(tmp_path, monkeypatch):
         "cdp_url": "ws://127.0.0.1:47000/devtools/browser/x", "features": {"local": True}})
     from tools import browser_supervisor
 
-    class _Registry:
+    class _Registry(browser_supervisor._SupervisorRegistry):
         def get_or_start(self, *a, **kw):
             return None
 
