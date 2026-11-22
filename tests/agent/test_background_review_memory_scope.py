@@ -24,8 +24,10 @@ import agent.background_review as bg
 
 
 def _review_agent(memory_enabled=True, user_profile_enabled=False) -> SimpleNamespace:
-    """The whitelist only reads the profile's memory flags off the fork."""
-    return SimpleNamespace(_memory_enabled=memory_enabled, _user_profile_enabled=user_profile_enabled)
+    return SimpleNamespace(
+        _memory_enabled=memory_enabled, _user_profile_enabled=user_profile_enabled,
+        tools=[{"function": {"name": name}} for name in ("memory", "skill_manage")],
+    )
 
 
 class TestReviewToolWhitelistScope:
@@ -48,6 +50,34 @@ class TestReviewToolWhitelistScope:
         # skill review that used memory nobody asked it to touch.
         whitelist, _extra = bg._review_tool_whitelist(_review_agent(), None)
         assert "memory" not in whitelist
+
+
+def test_stock_review_keeps_only_tasks_supported_by_its_tools():
+    review = bg._COMBINED_REVIEW_PROMPT
+    skills = {"skills_list", "skill_view", "skill_manage"}
+    assert bg._permitted_review_prompt(review, {"memory"}) == bg._MEMORY_REVIEW_PROMPT
+    assert bg._permitted_review_prompt(review, skills) == bg._SKILL_REVIEW_PROMPT
+    assert bg._permitted_review_prompt(review, skills | {"memory"}) == review
+
+
+def test_deferred_memory_keeps_trigger_scope(monkeypatch):
+    import model_tools
+    from agent import tool_executor
+
+    memory = {"function": {"name": "memory"}}
+    bridge = {"function": {"name": "tool_call"}}
+
+    def definitions(*, enabled_toolsets, quiet_mode, skip_tool_search_assembly=False):
+        if "memory" not in enabled_toolsets:
+            return []
+        return [memory] if skip_tool_search_assembly else [bridge]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", definitions)
+    monkeypatch.setattr(tool_executor, "_tool_search_scoped_names", lambda _agent: frozenset({"memory"}))
+    reviewer = _review_agent()
+    reviewer.tools = [bridge]
+    assert bg._review_tool_whitelist(reviewer, None, review_memory=True) == ({"memory"}, {"memory"})
+    assert bg._review_tool_whitelist(reviewer, None, review_memory=False) == (set(), set())
 
 
 class TestSpawnForwardsScope:
