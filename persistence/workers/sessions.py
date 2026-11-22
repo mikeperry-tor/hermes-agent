@@ -181,8 +181,8 @@ class WorkerSessionVerbs(Protocol):
         """``session.lifecycle``: the status the newest row of any visibility implies, ``empty`` without rows."""
         ...
 
-    def set_session_system_prompt(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, system_prompt: str | None) -> None:
-        """``session.prompt``: replace the stored prompt snapshot (``None`` clears)."""
+    def set_session_system_prompt(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, system_prompt: str | None, managed_tools: list[str] | str | None = None) -> None:
+        """``session.prompt``: replace the stored prompt and any supplied producing policy."""
         ...
 
     def patch_session_sidecars(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, patch: Mapping[str, JsonValue]) -> None:
@@ -190,7 +190,8 @@ class WorkerSessionVerbs(Protocol):
         ...
 
     def set_session_tool_pin(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int, tool_pin: ToolPin | None) -> None:
-        """``session.tools`` with ``{"tool_names"}``: ``None`` clears; a list of 1..256-character names, or a mapping with ``version`` (str) and ``tools`` (list) and an optional ``delegation_backend`` (str of at most 64), encoding to at most 4 MiB."""
+        """``session.tools``: save the versioned tool pin with its optional backend and managed selection.
+        A name list remains valid, ``None`` clears the pin, and the encoded pin is bounded to 4 MiB."""
         ...
 
     def latest_conversation_role(self, *, epoch: AuthorityEpoch, execution_id: WorkerExecutionId, session_id: SessionId, generation: ExecutionGeneration, sequence: int) -> str | None:

@@ -476,9 +476,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         sid = self.scope['session_id']
         return [sid] if self.get_session_model_config_value(sid, key) is not None else []
 
-    def update_system_prompt(self, session_id, system_prompt):
+    def update_system_prompt(self, session_id, system_prompt, *, managed_tools=None):
         self._session(session_id)
-        self._apply('session.prompt', {'system_prompt': system_prompt})
+        payload = {'system_prompt': system_prompt}
+        if managed_tools is not None:
+            payload['managed_tools'] = managed_tools
+        self._apply('session.prompt', payload)
 
     def patch_session_model_config(self, session_id, patch):
         self._session(session_id)
