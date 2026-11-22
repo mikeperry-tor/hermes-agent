@@ -26,7 +26,9 @@ from hermes_cli._subprocess_compat import (
 )
 from hermes_cli.sqlite_safe_read import LiveConnectionError, offline_file_access
 from hermes_cli.sizefmt import format_bytes
+from hermes_cli.config_backend import ConfigBackendUnavailable
 from hermes_platform.resolver.git import resolve_usable_git
+from hermes_yaml import YAMLError
 
 # ── Plugin context-reference provider API ────────────────────────────────────
 
@@ -238,6 +240,22 @@ async def preprocess_context_references_async(
     if refusal := host_feature_refusal("context_references", "@-references"):
         return ContextReferenceResult(message=message, original_message=message, references=refs,
                                       warnings=[refusal], blocked=True)
+    if any(ref.kind == "url" for ref in refs):
+        try:
+            fetch_urls = await asyncio.to_thread(_fetch_urls_enabled, plugins)
+        except (ConfigBackendUnavailable, OSError, TypeError, ValueError, YAMLError):
+            # Unknown preferences cannot authorize implicit fetching, and the
+            # native SystemExit must not escape a serving turn's asyncio task.
+            return ContextReferenceResult(
+                message=message, original_message=message, references=refs,
+                warnings=["URL reference configuration is unavailable; check its configuration source and retry."],
+                blocked=True)
+        if not fetch_urls:
+            # Keep the original text/chips, but do not let disabled URLs consume
+            # expansion slots or token limits before supported references.
+            refs = [ref for ref in refs if ref.kind != "url"]
+            if not refs:
+                return ContextReferenceResult(message=message, original_message=message)
     cwd_path = Path(cwd).expanduser().resolve()
     # Default root = cwd so @ references cannot escape the workspace unless a caller widens it.
     allowed_root_path = Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
@@ -281,6 +299,33 @@ async def preprocess_context_references_async(
     result.message = final.strip()
     result.expanded = bool(blocks or warnings)
     return result
+
+
+def _fetch_urls_enabled(use_profile: bool) -> bool:
+    from hermes_cli.managed_scope import load_managed_config
+
+    managed_snapshot = load_managed_config(strict=True)
+    managed = managed_snapshot.get("context_references", {})
+    if not isinstance(managed, dict):
+        raise ValueError("managed context_references must be a mapping")
+    if "fetch_urls" in managed:
+        selection = managed["fetch_urls"]
+        if type(selection) is not bool:
+            raise ValueError("managed context_references.fetch_urls must be boolean")
+        return selection
+    if not use_profile:
+        # Safe/config-bypass sessions retain built-in defaults and skip profile reads.
+        return True
+    from hermes_cli.config_effective import load_user_config_effective
+
+    config = load_user_config_effective(fail_closed=True, managed_snapshot=managed_snapshot)
+    options = config.get("context_references", {})
+    if not isinstance(options, dict):
+        raise ValueError("context_references must be a mapping")
+    selection = options.get("fetch_urls", True)
+    if type(selection) is not bool:
+        raise ValueError("context_references.fetch_urls must be boolean")
+    return selection
 
 
 # Git-backed reference kinds -> f(ref) -> git argv (the label is "git " + argv).
