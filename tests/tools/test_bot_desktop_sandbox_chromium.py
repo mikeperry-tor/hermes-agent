@@ -62,3 +62,21 @@ def test_no_browser_or_a_non_executable_one_is_still_none(run_probe):
 @pytest.mark.skipif(_host_has_opt_playwright_chromium(), reason="the probe also searches the host's /opt/playwright")
 def test_the_headless_shell_build_is_not_taken_for_the_headed_browser(run_probe):
     assert run_probe("chromium_headless_shell-1248/chrome-linux-arm64/headless_shell") is None
+
+
+@pytest.mark.parametrize("read,value", [
+    (sandbox_host.desktop_home, b"/home/runner"),
+    (sandbox_host.chromium_executable, b"/opt/playwright/chromium-1248/chrome-linux-arm64/chrome"),
+])
+def test_desktop_inspection_can_recover_on_the_same_executor(read, value, monkeypatch):
+    from unittest.mock import Mock
+
+    env = SimpleNamespace(_bd_desktop_user=None)
+    calls = Mock(side_effect=[
+        subprocess.CompletedProcess([], 1, b'', b''),
+        subprocess.CompletedProcess([], 0, value, b''),
+    ])
+    monkeypatch.setattr(sandbox_host.streams, "run_in", calls)
+    with pytest.raises(RuntimeError, match="Could not"):
+        read(env)
+    assert read(env) == value.decode()

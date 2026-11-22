@@ -15,7 +15,7 @@ def test_concurrent_grabs_each_see_their_own_xauthority(monkeypatch):
     envs = {"a": {"DISPLAY": ":91", "XAUTHORITY": "/tmp/xauth-a"},
             "b": {"DISPLAY": ":92", "XAUTHORITY": "/tmp/xauth-b"}}
     local = threading.local()
-    monkeypatch.setattr(runtime, "published_env", lambda: envs[local.profile])
+    monkeypatch.setattr(runtime, "_gateway_published_env", lambda: envs[local.profile])
     monkeypatch.setattr(runtime, "_launcher_pid", lambda: 4242)
     monkeypatch.delenv("XAUTHORITY", raising=False)
     seen = {}

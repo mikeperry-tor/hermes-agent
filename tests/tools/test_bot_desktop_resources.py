@@ -37,10 +37,12 @@ def test_unknown_or_sufficient_memory_never_blocks(monkeypatch, info):
 def test_running_screen_is_not_reported_blocked_by_later_pressure(tmp_path, monkeypatch):
     """The gate guards the allocation; once the desktop is up, memory pressure is the browser's problem,
     not a reason to tell the pane its running screen is blocked."""
-    monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path / "bd")
+    state_dir = tmp_path / "bd"
+    state_dir.mkdir()
+    (state_dir / "env").write_text("DISPLAY=:20\n", encoding="utf-8")
+    monkeypatch.setattr(runtime, "state_dir", lambda: state_dir)
     monkeypatch.setattr(runtime, "missing_binaries", list)
     monkeypatch.setattr(runtime, "_launcher_pid", lambda: 4242)
-    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":20"})
     monkeypatch.setattr(resources, "min_free_mb", lambda: 1536)
     monkeypatch.setattr(resources, "memory_info", lambda: resources.MemoryInfo(available_mb=100, limit_mb=4096))
     st = runtime.status()
