@@ -177,13 +177,16 @@ def test_browser_and_cua_driver_envs_carry_none_of_the_backend_values(sandbox_sc
 
 
 def test_a_host_cua_driver_never_gets_this_machines_seat_for_a_sandbox_hosted_screen(sandbox_screen, monkeypatch):
-    """bounded / unrestricted computer_use runs its embedded daemon on THIS machine even under terminal placement:
-    with no display it fails, where the seat would put an approval-bypassed driver on the human's own desktop."""
+    """bounded / unrestricted computer_use is refused under terminal placement, and even direct
+    embedded-daemon env construction strips the host seat variables."""
     for key, value in {"DISPLAY": ":0", "XAUTHORITY": "/home/u/.Xauthority",
                        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/u/bus"}.items():
         monkeypatch.setenv(key, value)
     from tools.computer_use.cua_backend import CuaDriverBackend
-    env = CuaDriverBackend("unrestricted")._embedded_daemon.child_env()
+    from tools.computer_use.cua_backend_daemon import _EmbeddedCuaDaemon
+    with pytest.raises(ValueError, match="standard permissions only"):
+        CuaDriverBackend("unrestricted")
+    env = _EmbeddedCuaDaemon("", "unrestricted").child_env()
     assert not {"DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"} & set(env)
 
 
@@ -230,7 +233,8 @@ def test_processes_inside_the_backend_still_receive_the_published_values(sandbox
                         ["docker", "exec", "-i", e._container_id])
     invocation = cua_backend.sandbox_mcp_invocation()
     assert invocation is not None
-    (command, args), child_env = invocation
+    (command, args), child_env, (inv_env, inv_published) = invocation
+    assert inv_env is sandbox_screen and inv_published == LAUNCHER_VALUES
     assert command == "docker" and "cua-driver mcp" in args[-1]
     for key, value in LAUNCHER_VALUES.items():
         assert f"export {key}=" in args[-1] and value in args[-1], key

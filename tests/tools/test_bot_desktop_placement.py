@@ -184,7 +184,7 @@ def test_terminal_placement_starts_the_sandbox_screen_instead_of_running_on_the_
     monkeypatch.setattr(runtime, "sandbox_screen_running", lambda: bool(started))
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":20", "XAUTHORITY": "/x"} if started else {})
     monkeypatch.setattr(runtime, "start", lambda **kw: started.append("started"))
-    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
+    monkeypatch.setattr(runtime, "tool_sandbox", lambda: (_FakeDocker(), runtime.published_env()))
     monkeypatch.setattr(runtime, "touch_activity", lambda: None)
     monkeypatch.setattr(browser_session_sandbox, "create_sandbox_session", lambda key: {
         "session_name": "sb_1", "cdp_url": "ws://127.0.0.1:45004/devtools/browser/abc",
@@ -199,7 +199,7 @@ def test_terminal_placement_starts_the_sandbox_screen_instead_of_running_on_the_
     monkeypatch.setattr(sandbox_host, "_user_for", lambda e: "pn")
     monkeypatch.setattr(streams, "exec_prefix", lambda e, *, user=None, interactive=True:
                         ["docker", "exec", "-i", "-u", user, e._container_id])
-    (command, args), child_env = cb.sandbox_mcp_invocation()
+    (command, args), child_env, _ = cb.sandbox_mcp_invocation()
     assert command == "docker" and "cua-driver mcp" in args[-1] and "export DISPLAY=:20" in args[-1]
     assert set(child_env) == {"PATH"}  # the host driver's env never reaches the sandbox driver
 
