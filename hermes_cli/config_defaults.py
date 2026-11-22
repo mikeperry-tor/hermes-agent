@@ -427,6 +427,8 @@ DEFAULT_CONFIG = {
         "engine": "auto",
         "executable_path": "",  # local binary; "" = PM Chromium, image build, or system Chromium
         "user_data_dir": "",  # persistent local profile dir; "" = fresh throwaway profile per session
+        "executor_python": "python3",  # Python with browser-harness in terminal desktop environments
+        "executor_workspace": "",  # persistent root inside terminal desktop environments; "" = <executor HOME>/.hermes/browser-use
         "require_sandbox": False,  # fail visibly rather than bypassing Chromium sandboxing
         "chromium_args": [],  # extra Chromium flags for local sessions, e.g. ["--lang=de"]
         # Cloud provider: LAN/localhost URLs open in a local Chromium (ignores allow_private_urls; False refuses)
