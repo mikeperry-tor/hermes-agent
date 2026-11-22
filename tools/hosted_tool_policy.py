@@ -1,11 +1,11 @@
-"""What a hosted scope may run: an allowlist of tools, and one switch for host-state features.
+"""Deployment tool denials, a hosted tool allowlist, and hosted host-state feature gates.
 
 In a hosted scope nothing tenant-supplied may execute on this host or touch its filesystem, and no
 agent may read or write state this host keeps for its profile. Two decisions enforce that. Each is
 made in one function and is deny-by-default, so a new tool or feature stays off in a hosted scope
 until someone shows it acts only through the agent's sandbox:
 
-* :func:`hosted_tool_refusal` — a tool runs in a hosted scope only if it is on
+* :func:`tool_refusal` — a tool runs in a hosted scope only if it is on
   :data:`HOSTED_TOOL_ALLOWLIST`, the tools whose every effect goes through the agent's own sandbox
   (``tools.environments.sandbox_scope``). Everything else (memory, recall, todo, vision, browser, web,
   MCP, connectors, catalog, delegation, skills, cron, ...) is refused before its handler. The agent
@@ -18,17 +18,21 @@ until someone shows it acts only through the agent's sandbox:
   host's state for the profile, or run here (:data:`HOST_FEATURES`). Every one is off in a hosted
   scope; each site asks this one function. They come back per agent through storage ports.
 
-A local install (no scope, or a local one) is untouched: neither set is consulted, and every
-function here answers "allowed", with one exception. The features that start a command the profile's
-own files name (:data:`RUNS_PROFILE_COMMANDS`) are also off while a plugin runs this process's
-profile elsewhere (``hermes_cli.profiles_run_elsewhere``): that backend writes those files and starts
-the commands itself, so no host process does, whichever command asks (``hermes hooks test``,
-``hermes mcp test``, a process that was already running when the profile was marked).
+A local install retains its features, with two additions. First, the features that start a command
+the profile's own files name (:data:`RUNS_PROFILE_COMMANDS`) are off while a plugin runs this
+process's profile elsewhere (``hermes_cli.profiles_run_elsewhere``): that backend writes those files
+and starts the commands itself, so no host process does, whichever command asks (``hermes hooks
+test``, ``hermes mcp test``, a process that was already running when the profile was marked).
+Second, an optional managed ``tools.disabled`` list denies named tools across discovery and
+dispatch without opting into the hosted allowlist; profiles cannot relax it.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
+
+CURRENT_MANAGED_POLICY = object()
+MANAGED_TOOL_POLICY_ERROR = "Managed tool policy could not be read or validated. Contact the deployment administrator."
 
 # Tools whose every effect goes through the agent's ScopedEnvironment and nothing on this host:
 #   terminal        commands run by env.execute in the sandbox; background spawns via spawn_via_env,
@@ -89,12 +93,54 @@ def _message(what: str, why: str) -> str:
             f"{', '.join(sorted(HOSTED_TOOL_ALLOWLIST))}, all run in its own sandbox.")
 
 
-def hosted_tool_refusal(tool_name: str) -> Optional[str]:
-    """Why a hosted scope may not run *tool_name*, or ``None``. Always ``None`` outside a hosted scope,
-    where the allowlist is not consulted."""
-    if not _hosted() or tool_name in HOSTED_TOOL_ALLOWLIST:
+def managed_disabled_tools() -> Optional[frozenset[str]]:
+    """Managed-only tool names; None means policy is unreadable/invalid, not unrestricted.
+
+    Intentionally managed-only (``/etc/hermes/config.yaml``) and omitted from user ``DEFAULT_CONFIG``.
+    Native managed scope owns location, file caching and config-backend authority; existing profile
+    ``disabled_toolsets`` can narrow selection but cannot undo this ceiling.
+    """
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli.managed_scope import load_managed_config
+    from hermes_yaml import YAMLError
+    try:
+        config = load_managed_config(strict=True)
+        options = config.get("tools", {})
+        if not isinstance(options, dict):
+            raise ValueError("managed tools must be a mapping")
+        names = options.get("disabled", [])
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name or name != name.strip() for name in names):
+            raise ValueError("managed tools.disabled must be a list of nonempty tool names")
+        return frozenset(names)
+    except (ConfigBackendUnavailable, OSError, ValueError, YAMLError):
         return None
-    return _message(tool_name, "only tools that act solely through the agent's sandbox are enabled")
+
+
+def _tool_refusal(tool_name: str, disabled: Optional[frozenset[str]]) -> Optional[str]:
+    if _hosted() and tool_name not in HOSTED_TOOL_ALLOWLIST:
+        return _message(tool_name, "only tools that act solely through the agent's sandbox are enabled")
+    if disabled is None:
+        return f"Tool execution is unavailable. {MANAGED_TOOL_POLICY_ERROR}"
+    if tool_name in disabled:
+        return "This tool is disabled by managed deployment policy."
+    return None
+
+
+def tool_refusal(tool_name: str) -> Optional[str]:
+    """Authorize dispatch against current deployment policy."""
+    return _tool_refusal(tool_name, managed_disabled_tools())
+
+
+def discovery_tool_refusal(disabled=CURRENT_MANAGED_POLICY) -> Callable[[str], Optional[str]]:
+    """Use one managed policy for a discovery operation and every catalog it builds."""
+    if disabled is CURRENT_MANAGED_POLICY:
+        disabled = managed_disabled_tools()
+    return lambda name: _tool_refusal(name, disabled)
+
+
+def discovery_tool_filter(disabled=CURRENT_MANAGED_POLICY) -> Callable[[str], bool]:
+    refusal = discovery_tool_refusal(disabled)
+    return lambda name: refusal(name) is None
 
 
 def _home_elsewhere() -> bool:

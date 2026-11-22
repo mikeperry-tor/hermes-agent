@@ -646,9 +646,10 @@ class ToolRegistry:
     def _toolset_entries(self, toolset: str, scope: Optional[str]) -> list[ToolEntry]:
         return self._grouped(self._merged_tools(scope).values()).get(toolset, [])
 
-    def _snapshot_entries(self) -> list[ToolEntry]:
+    def _snapshot_entries(self, *, permitted: Optional[Callable[[str], bool]] = None) -> list[ToolEntry]:
         with self._lock:
-            return list(self._merged_tools(None).values())
+            entries = list(self._merged_tools(None).values())
+        return entries if permitted is None else [entry for entry in entries if permitted(entry.name)]
 
     def _toolset_has_exposable_tools(self, toolset: str, entries: list[ToolEntry]) -> bool:
         """True when at least one tool in *toolset* would be exposed. Mirrors
@@ -1077,8 +1078,8 @@ class ToolRegistry:
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
         results normalized, every exception returned as ``{"error": ...}``."""
-        from tools.hosted_tool_policy import hosted_tool_refusal
-        if refusal := hosted_tool_refusal(name):  # deny-by-default in a hosted scope, before any handler
+        from tools.hosted_tool_policy import tool_refusal
+        if refusal := tool_refusal(name):  # deny-by-default in a hosted scope, before any handler
             return tool_error(refusal)
         entry = self.get_entry(name, scope=scope)
         if not entry:
@@ -1165,15 +1166,15 @@ class ToolRegistry:
         return self._toolset_has_exposable_tools(toolset, self._snapshot_entries())
 
 
-    def check_toolset_requirements(self) -> dict[str, bool]:
-        entries = self._snapshot_entries()
+    def check_toolset_requirements(self, *, permitted: Optional[Callable[[str], bool]] = None) -> dict[str, bool]:
+        entries = self._snapshot_entries(permitted=permitted)
         return {
             toolset: self._toolset_has_exposable_tools(toolset, entries)
             for toolset in sorted(self._grouped(entries))}
 
-    def get_available_toolsets(self) -> dict[str, dict]:
+    def get_available_toolsets(self, *, permitted=None) -> dict[str, dict]:
         """Return toolset metadata for UI display."""
-        entries = self._snapshot_entries()
+        entries = self._snapshot_entries(permitted=permitted)
         toolsets: dict[str, dict] = {}
         for toolset, members in self._grouped(entries).items():
             toolsets[toolset] = {
@@ -1197,10 +1198,10 @@ class ToolRegistry:
                 "tools": [entry.name for entry in members]}
         return result
 
-    def check_tool_availability(self, quiet: bool = False):
+    def check_tool_availability(self, quiet: bool = False, *, permitted: Optional[Callable[[str], bool]] = None):
         """Return (available_toolsets, unavailable_info) like the old function."""
         available, unavailable = [], []
-        entries = self._snapshot_entries()
+        entries = self._snapshot_entries(permitted=permitted)
         groups = self._grouped(entries)
         for ts in sorted(groups):
             if self._toolset_has_exposable_tools(ts, entries):
