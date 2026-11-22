@@ -252,7 +252,7 @@ def test_marked_home_keeps_the_hosts_own_layers(root, tmp_path, monkeypatch):
     managed = tmp_path / "managed"
     managed.mkdir()
     (managed / ".env").write_text("MHE_MANAGED_KEY=from-managed\n", encoding="utf-8")
-    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda **_kwargs: managed)
     monkeypatch.setenv("MHE_PROJECT_KEY", "from-shell")
     bridged: list[Path] = []
     monkeypatch.setattr(env_loader, "_reapply_terminal_config_bridge", bridged.append)

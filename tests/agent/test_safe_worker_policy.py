@@ -48,7 +48,7 @@ def test_worker_config_is_frozen_before_any_profile_read(tmp_path, mode):
         from hermes_cli import env_loader
         callbacks = []
         env_loader._apply_managed_env = lambda **kw: callbacks.append("managed")
-        env_loader._apply_external_secret_sources = lambda home: callbacks.append("secrets")
+        env_loader._apply_external_secret_sources = lambda home, **kw: callbacks.append("secrets")
         env_loader._reapply_terminal_config_bridge = lambda home: callbacks.append("terminal")
         env_loader.load_hermes_dotenv()
         cfg = load_config()

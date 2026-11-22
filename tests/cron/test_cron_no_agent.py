@@ -413,7 +413,7 @@ def test_a_routed_profile_script_keeps_administrator_managed_values_over_its_own
     (managed / ".env").write_text("ORG_POLICY_FLAG=managed-value\n", encoding="utf-8")
     monkeypatch.setattr(env_loader, "_LOADED_DOTENV_KEYS", set(env_loader._LOADED_DOTENV_KEYS))
     monkeypatch.setattr(env_loader, "_MANAGED_DOTENV_KEYS", set())
-    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda **_kwargs: managed)
     monkeypatch.setenv("ORG_POLICY_FLAG", "placeholder")
     env_loader._apply_managed_env()  # the boot-time managed load
     assert os.environ["ORG_POLICY_FLAG"] == "managed-value"

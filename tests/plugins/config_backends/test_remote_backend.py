@@ -1611,7 +1611,6 @@ def test_bootstrap_keeps_the_dotenv_precedence(tmp_path, monkeypatch):
     home.mkdir()
     managed = tmp_path / "managed"
     managed.mkdir()
-    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
     monkeypatch.setenv("CC_A", "process")
     monkeypatch.setenv("CC_D", "process")
     monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
@@ -1621,12 +1620,13 @@ def test_bootstrap_keeps_the_dotenv_precedence(tmp_path, monkeypatch):
     project.write_text("CC_B=project\nCC_C=project\nCC_D=project\n")
     (managed / ".env").write_text("CC_C=managed\n")
 
-    env = _bootstrap_env(home, project)
+    env, _ = _bootstrap_env(home, project, managed_path=managed / ".env")
 
     assert (env["CC_A"], env["CC_B"], env["CC_C"], env["CC_D"], env["CC_E"]) == (
         "user", "user", "managed", "process", "op")
     (home / ".env").unlink()  # no user .env: the project layer overrides the process
-    assert _bootstrap_env(home, project)["CC_D"] == "project"
+    env, _ = _bootstrap_env(home, project, managed_path=managed / ".env")
+    assert env["CC_D"] == "project"
 
 
 def test_tui_section_and_prompt_setters_refuse_locked_edits(plane, monkeypatch):
