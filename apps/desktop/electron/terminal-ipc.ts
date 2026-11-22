@@ -390,13 +390,13 @@ export function registerTerminalIpc({
 
     const remoteCommand =
       remoteState?.remotePlatform === 'Windows'
-        ? buildWindowsInteractiveCommand(String(payload?.cwd || '').trim())
+        ? buildWindowsInteractiveCommand(String(payload?.cwd || ''))
         : undefined
 
     const ptyProcess = remote
       ? nodePty.spawn(
           sshBinary(),
-          buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || '').trim(), undefined, remoteCommand),
+          buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || ''), undefined, remoteCommand),
           { cols, cwd: app.getPath('home'), env: terminalShellEnv(), name: 'xterm-256color', rows }
         )
       : nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
