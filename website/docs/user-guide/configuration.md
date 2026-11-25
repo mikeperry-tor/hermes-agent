@@ -562,6 +562,10 @@ TERMINAL_SSH_USER=ubuntu
 
 **How it works:** Connects at init time with `BatchMode=yes` and `StrictHostKeyChecking=accept-new`, then captures the remote login shell's environment once into a snapshot file. Every command runs as a fresh `bash -c` that sources that snapshot, `cd`s to the tracked working directory, and runs your command.
 
+`read_file` uses Python 3 on the POSIX SSH target to resolve paths, check
+protected files, and read the inspected file. If the file tool cannot inspect
+a path, verify that `python3` is on the SSH user's `PATH` and can access it.
+
 **Skill / config env passthrough:** variables a skill declares in `required_environment_variables`, or that you list under `terminal.env_passthrough`, are forwarded with OpenSSH `SendEnv` — the names go on the `ssh` command line and the values travel in the client's environment, never in the remote command text. The remote `sshd` must accept them; add to `/etc/ssh/sshd_config` on the server and reload sshd:
 
 ```

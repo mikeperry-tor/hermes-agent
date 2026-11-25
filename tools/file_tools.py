@@ -8,6 +8,7 @@ staleness state).
 
 import base64
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -23,23 +24,24 @@ from agent.tool_result_classification import GUARDRAIL_REFUSAL_KEY
 from tools.binary_extensions import has_binary_extension
 from tools.skill_provenance import is_background_review
 from tools.file_operations import (
-    ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
+    ShellFileOperations, SSHPathState, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
 from tools import file_state
 from hermes_platform.host import facts
 from agent.redact import _is_secret_file_arg, redact_sensitive_text
 from tools.file_tools_paths import (
-    _expand_tilde, _hosted_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_entry_for_task,
-    _resolve_path_for_task)
+    _anchor_ssh_path, _expand_tilde, _hosted_tilde, _path_resolution_warning, _resolve_base_dir,
+    _resolve_entry_for_task, _resolve_path_for_task, uses_ssh_for_task)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
     _is_internal_file_tool_content, _stale_overwrite_blocker, _stale_write_refusal)
 from tools.file_tools_read_tracking import (
-    _bump_consecutive, _cap_read_tracker_data, _carry_full_write_baselines, _check_file_staleness,
+    SSHFileKey, _bump_consecutive, _cap_read_tracker_data, _carry_full_write_baselines, _check_file_staleness,
     _check_not_found_cache, _dedup_lookup, _known_full_content_sha256,
     _file_metadata, _file_version, _on_host,
-    _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _note_read_served, _patch_failure_lock,
+    _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _note_read_served,
+    _patch_failure_lock, _programmatic_read,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
 
@@ -419,7 +421,9 @@ def _special_file_kind(path) -> str | None:
                 "a special (non-regular) file")
 
 
-def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | None:
+def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str,
+                             file_ops: ShellFileOperations, *, ssh_state: SSHPathState | None = None,
+                             ssh_secret_file: bool = False) -> str | None:
     """Render an extractable document (.docx/.xlsx/.pdf/...) as paginated text.
 
     Returns the JSON result, a tool_error for an actionable extraction failure
@@ -441,7 +445,6 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
     wrapped, wrap_width = False, 0
     if not (archived or is_extractable_document(str(_resolved))):
         return None
-    file_ops = _get_file_ops(task_id)
     if archived and (sync_manager := getattr(getattr(file_ops, "env", None), "_sync_manager", None)) is not None:
         # A file-synced sandbox gets new cache files on its next (rate-limited) sync; an archive written since
         # must be there before this read, or the model is told it expired.
@@ -449,11 +452,21 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
             sync_manager.sync(force=True)
         except Exception:  # health: allow BLE001 -- a failed push leaves the read to report what the sandbox has
             logger.debug("Archive sync before read failed for %s", path, exc_info=True)
+        else:
+            if ssh_state is not None:
+                refreshed = _validated_ssh_read_state(file_ops, ssh_state.path)
+                if refreshed.path != ssh_state.path:
+                    return tool_error(f"'{path}' changed during archive sync. Read it again.")
+                ssh_state = refreshed
+                ssh_secret_file |= refreshed.secret_file
     # The sandbox resolves its own ``~`` and cwd: _resolved expanded them with the host's, so a sandbox
     # gets the path as the model gave it, like the ordinary read in read_file_tool.
     byte_path = str(_resolved) if _file_ops_uses_host_paths(file_ops) else path
     try:
-        binary = file_ops.read_file_bytes(byte_path, max_bytes=MAX_DOCUMENT_BYTES)
+        if ssh_state is None:
+            binary = file_ops.read_file_bytes(byte_path, max_bytes=MAX_DOCUMENT_BYTES)
+        else:
+            binary = file_ops.read_inspected_ssh_bytes(ssh_state, MAX_DOCUMENT_BYTES)
         if binary.error or binary.base64_content is None:
             raise ExtractionError(binary.error or "Document bytes unavailable")
         document_bytes = base64.b64decode(binary.base64_content, validate=True)
@@ -505,11 +518,11 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
         rendered = result_dict["content"]
         result_dict["content"] = redact_sensitive_text(
             rendered, file_read=True,
-            secret_file=_is_secret_file_arg(str(_resolved)))
+            secret_file=ssh_secret_file if ssh_state is not None else _is_secret_file_arg(str(_resolved)))
         redacted = result_dict["content"] != rendered
     else:
         redacted = False
-    if (offset == 1 and not result_dict["truncated"] and not redacted
+    if (ssh_state is None and offset == 1 and not result_dict["truncated"] and not redacted
             and not truncated_lines and not result_dict.get("truncated_lines")):
         # The whole document was shown, so a text-authorable format (.ipynb)
         # may later be overwritten by write_file; the binary-container guard
@@ -556,7 +569,8 @@ def _dedup_stub_or_block(task_data: dict, dedup_key: tuple, path: str) -> str:
 def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_str: str,
                             offset: int, limit: int, dedup_key: tuple, *, partial: bool,
                             redacted: bool = False, end_line: int | None = None,
-                            total_lines=None, version_before=None, snapshot=None) -> int:
+                            total_lines=None, version_before=None, snapshot=None,
+                            ssh_key: SSHFileKey | None = None, repeat_version=None) -> int:
     """Bookkeeping after a real (non-stub) read; returns the consecutive-read count.
 
     Per-task tracker under the lock (stub counter, history, consecutive count,
@@ -569,14 +583,22 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     background-review read-mark (a FULL read of a skill file counts like
     skill_view so a follow-up skill_manage(patch) is accepted).
     """
-    version = (snapshot or _file_version(resolved_str)) if version_before is not None else None
-    stable = version is not None and version[:-1] == version_before == _file_metadata(resolved_str)
+    if ssh_key is not None:
+        if _programmatic_read.get():
+            return 1
+        version = snapshot
+        stable = version is not None and version[:-1] == version_before
+    else:
+        version = (snapshot or _file_version(resolved_str)) if version_before is not None else None
+        stable = version is not None and version[:-1] == version_before == _file_metadata(resolved_str)
+    tracked_path = ssh_key or resolved_str
     complete = False
     with _read_tracker_lock:
-        count, dedup = _note_read_served(task_data, dedup_key, path, offset, limit)
+        count, dedup = _note_read_served(task_data, dedup_key, path, offset, limit,
+                                        version=repeat_version)
         task_data["read_history"].add((path, offset, limit))
         try:
-            if _on_host(resolved_str):
+            if ssh_key is None and _on_host(resolved_str):
                 _mtime_now = os.path.getmtime(resolved_str)
                 task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
         except OSError:
@@ -586,23 +608,25 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
             dedup[dedup_key] = version_before
             # A narrower view does not undo knowledge of these same bytes. Do
             # not revive a baseline after a partial read of a different version.
-            complete = baselines.get(resolved_str) == version
+            complete = baselines.get(tracked_path) == version
             if not complete:
                 complete = not partial
                 if partial and end_line is not None:
                     complete, redacted = _note_read_coverage(
-                        task_data, resolved_str, version, offset, end_line, total_lines, redacted)
+                        task_data, tracked_path, version, offset, end_line, total_lines, redacted)
                 complete = complete and not redacted
             if complete:
-                baselines[resolved_str] = version
-                task_data.setdefault("blind_patches", {}).pop(resolved_str, None)
+                baselines[tracked_path] = version
+                task_data.setdefault("blind_patches", {}).pop(tracked_path, None)
         if not complete:
-            baselines.pop(resolved_str, None)
+            baselines.pop(tracked_path, None)
         if not stable or count >= 4:
             task_data["dedup"].pop(dedup_key, None)
             task_data["dedup_generation_reads"].discard(dedup_key)
         _cap_read_tracker_data(task_data)
 
+    if ssh_key is not None:
+        return count
     try:
         file_state.record_read(task_id, resolved_str, partial=not complete)
     except Exception:
@@ -635,6 +659,94 @@ def _read_device_base(path: str, task_id: str) -> tuple[Path | PurePosixPath | N
         return None, True
 
 
+def _validated_ssh_read_state(file_ops: ShellFileOperations, input_path: str) -> SSHPathState:
+    if error := get_read_block_error(input_path, ssh_path=True):
+        raise ValueError(error)
+    inspected = file_ops.inspect_ssh_path(input_path, protect_read=True)
+    if inspected.read_denied:
+        raise ValueError(f"Cannot read '{input_path}' because it targets a protected Hermes file on SSH.")
+    if error := get_read_block_error(inspected.path, ssh_path=True):
+        raise ValueError(error)
+    if inspected.kind == "special":
+        raise ValueError(f"Cannot read '{input_path}': this is a special file in the SSH filesystem.")
+    return inspected
+
+
+def _get_ssh_file_ops(task_id: str) -> ShellFileOperations:
+    from tools.environments.ssh import SSHEnvironment
+
+    file_ops = _get_file_ops(task_id)
+    if not isinstance(file_ops.env, SSHEnvironment):
+        raise ValueError("The file tools could not confirm the selected SSH backend.")
+    return file_ops
+
+
+def _prepare_read_target(path: str, task_id: str):
+    if uses_ssh_for_task(task_id):
+        file_ops = _get_ssh_file_ops(task_id)
+        input_path = _anchor_ssh_path(path, task_id)
+        inspected = _validated_ssh_read_state(file_ops, input_path)
+        variant = None
+        if inspected.kind == "absent" and (variant := file_ops._unicode_variant_match(inspected.path, ssh_path=True)):
+            inspected = _validated_ssh_read_state(file_ops, variant)
+        resolved = PurePosixPath(inspected.path)
+        secret_file = (
+            inspected.secret_file
+            or _is_secret_file_arg(str(resolved), ssh_path=True)
+            or _is_secret_file_arg(input_path, ssh_path=True)
+        )
+        return file_ops, resolved, inspected, variant, secret_file, None
+
+    device_base, unanchored = _read_device_base(path, task_id)
+    if _is_blocked_device(path, base_dir=device_base):
+        return None, None, None, None, False, tool_error(
+            f"Cannot read '{path}': this is a device file that would "
+            "block or produce infinite output.")
+
+    resolved = PurePosixPath(path) if unanchored else _resolve_path_for_task(path, task_id)
+    file_ops = _get_file_ops(task_id)
+    # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
+    if _file_ops_uses_host_paths(file_ops):
+        kind = _special_file_kind(resolved)
+        if kind is not None:
+            return None, None, None, None, False, json.dumps({
+                "success": False,
+                "note": (
+                    f"'{path}' is {kind}, not a regular file — reading "
+                    "it would block indefinitely, so no read was "
+                    "attempted. Use terminal utilities if you need to "
+                    "interact with it.")})
+    # Hermes internal denylist (prompt injection via catalog metadata,
+    # credential stores). Runs BEFORE document extraction so a
+    # protected SQLite store (state.db) cannot be read through the extractor. Pass the RESOLVED path: the denylist's own
+    # resolve() uses the process cwd and would miss a relative "auth.json".
+    if block_error := get_read_block_error(str(resolved)):
+        return None, None, None, None, False, tool_error(block_error)
+    return file_ops, resolved, None, None, False, None
+
+
+def _execute_read_file(file_ops: ShellFileOperations, path: str, resolved_str: str,
+                       offset: int, limit: int, inspected: SSHPathState | None,
+                       variant: str | None):
+    if inspected is None:
+        return file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)
+    result = file_ops.read_inspected_ssh_file(inspected, offset, limit)
+    if result.similar_files:
+        safe_suggestions = []
+        for candidate in result.similar_files:
+            try:
+                suggested = _validated_ssh_read_state(file_ops, candidate)
+            except ValueError:
+                continue
+            if suggested.kind != "absent":
+                safe_suggestions.append(candidate)
+        result.similar_files = safe_suggestions
+    if variant and result.error is None:
+        variant_hint = f"Resolved '{path}' to the Unicode-equivalent SSH path '{variant}'."
+        result.hint = f"{variant_hint} {result.hint}" if result.hint else variant_hint
+    return result
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers.
 
@@ -654,36 +766,12 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if nt_err:
             return tool_error(nt_err)
         path = _hosted_tilde(path, task_id)  # a hosted read sends the path as given: ``~`` is the sandbox's home
-
-        device_base, unanchored = _read_device_base(path, task_id)
-        if _is_blocked_device(path, base_dir=device_base):
-            return tool_error(
-                f"Cannot read '{path}': this is a device file that would "
-                "block or produce infinite output.")
-
-        _resolved = PurePosixPath(path) if unanchored else _resolve_path_for_task(path, task_id)
-
-        # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
-        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
-            kind = _special_file_kind(_resolved)
-            if kind is not None:
-                return json.dumps({
-                    "success": False,
-                    "note": (
-                        f"'{path}' is {kind}, not a regular file — reading "
-                        "it would block indefinitely, so no read was "
-                        "attempted. Use terminal utilities if you need to "
-                        "interact with it.")})
-
-        # Hermes internal denylist (prompt injection via catalog metadata,
-        # credential stores). Runs BEFORE document extraction so a
-        # protected SQLite store (state.db) cannot be read through the extractor. Pass the RESOLVED path: the denylist's own
-        # resolve() uses the process cwd and would miss a relative "auth.json".
-        block_error = get_read_block_error(str(_resolved))
-        if block_error:
-            return tool_error(block_error)
-
-        extracted = _read_extracted_document(path, _resolved, offset, limit, task_id)
+        file_ops, _resolved, inspected, variant, ssh_secret_file, early = _prepare_read_target(path, task_id)
+        if early is not None:
+            return early
+        ssh_path = inspected is not None
+        extracted = _read_extracted_document(path, _resolved, offset, limit, task_id, file_ops,
+                                            ssh_state=inspected, ssh_secret_file=ssh_secret_file)
         if extracted is not None:
             return extracted
 
@@ -695,23 +783,26 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 "Use vision_analyze for images, or terminal to inspect binary files.")
 
         resolved_str = str(_resolved)
-        cached_not_found = _check_not_found_cache("read", resolved_str, task_id)
+        cached_not_found = None if ssh_path else _check_not_found_cache("read", resolved_str, task_id)
         if cached_not_found is not None:
             return cached_not_found
 
         # Dedup: identical (path, offset, limit) on an unchanged file returns a
         # lightweight stub instead of re-sending the content.
-        dedup_key = (resolved_str, offset, limit)
+        ssh_key = SSHFileKey.for_backend(file_ops.env, resolved_str) if ssh_path else None
+        dedup_key = (ssh_key or resolved_str, offset, limit)
         task_data, cached_version, content_served_in_generation = _dedup_lookup(task_id, dedup_key)
         # Same rule as skill_view: the review fork shares the parent's task_id and its
         # read-before-write guard needs a real read, which the stub path never records (#95976).
-        file_ops = _get_file_ops(task_id)
-        version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
+        if ssh_path:
+            version_before = inspected.metadata
+        else:
+            version_before = _file_metadata(resolved_str) if _file_ops_uses_host_paths(file_ops) else None
         if (cached_version is not None and not is_background_review()
                 and version_before == cached_version and content_served_in_generation):
             return _dedup_stub_or_block(task_data, dedup_key, path)
 
-        result = file_ops.read_file(resolved_str if _file_ops_uses_host_paths(file_ops) else path, offset, limit)
+        result = _execute_read_file(file_ops, path, resolved_str, offset, limit, inspected, variant)
         result_dict = result.to_dict()
 
         # Failed reads cannot establish whole-file knowledge.
@@ -719,9 +810,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         if isinstance(_err, str) and _err.startswith("File not found:"):
             from tools.tool_result_storage import expired_archive_fields
             result_dict.update(expired_archive_fields(path))
-            _record_not_found("read", resolved_str, task_id, json.dumps(result_dict, ensure_ascii=False))
+            if not ssh_path:
+                _record_not_found("read", resolved_str, task_id, json.dumps(result_dict, ensure_ascii=False))
         if _err or result_dict.get("is_binary"):
             return json.dumps(result_dict, ensure_ascii=False)
+        snapshot = getattr(result, "_snapshot", None)
 
         # Char budget on the FORMATTED content (what enters context), BEFORE
         # redaction (skip the regex pass on huge content); truncate gracefully
@@ -735,8 +828,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
         redacted = False
         if result.content:
             unredacted = result.content
-            result.content = redact_sensitive_text(
-                unredacted, file_read=True, secret_file=_is_secret_file_arg(resolved_str))
+            secret_file = ssh_secret_file if ssh_path else _is_secret_file_arg(resolved_str)
+            result.content = redact_sensitive_text(unredacted, file_read=True, secret_file=secret_file)
             redacted = result.content != unredacted
             result_dict["content"] = result.content
 
@@ -762,12 +855,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
             end_line = offset + limit - 1
             if isinstance(total_lines, int) and total_lines > 0:
                 end_line = min(end_line, total_lines)
+        repeat_version = None
+        if ssh_key is not None:
+            repeat_version = snapshot or (version_before, hashlib.sha256((result.content or "").encode()).digest())
         count = _record_successful_read(task_data, task_id, path, resolved_str, offset, limit,
                                         dedup_key, partial=(offset > 1) or bool(result_dict.get("truncated")),
                                         redacted=redacted or bool(result_dict.get("truncated_lines")),
                                         end_line=end_line, total_lines=total_lines,
                                         version_before=version_before,
-                                        snapshot=getattr(result, "_snapshot", None))
+                                        snapshot=snapshot, ssh_key=ssh_key, repeat_version=repeat_version)
         if count >= 4:
             return tool_error(
                 f"BLOCKED: You have read this exact file region {count} times in a row. "
