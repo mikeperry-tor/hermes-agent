@@ -271,10 +271,7 @@ def build_write_denied_paths(home: str) -> set[str]:
     # ``~/.ssh/config`` is deliberately NOT hard-denied: no key bytes, and editing
     # it is routine. It can carry ProxyCommand / Match exec, so it goes through the
     # approval gate instead (_approval_paths_by_key).
-    home_files = (
-        (".ssh", "authorized_keys"), (".ssh", "id_rsa"), (".ssh", "id_ed25519"),
-        *((name,) for name in HOME_CREDENTIAL_FILES),
-    )
+    home_files = (*SSH_KEY_FILES, *HOME_CREDENTIAL_FILES)
     # Secret material under HERMES_HOME, on the active profile, every sibling profile
     # and the global root: overwriting the root .env leaks credentials across every profile that
     # inherits it, and the root Anthropic PKCE store is still read by default /
@@ -291,9 +288,9 @@ def build_write_denied_paths(home: str) -> set[str]:
         *SECRET_CACHE_STORES,
     )
     paths = [
-        *(os.path.join(home, *f) for f in home_files),
+        *(os.path.join(home, *f.split("/")) for f in home_files),
         *(str(base / f) for base in _credential_store_dirs() for f in hermes_files),
-        "/etc/sudoers", "/etc/passwd", "/etc/shadow",
+        *WRITE_PROTECTED_SYSTEM_FILES,
     ]
     return {os.path.realpath(p) for p in paths}
 
@@ -301,6 +298,8 @@ def build_write_denied_paths(home: str) -> set[str]:
 # Home-root single-file credential stores. Also hidden by the dashboard Files API (hermes_cli.web_routers.files);
 # agent/redact.py treats a read of one as secret-bearing output. ``_netrc`` is the name curl and git use on Windows.
 HOME_CREDENTIAL_FILES = (".netrc", "_netrc", ".pgpass", ".npmrc", ".pypirc", ".git-credentials")
+SSH_KEY_FILES = (".ssh/authorized_keys", ".ssh/id_rsa", ".ssh/id_ed25519")
+WRITE_PROTECTED_SYSTEM_FILES = ("/etc/sudoers", "/etc/passwd", "/etc/shadow")
 
 # Home-relative credential directories (POSIX paths). Also dropped from profile exports (hermes_cli.profiles)
 # and hidden by the dashboard Files API.

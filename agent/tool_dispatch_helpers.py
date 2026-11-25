@@ -181,7 +181,8 @@ def _peel_bridge_call(tool_name: str, function_args: dict) -> tuple[str, dict]:
         return tool_name, function_args
 
 
-def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, list[Path], bool] | None:
+def _batch_admission(tool_call, execution_cwd: Optional[Path], *, ssh_paths: bool = False
+                     ) -> tuple[str, list[Path], bool] | None:
     """Classify one call for the planner: ``None`` = sequential barrier, else
     ``(effective_name, scoped_paths, is_writer)`` (empty paths = unscoped parallel-safe)."""
     tool_name = tool_call.function.name
@@ -204,6 +205,8 @@ def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, lis
     if name in _NEVER_PARALLEL_TOOLS or _requires_extended_tool_deadline(name):
         return None
     if name in _PATH_SCOPED_TOOLS:
+        if ssh_paths:
+            return None
         scoped = _extract_parallel_scope_paths(name, args, execution_cwd=execution_cwd)
         return (name, scoped, name in _PATH_SCOPED_WRITERS) if scoped else None
     if name in _PARALLEL_SAFE_TOOLS or name in _PARALLEL_SAFE_BRIDGE_LOOKUPS or _is_mcp_tool_parallel_safe(name):
@@ -211,7 +214,8 @@ def _batch_admission(tool_call, execution_cwd: Optional[Path]) -> tuple[str, lis
     return None
 
 
-def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None) -> list[tuple]:
+def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = None,
+                              task_id: str | None = None) -> list[tuple]:
     """Split a tool-call batch into ordered ``("parallel"|"sequential", calls)`` segments.
 
     Call order is preserved exactly (a later call never crosses an earlier barrier), so
@@ -222,6 +226,14 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     the call starts a NEW run after the conflicting one lands. Runs shorter than two calls
     demote to sequential (it owns the richer inline dispatch); adjacent sequential merge.
     """
+    from tools.file_tools_paths import uses_ssh_for_task
+    from tools.terminal_scope import TerminalPolicyUnavailable
+
+    # Only the executor can tell whether two SSH spellings name the same file.
+    try:
+        ssh_paths = task_id is not None and uses_ssh_for_task(task_id)
+    except TerminalPolicyUnavailable:
+        ssh_paths = True
     segments: list[tuple] = []
     current: list = []
     reserved_paths: list[tuple[Path, bool]] = []  # (canonical_path, is_writer) for the current run
@@ -241,7 +253,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
         current, reserved_paths = [], []
 
     for tool_call in tool_calls:
-        admission = _batch_admission(tool_call, execution_cwd)
+        admission = _batch_admission(tool_call, execution_cwd, ssh_paths=ssh_paths)
         if admission is None:
             _close_parallel()
             _extend_sequential([tool_call])
@@ -364,10 +376,12 @@ def _extract_landed_file_mutation_paths(
     tool_name: str,
     args: dict[str, Any],
     result: Any,
+    *,
+    report_only: bool = False,
 ) -> list[str]:
     """Concrete file paths a successful mutation reports (``files_modified`` /
     ``resolved_path`` in the JSON result), falling back to the declared targets."""
-    targets = _extract_file_mutation_targets(tool_name, args)
+    targets = [] if report_only else _extract_file_mutation_targets(tool_name, args)
     if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
         return targets
     try:
@@ -376,6 +390,10 @@ def _extract_landed_file_mutation_paths(
         return targets
     if not isinstance(data, dict):
         return targets
+    if isinstance(files_landed := data.get("files_landed"), list):
+        return [path for path in files_landed if isinstance(path, str) and path]
+    if report_only:
+        return []
     files = data.get("files_modified")
     landed = [str(p) for p in files if p] if isinstance(files, list) else []
     resolved = data.get("resolved_path")

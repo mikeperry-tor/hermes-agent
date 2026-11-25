@@ -45,6 +45,19 @@ class SSHFileKey(NamedTuple):
         return cls(environment.host, environment.port, environment.user, path)
 
 
+def ssh_write_baseline(task_id: str, key: SSHFileKey) -> tuple | None:
+    with _read_tracker_lock:
+        return (_read_tracker.get(task_id) or {}).get("full_write_baselines", {}).get(key)
+
+
+def record_ssh_write(task_id: str, key: SSHFileKey, version: tuple) -> None:
+    with _read_tracker_lock:
+        task_data = _task_data(task_id)
+        task_data["full_write_baselines"][key] = version
+        task_data["read_coverage"].pop(key, None)
+        _cap_read_tracker_data(task_data)
+
+
 class _PerAgentTracker(dict):
     """``{task_id: ...}`` whose keys carry the bound hosted agent's sandbox key, so two hosted
     agents that reuse a task id never share loop counters, read history or patch failures. With

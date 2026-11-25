@@ -20,7 +20,7 @@ import posixpath
 import secrets
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, NamedTuple, Optional
+from typing import Callable, Dict, NamedTuple, Optional
 from pathlib import Path
 
 from tools.binary_extensions import has_binary_extension
@@ -298,7 +298,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     def _head(self, path: str, nbytes: int) -> ExecuteResult:
         return self._exec(f"head -c {nbytes} {self._escape_shell_arg(path)} 2>/dev/null")
 
-    def _fenced_read(self, body: str, *more: str) -> tuple[Optional[list[str]], Optional[int], ExecuteResult]:
+    def _fenced_read(self, body: str, *more: str, stdin_data: str | None = None
+                     ) -> tuple[Optional[list[str]], Optional[int], ExecuteResult]:
         """Run BODY, then each of MORE, each in its own sentinel-delimited segment; return (those
         segments, BODY's exit status, reply).
 
@@ -317,7 +318,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         rest = "".join(f"{mark}; {cmd}; " for cmd in more)
         # xtrace off first: a traced ``+ echo <sentinel>`` line is an extra separator, and the
         # traces of the transport commands would land inside the payload segments.
-        result = self._exec(f"{{ set +x; }} 2>/dev/null; {mark}; {body}; __hb=$?; {rest}{mark}; echo $__hb")
+        kwargs = {"stdin_data": stdin_data} if stdin_data is not None else {}
+        result = self._exec(f"{{ set +x; }} 2>/dev/null; {mark}; {body}; __hb=$?; {rest}{mark}; echo $__hb", **kwargs)
         segments = _split_segments(result.stdout or "", sentinel)
         if len(segments) != len(more) + 3:
             return None, None, result
@@ -771,9 +773,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         encoded = base64.b64encode(snippet.encode("utf-8")).decode("ascii")
         return f"{py} -c \"import base64; exec(base64.b64decode('{encoded}').decode())\""
 
-    def _framed_ssh_file_output(self, snippet: str) -> str:
+    def _framed_ssh_file_output(self, snippet: str, *, stdin_data: str | None = None) -> str:
         command = self._python_snippet_command(snippet, "python3 -I")
-        segments, status, reply = self._fenced_read(command)
+        kwargs = {"stdin_data": stdin_data} if stdin_data is not None else {}
+        segments, status, reply = self._fenced_read(command, **kwargs)
         if reply.exit_code != 0 or status != 0 or not segments:
             raise ValueError("The SSH file operation could not verify the inspected path.")
         return segments[0]
@@ -1720,7 +1723,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     # --- PATCH (replace mode) -----------------------------------------------
 
     def _no_match_result(self, path: str, content: str, old_string: str,
-                         new_string: str, match_count: int, error: Optional[str]) -> PatchResult:
+                         new_string: str, match_count: int, error: Optional[str],
+                         *, hint_text: Callable[[str], str] | None = None) -> PatchResult:
         """PatchResult for a failed fuzzy match. Already-applied detection first: the
         most common production failure is a re-send of an edit that already landed,
         and a success-shaped no-op stops the model burning turns on re-reads.
@@ -1733,6 +1737,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                     f"File already contains the target text — the edit "
                     f"appears to be already applied to {path}. No write "
                     "performed; do not re-send this patch."))
+        if hint_text is not None and hint_text(content) != content:
+            return PatchResult(error="The SSH edit could not find a unique match in text that contains redactions.")
         err_msg = error or f"Could not find match for old_string in {path}"
         try:
             err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
@@ -1761,10 +1767,29 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 "The patch did not persist. Re-read the file and try again."))
         return None
 
+    def _prepare_patch_replace(self, path: str, raw_content: str, old_string: str, new_string: str,
+                               replace_all: bool, *, hint_text: Callable[[str], str] | None = None
+                               ) -> tuple[str | None, PatchResult]:
+        content, _ = _strip_bom(raw_content)
+        from tools.fuzzy_match import boundary_note, fuzzy_find_and_replace
+        correction_notes = []
+        new_content, match_count, strategy, error = fuzzy_find_and_replace(
+            content, old_string, new_string, replace_all, correction_notes=correction_notes)
+        if error or match_count == 0:
+            return None, self._no_match_result(
+                path, content, old_string, new_string, match_count, error, hint_text=hint_text)
+        # Models send bare-LF old/new strings; normalize the substituted region to
+        # the file's ending so CRLF files stay consistent.
+        file_ending = _detect_line_ending(content)
+        if file_ending:
+            new_content = _normalize_line_endings(new_content, file_ending)
+        return new_content, PatchResult(
+            success=True, files_modified=[path],
+            note="\n".join(n for n in (*correction_notes, boundary_note([strategy])) if n) or None)
+
     def patch_replace(self, path: str, old_string: str, new_string: str,
                       replace_all: bool = False) -> PatchResult:
-        """Replace text in a file using fuzzy matching (``old_string`` must be
-        unique unless ``replace_all``). Returns a PatchResult with diff + lint."""
+        """Replace text in a file using fuzzy matching."""
         path = self._expand_path(path)
         denied = get_write_denied_error(path)
         if denied:
@@ -1772,38 +1797,21 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         data, failed = self._read_exact_bytes(path)
         if data is None:
             return PatchResult(error=failed.cwd_error or f"Failed to read file: {path}")
-        # Every line the replacement does not touch is written back, so read the exact bytes;
-        # surrogateescape lets write_file restore any byte UTF-8 cannot decode (#79178).
-        # Match and diff on BOM-stripped content (a phantom U+FEFF defeats an exact
-        # first-line match); the raw read becomes write_file's pre_content.
         raw_content = data.decode("utf-8", "surrogateescape")
-        content, _ = _strip_bom(raw_content)
-
-        from tools.fuzzy_match import boundary_note, fuzzy_find_and_replace
-        correction_notes = []
-        new_content, match_count, strategy, error = fuzzy_find_and_replace(
-            content, old_string, new_string, replace_all, correction_notes=correction_notes)
-        if error or match_count == 0:
-            return self._no_match_result(path, content, old_string, new_string, match_count, error)
-        # Models send bare-LF old/new strings; normalize the substituted region to
-        # the file's ending so CRLF files stay consistent.
-        file_ending = _detect_line_ending(content)
-        if file_ending:
-            new_content = _normalize_line_endings(new_content, file_ending)
+        new_content, result = self._prepare_patch_replace(path, raw_content, old_string, new_string, replace_all)
+        if new_content is None:
+            return result
         write_result = self.write_file(path, new_content, pre_content=raw_content)
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
         verify_error = self._verify_patch_persisted(path, new_content)
         if verify_error is not None:
             return verify_error
-        # write_file already ran the lint delta on these bytes (pre = the raw read).
-        return PatchResult(
-            success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
-            lint=write_result.lint,
-            note="\n".join(n for n in (*correction_notes, boundary_note([strategy])) if n) or None,
-            # From the internal write_file call, whose baseline was the pre-patch content.
-            lsp_diagnostics=write_result.lsp_diagnostics,
-            _writes=[(path, hashlib.sha256(data).hexdigest(), write_result._content_sha256)])
+        result.lint = write_result.lint
+        result.diff = self._unified_diff(_strip_bom(raw_content)[0], new_content, path)
+        result.lsp_diagnostics = write_result.lsp_diagnostics
+        result._writes = [(path, hashlib.sha256(data).hexdigest(), write_result._content_sha256)]
+        return result
 
     def patch_v4a(self, patch_content: str) -> PatchResult:
         """Apply a V4A format patch (``*** Begin Patch`` / ``*** Update File:`` /

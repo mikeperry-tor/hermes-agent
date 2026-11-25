@@ -64,6 +64,16 @@ def _flatten_ids(segments):
 
 
 class TestPlanToolBatchSegments:
+    def test_ssh_file_tools_run_in_order_without_host_path_resolution(self, monkeypatch):
+        monkeypatch.setattr("tools.file_tools_paths.uses_ssh_for_task", lambda _: True)
+        canonical_path = MagicMock(side_effect=AssertionError("SSH paths belong to the executor"))
+        monkeypatch.setattr("agent.tool_dispatch_helpers._canonical_path", canonical_path)
+        calls = [_tc("write_file", '{"path":"/workspace/a"}'),
+                 _tc("read_file", '{"path":"/workspace/alias"}'),
+                 _tc("search_files", '{"pattern":"content"}')]
+        assert _plan_tool_batch_segments(calls, task_id="executor") == [("sequential", calls)]
+        canonical_path.assert_not_called()
+
     def test_all_safe_batch_is_single_parallel_segment(self):
         calls = [_tc("web_search"), _tc("read_file", '{"path":"a.py"}'), _tc("web_extract")]
         segments = _plan_tool_batch_segments(calls)

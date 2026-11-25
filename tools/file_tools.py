@@ -45,6 +45,8 @@ from tools.file_tools_read_tracking import (
     _patch_failure_lock, _programmatic_read,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
+from tools.file_tools_ssh_writes import patch_ssh_replace, write_ssh_file
+from tools.file_tools_ssh_patch import patch_ssh_v4a
 
 logger = logging.getLogger(__name__)
 
@@ -995,6 +997,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     (unadvertised in the schema; the mirror rejection error teaches it — the
     cross-PROFILE guard it was named for no longer exists).
     """
+    if uses_ssh_for_task(task_id):
+        if error := get_nt_namespace_error(path, verb="Write"):
+            return tool_error(error)
+        try:
+            requested = _anchor_ssh_path(_hosted_tilde(path, task_id), task_id)
+            return write_ssh_file(_get_ssh_file_ops(task_id), requested, content, task_id)
+        except (OSError, ValueError) as exc:
+            return tool_error(str(exc))
+
     # write_file checks the binary-document guard before the mirror guard.
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
@@ -1091,6 +1102,26 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
+    if mode == "replace" and uses_ssh_for_task(task_id):
+        if not path or old_string is None or new_string is None:
+            return tool_error("path, old_string, and new_string are required.")
+        if error := get_nt_namespace_error(path, verb="Write"):
+            return tool_error(error)
+        try:
+            requested = _anchor_ssh_path(_hosted_tilde(path, task_id), task_id)
+            return patch_ssh_replace(_get_ssh_file_ops(task_id), requested, old_string,
+                                     new_string, replace_all, task_id)
+        except (OSError, ValueError) as exc:
+            return tool_error(str(exc))
+
+    if mode == "patch" and uses_ssh_for_task(task_id):
+        if not patch:
+            return tool_error("patch content required")
+        try:
+            return patch_ssh_v4a(_get_ssh_file_ops(task_id), patch, task_id)
+        except (OSError, ValueError) as exc:
+            return tool_error(str(exc))
+
     _paths_to_check = [path] if path else []
     _content_write_paths = list(_paths_to_check)
     _entry_paths: list[str] = []

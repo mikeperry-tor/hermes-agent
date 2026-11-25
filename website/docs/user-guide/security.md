@@ -472,6 +472,16 @@ With the SSH backend, `read_file` and `search_files` check paths on the
 executor. Search excludes protected paths before returning or counting matches,
 including when a symlink points to a protected file. Multiline SSH content
 search requires ripgrep on the executor.
+
+SSH edits check the requested and resolved paths before reading or changing a
+file. Replacing an existing file with `write_file` requires a full, unredacted
+read of its current contents or a successful write by the same task. Targeted
+patches read the selected file version before applying changes. A V4A move
+checks both entries and refuses to replace a destination that appeared after
+validation. SSH moves require a filesystem that supports an atomic move without
+replacing the destination. Move relative symlinks within their current
+directory. Split a patch that changes an intermediate symlink
+before using it. SSH patches hide source excerpts when redaction applies.
 :::
 
 ## User Authorization (Gateway)

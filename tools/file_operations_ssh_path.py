@@ -114,10 +114,7 @@ def policy_key(path):
     text = str(path)
     return text.casefold() if sys.platform in ('darwin', 'win32') else text
 
-def read_policy(input_path, resolved, protected):
-    if not protected:
-        return False, False
-    files, directories = protected
+def hermes_homes(targets):
     user_home = Path.home()
     suffix = os.environ.get('HERMES_DATA_DIR_SUFFIX', '')
     homes = {user_home / '.hermes', user_home / ('.hermes' + suffix)}
@@ -127,7 +124,6 @@ def read_policy(input_path, resolved, protected):
         homes.add(home)
         if home.parent.name == 'profiles':
             homes.add(home.parent.parent)
-    targets = {Path(input_path), Path(resolved)}
     for base in tuple(homes):
         profiles = base / 'profiles'
         try:
@@ -140,9 +136,16 @@ def read_policy(input_path, resolved, protected):
             for target in targets:
                 if policy_key(target).startswith(prefix):
                     homes.add(Path(*target.parts[:len(parent.parts) + 1]))
+    return homes
+
+def read_policy(input_path, resolved, protected):
+    if not protected:
+        return False, False
+    files, directories = protected
+    targets = {Path(input_path), Path(resolved)}
     target_keys = {policy_key(target) for target in targets}
     secret = False
-    for home in homes:
+    for home in hermes_homes(targets):
         if not home.is_dir():
             continue
         dirs = {home, policy_path(home)}

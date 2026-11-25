@@ -138,8 +138,8 @@ class TurnExplainersMixin:
             ssh = uses_ssh_for_task(task_id or "default")
         except TerminalPolicyUnavailable:
             return
-        if landed:
-            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
+        if landed or ssh:
+            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result, report_only=not landed)
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(landed_paths)
