@@ -26,6 +26,7 @@ from tools.skill_provenance import is_background_review
 from tools.file_operations import (
     ShellFileOperations, SSHPathState, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
+from tools.file_operations_search import split_search_roots
 from tools import file_state
 from hermes_platform.host import facts
 from agent.redact import _is_secret_file_arg, redact_sensitive_text
@@ -1186,7 +1187,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
 
         # Pagination args (and order) are part of the key so paging through truncated
         # results doesn't trip the repeated-search guard.
-        search_key = ("search", pattern, target, str(path), file_glob or "", limit, offset, order)
+        search_key = ("search", pattern, target, str(path), file_glob or "",
+                      limit, offset, order, output_mode, context)
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
                 "last_key": None, "consecutive": 0, "read_history": set()})
@@ -1207,6 +1209,18 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if nt_err:
             return tool_error(nt_err)
         path = _hosted_tilde(path, task_id)
+        if uses_ssh_for_task(task_id):
+            alternatives = tuple(_anchor_ssh_path(part, task_id) for part in split_search_roots(path)
+                                 if not get_nt_namespace_error(part, verb="Search"))
+            result = _get_ssh_file_ops(task_id).search_ssh(
+                pattern, _anchor_ssh_path(path, task_id), target, file_glob,
+                limit, offset, output_mode, context, order, alternatives)
+            result_dict = result.to_dict()
+            if count >= 3:
+                result_dict["_warning"] = f"You have run this exact search {count} times consecutively."
+            if result.truncated:
+                result_dict["_hint"] = f"Results truncated. Use offset={offset + limit} to see more."
+            return json.dumps(result_dict)
         try:
             resolved_search_path = str(_resolve_path_for_task(path, task_id))
         except (OSError, ValueError, RuntimeError) as exc:
