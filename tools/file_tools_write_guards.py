@@ -12,6 +12,7 @@ whole-file overwrite of content this task never saw or that changed since.
 
 import fnmatch
 import os
+import posixpath
 import unicodedata
 from pathlib import Path
 
@@ -199,6 +200,27 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
     return enabled, [str(p) for p in extra if p]
 
 
+def _protected_instruction_basename(base: str, extra_patterns: list[str]) -> bool:
+    keys = (base.lower(), _name_key(base))
+    return keys[1] in _PROTECTED_INSTRUCTION_BASENAMES or any(
+        fnmatch.fnmatch(key, norm(pattern)) for pattern in extra_patterns
+        for key, norm in zip(keys, (str.lower, _name_key)))
+
+
+def _check_ssh_instruction_write(paths: list[str], task_id: str) -> str | None:
+    enabled, extra_patterns = _protected_instruction_config()
+    if not enabled:
+        return None
+    reasons = []
+    for path in dict.fromkeys(posixpath.normpath(path) for path in paths):
+        base = posixpath.basename(path)
+        if _protected_instruction_basename(base, extra_patterns):
+            reasons.append(base)
+        elif posixpath.basename(posixpath.dirname(path)).casefold() == ".hermes":
+            reasons.append(path)
+    return _request_protected_instruction_approval(list(dict.fromkeys(reasons)), task_id) if reasons else None
+
+
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
                                   extra_patterns: list[str] | None = None) -> str | None:
@@ -236,10 +258,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         base = os.path.basename(candidate)
         # Folded keys only ADD matches: the lowercase pair stays, since a glob's ``?`` or ``[ß]`` matches the
         # one-char ``ß`` but not its folded ``ss``.
-        keys = (base.lower(), _name_key(base))
-        if keys[1] in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(key, norm(pattern)) for pattern in extra_patterns
-                for key, norm in zip(keys, (str.lower, _name_key))):
+        if _protected_instruction_basename(base, extra_patterns):
             return base
 
     # The ``.hermes`` component rule below targets PROJECT-LOCAL config, and the home
@@ -388,7 +407,10 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
             return denied  # ~/.bashrc -> ~/.ssh/authorized_keys: refuse before prompting
         if key := write_approval_key(resolved):
             by_key.setdefault(key, []).append(p)
+    return _request_write_approvals(by_key)
 
+
+def _request_write_approvals(by_key: dict[str, list[str]]) -> str | None:
     for pattern_key, targets in by_key.items():
         noun, why_gated = _APPROVAL_WRITE_CLASSES[pattern_key]
         display_targets = ", ".join(dict.fromkeys(targets))
@@ -497,7 +519,8 @@ def _target_regular_file_state(filepath: str, task_id: str = "default") -> str:
     return "unavailable"
 
 
-def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
+def _check_binary_document_write(filepath: str, task_id: str = "default", *,
+                                 inspected: str | None = None) -> str | None:
     """Reject text-tool writes that would corrupt a binary document (read_file showed
     EXTRACTED text, so the model may write it back). Opaque document formats and
     SQLite sidecars (-wal/-shm/-journal) are always rejected; .pdf and every other
@@ -536,7 +559,7 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
     # syntax is text-authorable and text fixtures named ``*.db`` exist.
     pdf = is_pdf_path(filepath)
     if pdf or has_binary_extension(filepath):
-        state = _target_regular_file_state(filepath, task_id)
+        state = inspected or _target_regular_file_state(filepath, task_id)
         if state == "exists":
             if pdf:
                 return (
