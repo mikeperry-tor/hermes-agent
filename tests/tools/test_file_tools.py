@@ -8,6 +8,8 @@ import base64
 import hashlib
 import json
 import logging
+import os
+import shutil
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -125,6 +127,83 @@ def test_ssh_read_refuses_backend_mismatch_before_inspection(monkeypatch):
 
     assert "could not confirm the selected SSH backend" in result["error"]
     ops.inspect_ssh_path.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_search_uses_executor_policy_before_paging(tmp_path, monkeypatch, capsys):
+    from tools import file_tools
+    from tools.file_operations import ShellFileOperations
+
+    home = tmp_path / "executor-home"
+    profile = home / ".hermes"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    project = tmp_path / "project :42: results"
+    project.mkdir()
+    visible = project / "part:31-\nresult "
+    visible.write_text("before\nmatch :13: row\nafter\n")
+    (project / "empty").write_text("nothing found\n")
+    denied = project / "hidden-result"
+    denied.write_text("match credential bytes\n")
+    (profile / "auth.json").symlink_to(denied)
+    secret = project / ".netrc"
+    secret.write_text('password: "shortsecret"\n')
+    (project / "config-alias").symlink_to(secret)
+
+    def executor_response(snippet):
+        exec(compile(snippet, "<ssh executor>", "exec"), {})
+        return capsys.readouterr().out
+
+    ops = ShellFileOperations(_ssh_test_environment())
+    monkeypatch.setattr(ops, "_framed_ssh_file_output", executor_response)
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    def search(path=project, pattern="match", **kwargs):
+        return json.loads(file_tools.search_tool(pattern, path=str(path),
+                                                task_id="ssh-search-policy", **kwargs))
+
+    count = search(output_mode="count", limit=1)
+    assert count["counts"] == {str(visible): 1}
+    assert count["total_count"] == 1 and not count.get("truncated")
+    assert "error" in search(path=denied)
+    assert search(context=1)["matches"] == [
+        {"path": str(visible), "line": 1, "content": "before"},
+        {"path": str(visible), "line": 2, "content": "match :13: row"},
+        {"path": str(visible), "line": 3, "content": "after"},
+    ]
+    redacted = search(path=project / "config-alias", pattern="password")
+    assert redacted["matches"] and "shortsecret" not in str(redacted)
+
+    first_root = project / "first"
+    second_root = project / "second"
+    first_root.write_text("root match\n")
+    second_root.write_text("root match\n")
+    multi = search(path=f"{first_root}, {denied}, {second_root}", pattern="root match",
+                   output_mode="count", limit=1, offset=1)
+    assert multi["counts"] == {str(second_root): 1}
+    assert multi["total_count"] == 2 and str(denied) not in str(multi)
+    literal = project / "first, second"
+    literal.write_text("literal comma path\n")
+    assert search(path=literal, pattern="literal comma")["matches"][0]["path"] == str(literal)
+
+    if shutil.which("rg"):
+        recent = project / "recent-directory"
+        recent.mkdir()
+        for file in project.iterdir():
+            if file.is_file() and not file.is_symlink():
+                os.utime(file, (1000, 1000))
+        os.utime(recent, (2000, 2000))
+        first = search(pattern="*", target="files", limit=1)
+        assert first["files"] == [str(recent)] and first["truncated"]
+        literal = search(path=visible, file_glob="*.no-match")
+        assert literal["matches"][0]["path"] == str(visible)
+        assert search(path=visible, file_glob="[z-a]")["error"]
+        binary = project / "binary"
+        binary.write_bytes(b"filler\n" * 2000 + b"\0\nbefore\nmatch :13: row\n")
+        multiline = search(pattern=r"before\nmatch", output_mode="count")
+        assert multiline["counts"] == {str(visible): 1}
 
 
 def test_ssh_missing_read_suggestions_use_executor_protection(monkeypatch):

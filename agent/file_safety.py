@@ -549,6 +549,12 @@ def ssh_read_protected_entries() -> tuple[tuple[str, ...], tuple[str, ...]]:
     return files, ("skills/.hub", *(entry[0] for entry in _READ_DENIED_DIRS))
 
 
+def ssh_read_path_rules() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Path-only rules used while walking search candidates on an SSH executor."""
+    return (tuple(sorted(_BLOCKED_PROJECT_ENV_BASENAMES)),
+            tuple(sorted(_BLOCKED_DEVICE_PATHS)), _BLOCKED_PROC_SUFFIXES)
+
+
 def get_read_block_error(path: str, *, ssh_path: bool = False) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
 
