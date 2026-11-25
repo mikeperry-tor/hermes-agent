@@ -283,17 +283,17 @@ def _ssh_remote_home(task_id: str) -> str | None:
     return home if isinstance(home, str) and posixpath.isabs(home) else None
 
 
-def _resolve_ssh_path(filepath: str, task_id: str) -> PurePosixPath:
-    """Resolve *filepath* in the SSH target's namespace, never via the Hermes host
-    (``Path.resolve()`` and ``get_subprocess_home()`` both name host directories).
-
-    ``~`` becomes the remote home once the live environment has detected it, so the
-    result is absolute and the write guards see the real target. Before that it stays
-    ``~``-prefixed for the remote shell; ``~user`` always does.
-    """
-    text = str(filepath or "").strip()
+def _anchor_ssh_path(filepath: str, task_id: str) -> str:
+    """Join the SSH session directory without interpreting symlinks or parent components."""
+    text = str(filepath or "")
     if not text.startswith("~") and not posixpath.isabs(text):
         text = posixpath.join(_ssh_remote_anchor(task_id), text)
+    return text
+
+
+def _resolve_ssh_path(filepath: str, task_id: str) -> PurePosixPath:
+    """Normalize a path for display without examining the SSH filesystem."""
+    text = _anchor_ssh_path(str(filepath or "").strip(), task_id)
     if text == "~" or text.startswith("~/"):
         home = _ssh_remote_home(task_id)
         text = home + text[1:] if home else text

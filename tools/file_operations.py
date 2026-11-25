@@ -16,14 +16,15 @@ import difflib
 import hashlib
 import json
 import logging
+import posixpath
 import secrets
 import time
 from abc import ABC, abstractmethod
-from typing import Optional, Dict
+from typing import Dict, NamedTuple, Optional
 from pathlib import Path
 
 from tools.binary_extensions import has_binary_extension
-from agent.file_safety import get_write_denied_error
+from agent.file_safety import get_write_denied_error, ssh_read_protected_entries
 from tools.file_operations_common import (
     ExecuteResult, PatchResult, ReadResult, SearchResult, WriteResult,
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
@@ -34,6 +35,188 @@ from tools.file_operations_search import SearchMixin
 from tools import file_operations_native as _native_io
 
 logger = logging.getLogger(__name__)
+
+
+class SSHPathState(NamedTuple):
+    path: str
+    kind: str
+    metadata: tuple[int, int, int, int, int] | None
+    read_denied: bool = False
+    secret_file: bool = False
+
+
+_SSH_PATH_STATE = """\
+import base64, hashlib, json, os, stat, sys
+from contextlib import contextmanager
+from pathlib import Path
+
+def resolve(path):
+    missing = []
+    while True:
+        try:
+            resolved = str(Path(path).resolve(strict=True))
+        except FileNotFoundError:
+            # Refuse a dangling link before classifying a path as missing.
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                parent, name = os.path.split(path)
+                if name in ('', '.', '..') or parent == path:
+                    raise
+                missing.append(name)
+                path = parent
+                continue
+            raise
+        if missing and not stat.S_ISDIR(os.stat(resolved).st_mode):
+            raise NotADirectoryError(resolved)
+        return os.path.join(resolved, *reversed(missing)), bool(missing)
+
+def metadata(st):
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+@contextmanager
+def open_regular(path, expected):
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or metadata(opened) != expected:
+            raise OSError('file changed before opening')
+        yield stream
+        if metadata(os.fstat(stream.fileno())) != expected or metadata(os.lstat(path)) != expected:
+            raise OSError('file changed while open')
+
+def observe(path):
+    try:
+        original = os.stat(path)
+    except FileNotFoundError:
+        original = None
+    resolved, missing = resolve(path)
+    if missing:
+        if original is not None:
+            raise OSError('path disappeared during resolution')
+        return resolved, 'absent', None
+    st = os.lstat(resolved)
+    info = metadata(st)
+    if original is None or metadata(original) != info:
+        raise OSError('path changed during resolution')
+    if stat.S_ISDIR(st.st_mode):
+        return resolved, 'directory', info
+    if stat.S_ISLNK(st.st_mode):
+        raise OSError('path changed during resolution')
+    if not stat.S_ISREG(st.st_mode):
+        return resolved, 'special', info
+    return resolved, 'regular', info
+
+def read_page(path, expected, offset, end, clamp):
+    hasher = hashlib.sha256()
+    sample = b''
+    pending = b''
+    page = []
+    line = 1
+    last_byte = b''
+    size = 0
+    with open_regular(path, expected) as stream:
+        for chunk in iter(lambda: stream.read(1048576), b''):
+            if not sample:
+                sample = chunk[:1000]
+            hasher.update(chunk)
+            size += len(chunk)
+            last_byte = chunk[-1:]
+            if line > end:
+                line += chunk.count(b'\\n')
+                continue
+            pieces = chunk.split(b'\\n')
+            for head in pieces[:-1]:
+                if offset <= line <= end:
+                    page.append((pending + head)[:clamp] + b'\\n')
+                pending = b''
+                line += 1
+            if offset <= line <= end:
+                pending += pieces[-1][:clamp - len(pending)]
+        if last_byte not in (b'', b'\\n') and offset <= line <= end:
+            page.append(pending + b'\\n')
+    return (base64.b64encode(b''.join(page)).decode('ascii'),
+            base64.b64encode(sample).decode('ascii'), line - 1,
+            last_byte == b'\\n', size, hasher.hexdigest())
+
+def read_bytes(path, expected, maximum):
+    with open_regular(path, expected) as stream:
+        return base64.b64encode(stream.read(maximum + 1)).decode('ascii')
+
+def directory_names(path, limit):
+    try:
+        return sorted(name for name in os.listdir(path) if not name.startswith('.'))[:limit]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+def policy_path(path):
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path
+
+def policy_key(path):
+    text = str(path)
+    return text.casefold() if sys.platform in ('darwin', 'win32') else text
+
+def read_policy(input_path, resolved, protected):
+    if not protected:
+        return False, False
+    files, directories = protected
+    user_home = Path.home()
+    suffix = os.environ.get('HERMES_DATA_DIR_SUFFIX', '')
+    homes = {user_home / '.hermes', user_home / ('.hermes' + suffix)}
+    configured = os.environ.get('HERMES_HOME', '').strip()
+    if configured:
+        home = Path(os.path.expandvars(configured)).expanduser().absolute()
+        homes.add(home)
+        if home.parent.name == 'profiles':
+            homes.add(home.parent.parent)
+    targets = {Path(input_path), Path(resolved)}
+    for base in tuple(homes):
+        profiles = base / 'profiles'
+        try:
+            homes.update(entry for entry in profiles.iterdir() if entry.is_dir())
+        except OSError:
+            pass
+        # An execute-only profiles directory can contain a readable named profile.
+        for parent in {profiles, policy_path(profiles)}:
+            prefix = policy_key(parent).rstrip(os.sep) + os.sep
+            for target in targets:
+                if policy_key(target).startswith(prefix):
+                    homes.add(Path(*target.parts[:len(parent.parts) + 1]))
+    target_keys = {policy_key(target) for target in targets}
+    secret = False
+    for home in homes:
+        if not home.is_dir():
+            continue
+        dirs = {home, policy_path(home)}
+        for target in targets:
+            name = target.name.lower()
+            is_config = name == 'config.yaml' or name.startswith(('config.yaml.good.', 'config.yaml.corrupt.'))
+            parents = {policy_key(parent) for parent in target.parents}
+            if is_config and any(policy_key(folder) in parents for folder in dirs):
+                secret = True
+        for name in files:
+            entry = home / name
+            if policy_key(entry) in target_keys or policy_key(policy_path(entry)) in target_keys:
+                return True, secret
+        for name in directories:
+            entry = home / name
+            blocked = {policy_key(entry), policy_key(policy_path(entry))}
+            if any(target == folder or target.startswith(folder.rstrip(os.sep) + os.sep)
+                   for folder in blocked for target in target_keys):
+                return True, secret
+    return False, secret
+
+def inspect_path(path, protected):
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        raise ValueError('SSH path does not resolve to an absolute path')
+    state = observe(path)
+    return (*state, *read_policy(path, state[0], protected))
+
+"""
 
 # Controller home; SearchMixin reads it (tests monkeypatch it here).
 _HOME = str(Path.home())
@@ -752,23 +935,111 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         (``b'\\xfe\\xff'``) embedded in a ``-c`` program. ``exec`` decodes
         and runs it unchanged.
         """
+        return self._exec(self._python_snippet_command(snippet, py or self._python_interpreter_cmd()))
+
+    @staticmethod
+    def _python_snippet_command(snippet: str, py: str) -> str:
         encoded = base64.b64encode(snippet.encode("utf-8")).decode("ascii")
-        if py is None:
-            py = self._python_interpreter_cmd()
-        return self._exec(
-            f"{py} -c \"import base64; exec(base64.b64decode('{encoded}').decode())\""
+        return f"{py} -c \"import base64; exec(base64.b64decode('{encoded}').decode())\""
+
+    def _framed_ssh_file_output(self, snippet: str) -> str:
+        command = self._python_snippet_command(snippet, "python3 -I")
+        segments, status, reply = self._fenced_read(command)
+        if reply.exit_code != 0 or status != 0 or not segments:
+            raise ValueError("The SSH file operation could not verify the inspected path.")
+        return segments[0]
+
+    def _ssh_file_value(self, expression: str):
+        return json.loads(self._framed_ssh_file_output(_SSH_PATH_STATE + f"\nprint(json.dumps({expression}))\n"))
+
+    def inspect_ssh_path(self, path: str, *, protect_read: bool = False) -> SSHPathState:
+        """Resolve and inspect a path in the SSH filesystem before a guarded operation."""
+        if not path.startswith(("/", "~")):
+            raise ValueError("Cannot determine the absolute SSH path. Use an absolute executor path.")
+        protected = ssh_read_protected_entries() if protect_read else None
+        try:
+            resolved, kind, info, denied, secret = self._ssh_file_value(f"inspect_path({path!r}, {protected!r})")
+            if not isinstance(resolved, str) or not resolved.startswith("/"):
+                raise ValueError
+            if type(denied) is not bool or type(secret) is not bool:
+                raise ValueError
+            if kind == "absent" and info is None:
+                return SSHPathState(resolved, kind, None, denied, secret)
+            if kind not in ("regular", "directory", "special"):
+                raise ValueError
+            if not isinstance(info, list) or len(info) != 5 or any(type(value) is not int for value in info):
+                raise ValueError
+            return SSHPathState(resolved, kind, tuple(info), denied, secret)
+        except (TypeError, ValueError):
+            raise ValueError(f"Could not inspect SSH file state for {path!r}.") from None
+
+    def read_inspected_ssh_file(self, state: SSHPathState, offset: int, limit: int) -> ReadResult:
+        """Read the page and digest from the same executor file descriptor."""
+        if state.kind == "absent":
+            return self._suggest_similar_files(state.path, ssh_path=True)
+        if state.kind != "regular" or state.metadata is None:
+            return self._not_regular_error(state.path)
+        file_size = state.metadata[2]
+        if self._is_image(state.path):
+            return self._image_redirect_result(file_size)
+        from tools.tool_output_limits import get_max_line_length
+
+        end = offset + limit - 1
+        clamp = 4 * get_max_line_length() + 1
+        try:
+            encoded, encoded_sample, total, newline, observed_size, digest = self._ssh_file_value(
+                f"read_page({state.path!r}, {state.metadata!r}, {offset}, {end}, {clamp})")
+            if type(total) is not int or type(newline) is not bool or type(observed_size) is not int:
+                raise ValueError
+            page_bytes = base64.b64decode(encoded, validate=True)
+            page = page_bytes.decode("utf-8", "replace")
+            sample = base64.b64decode(encoded_sample, validate=True)
+            checksum = bytes.fromhex(digest)
+            if len(checksum) != hashlib.sha256().digest_size:
+                raise ValueError
+        except (TypeError, ValueError):
+            return ReadResult(error=f"Could not read the inspected SSH file {state.path!r}. Read it again before editing.")
+        if self._is_likely_binary_bytes(sample):
+            text = self._try_read_utf16(state.path, offset, limit, observed_size, ssh_state=state)
+            if text is not None:
+                return text
+            return ReadResult(is_binary=True, file_size=observed_size,
+                              error=f"Cannot read binary file '{state.path}' ({describe_binary_file(sample, observed_size)}).")
+        display = _strip_terminal_fence_leaks(page)
+        read_result = self._assemble_read_result(
+            display, offset=offset, end_line=end, total_lines=total,
+            file_size=observed_size, file_ends_with_newline=newline,
         )
+        if observed_size == file_size and display == page and page.encode("utf-8") == page_bytes:
+            read_result._snapshot = (*state.metadata, checksum)
+        return read_result
+
+    def read_inspected_ssh_bytes(self, state: SSHPathState, maximum: int) -> ReadResult:
+        """Supply a document extractor with bytes from the inspected regular file."""
+        if state.kind != "regular" or state.metadata is None:
+            return self._not_regular_error(state.path)
+        file_size = state.metadata[2]
+        if file_size > maximum:
+            return ReadResult(error=f"SSH file exceeds the {maximum}-byte read limit.", file_size=file_size)
+        try:
+            encoded = self._ssh_file_value(f"read_bytes({state.path!r}, {state.metadata!r}, {maximum})")
+            if not isinstance(encoded, str):
+                raise ValueError
+        except (TypeError, ValueError):
+            return ReadResult(error=f"Could not read the inspected SSH file {state.path!r}.")
+        return ReadResult(base64_content=encoded, file_size=file_size, is_binary=True)
 
     def _try_read_utf16(self, path: str, offset: int, limit: int,
-                        file_size: int) -> Optional[ReadResult]:
+                        file_size: int, *, ssh_state: SSHPathState | None = None) -> Optional[ReadResult]:
         """Read ``path`` as UTF-16 transcoded to UTF-8, or None (caller falls back
         to the binary-file error). Skips known-binary extensions and files over
         10 MiB. ``path`` must already be expanded."""
         if has_binary_extension(path) or file_size > self._UTF16_MAX_BYTES:
             return None
-        snippet = (
+        opener = f"open_regular(p, {ssh_state.metadata!r})" if ssh_state else "open(p, 'rb')"
+        snippet = (_SSH_PATH_STATE if ssh_state else "") + (
             "import sys, json, os\n"
-            f"p = {json.dumps(path)}\n"
+            f"p = {path!r}\n"
             f"offset = {int(offset)}\n"
             f"limit = {int(limit)}\n"
             f"MAX = {self._UTF16_MAX_BYTES}\n"
@@ -777,7 +1048,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             "    size = os.path.getsize(p)\n"
             "    if size > MAX:\n"
             "        print('HERMES_UTF16:NO'); sys.exit(0)\n"
-            "    with open(p, 'rb') as f:\n"
+            f"    with {opener} as f:\n"
             "        data = f.read()\n"
             "    sample = data[:SAMPLE]\n"
             "    enc = None\n"
@@ -809,13 +1080,20 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             "    print('HERMES_UTF16:NO'); sys.exit(0)\n"
         )
 
-        result = self._exec_python_snippet(snippet)
-        if result.exit_code != 0 and "python3" in (result.stdout or ""):
-            result = self._exec_python_snippet(snippet, py="python")
-
-        stdout = _strip_terminal_fence_leaks(result.stdout or "")
+        if ssh_state:
+            try:
+                stdout = self._framed_ssh_file_output(snippet)
+            except ValueError:
+                return None
+        else:
+            result = self._exec_python_snippet(snippet)
+            if result.exit_code != 0 and "python3" in (result.stdout or ""):
+                result = self._exec_python_snippet(snippet, py="python")
+            if result.exit_code != 0:
+                return None
+            stdout = _strip_terminal_fence_leaks(result.stdout or "")
         marker = stdout.find("HERMES_UTF16:OK")
-        if result.exit_code != 0 or marker < 0:
+        if marker < 0:
             return None
         payload = stdout[marker + len("HERMES_UTF16:OK"):].strip()
         try:
@@ -1198,60 +1476,78 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             file_size=file_size, truncated=truncated, hint=hint,
             truncated_lines=True if truncated_lines else None)
 
-    def _unicode_variant_match(self, path: str) -> Optional[str]:
+    def _unicode_variant_match(self, path: str, *, ssh_path: bool = False) -> Optional[str]:
         """On-disk spelling of a file whose name is unicode-equivalent to ``path``
         (``filename_match_key``). Returns the entry only when EXACTLY one
         matches — several candidates = homoglyph collision, guessing would read the
         wrong file."""
-        dir_path = os.path.dirname(path) or "."
-        filename = os.path.basename(path)
+        path_module = posixpath if ssh_path else os.path
+        dir_path = path_module.dirname(path) or "."
+        filename = path_module.basename(path)
         if not filename:
             return None
         target = filename_match_key(filename)
-        ls_result = self._exec(f"ls -1 -- {self._escape_shell_arg(dir_path)} 2>/dev/null")
-        if ls_result.exit_code != 0 or not ls_result.stdout.strip():
-            return None
+        if ssh_path:
+            entries = self._ssh_directory_names(dir_path)
+        else:
+            ls_result = self._exec(f"ls -1 -- {self._escape_shell_arg(dir_path)} 2>/dev/null")
+            if ls_result.exit_code != 0 or not ls_result.stdout.strip():
+                return None
+            entries = _strip_terminal_fence_leaks(ls_result.stdout).splitlines()
         candidates = [
-            entry for entry in _strip_terminal_fence_leaks(ls_result.stdout).splitlines()
+            entry for entry in entries
             if entry and entry != filename and filename_match_key(entry) == target]
         if len(candidates) == 1:
-            return os.path.join(dir_path, candidates[0]) if dir_path != "." or "/" in path else candidates[0]
+            return path_module.join(dir_path, candidates[0]) if dir_path != "." or "/" in path else candidates[0]
         return None
 
-    def _suggest_similar_files(self, path: str) -> ReadResult:
+    def _ssh_directory_names(self, path: str, limit: int | None = None) -> list[str]:
+        try:
+            entries = self._ssh_file_value(f"directory_names({path!r}, {limit!r})")
+        except ValueError:
+            return []
+        if not isinstance(entries, list) or not all(isinstance(name, str) and "/" not in name for name in entries):
+            return []
+        return entries
+
+    def _suggest_similar_files(self, path: str, *, ssh_path: bool = False) -> ReadResult:
         """"File not found" result listing up to 5 similar names from the same directory."""
-        dir_path = os.path.dirname(path) or "."
-        filename = os.path.basename(path)
-        basename_no_ext = os.path.splitext(filename)[0].lower()
-        ext = os.path.splitext(filename)[1].lower()
+        path_module = posixpath if ssh_path else os.path
+        dir_path = path_module.dirname(path) or "."
+        filename = path_module.basename(path)
+        basename_no_ext = path_module.splitext(filename)[0].lower()
+        ext = path_module.splitext(filename)[1].lower()
         lower_name = filename.lower()
-        ls_result = self._exec(f"ls -1 -- {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50")
+        if ssh_path:
+            entries = self._ssh_directory_names(dir_path, 50)
+        else:
+            ls_result = self._exec(f"ls -1 -- {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50")
+            entries = ls_result.stdout.strip().split('\n') if ls_result.exit_code == 0 else []
         scored: list = []  # (score, filepath) — higher is better
-        if ls_result.exit_code == 0 and ls_result.stdout.strip():
-            for f in ls_result.stdout.strip().split('\n'):
-                if not f:
-                    continue
-                lf = f.lower()
-                score = 0
-                if lf == lower_name:
-                    score = 100
-                elif os.path.splitext(f)[0].lower() == basename_no_ext:  # config.yml vs config.yaml
-                    score = 90
-                elif lf.startswith(lower_name) or lower_name.startswith(lf):
-                    score = 70
-                elif lower_name in lf:
-                    score = 60
-                elif lf in lower_name and len(lf) > 2:
-                    score = 40
-                elif ext and os.path.splitext(f)[1].lower() == ext:
-                    common = set(lower_name) & set(lf)
-                    if len(common) >= max(len(lower_name), len(lf)) * 0.4:
-                        score = 30
-                # Near-miss spelling (AGENT.md -> AGENTS.md) the substring checks miss.
-                if score == 0 and difflib.SequenceMatcher(None, lower_name, lf).ratio() >= 0.8:
-                    score = 50
-                if score > 0:
-                    scored.append((score, os.path.join(dir_path, f)))
+        for f in entries:
+            if not f:
+                continue
+            lf = f.lower()
+            score = 0
+            if lf == lower_name:
+                score = 100
+            elif path_module.splitext(f)[0].lower() == basename_no_ext:  # config.yml vs config.yaml
+                score = 90
+            elif lf.startswith(lower_name) or lower_name.startswith(lf):
+                score = 70
+            elif lower_name in lf:
+                score = 60
+            elif lf in lower_name and len(lf) > 2:
+                score = 40
+            elif ext and path_module.splitext(f)[1].lower() == ext:
+                common = set(lower_name) & set(lf)
+                if len(common) >= max(len(lower_name), len(lf)) * 0.4:
+                    score = 30
+            # Near-miss spelling (AGENT.md -> AGENTS.md) the substring checks miss.
+            if score == 0 and difflib.SequenceMatcher(None, lower_name, lf).ratio() >= 0.8:
+                score = 50
+            if score > 0:
+                scored.append((score, path_module.join(dir_path, f)))
         scored.sort(key=lambda x: -x[0])
         return ReadResult(error=f"File not found: {path}", not_found=True,
                           similar_files=[fp for _, fp in scored[:5]])

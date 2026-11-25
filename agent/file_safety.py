@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import posixpath
 import re
 import socket
 from contextlib import suppress
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from hermes_cli.home_data_layout import (
@@ -519,12 +520,12 @@ _BLOCKED_PROC_SUFFIXES = (
     "/mem", "/auxv", "/pagemap")
 
 
-def is_blocked_device_path(path: str) -> bool:
+def is_blocked_device_path(path: str, *, ssh_path: bool = False) -> bool:
     """True for a concrete device/fd/proc path that can hang reads or leak process state.
 
     Path-only (no I/O, no ``~`` expansion): callers pass an expanded path. POSIX spellings only, so
     after ``normpath`` a Windows path never matches."""
-    normalized = os.path.normpath(path)
+    normalized = (posixpath if ssh_path else os.path).normpath(path)
     if normalized in _BLOCKED_DEVICE_PATHS:
         return True
     return normalized.startswith("/proc/") and normalized.endswith(_BLOCKED_PROC_SUFFIXES)
@@ -542,7 +543,13 @@ def is_project_env_basename(name: str) -> bool:
     return name.casefold() in _BLOCKED_PROJECT_ENV_BASENAMES
 
 
-def get_read_block_error(path: str) -> Optional[str]:
+def ssh_read_protected_entries() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Paths relative to a Hermes home that the SSH executor resolves for its read guard."""
+    files = tuple(name.replace("\\", "/") for name in _CREDENTIAL_FILE_NAMES)
+    return files, ("skills/.hub", *(entry[0] for entry in _READ_DENIED_DIRS))
+
+
+def get_read_block_error(path: str, *, ssh_path: bool = False) -> Optional[str]:
     """Return an error message when a read targets a denied Hermes path.
 
     Blocked: device/fd/proc files that hang reads or leak process state (``/dev/zero``,
@@ -554,6 +561,8 @@ def get_read_block_error(path: str) -> Optional[str]:
     Callers that resolve relative paths against a non-process cwd (e.g.
     ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
     the process cwd, so a relative ``"auth.json"`` would miss the denylist.
+    SSH callers check the absolute input and backend-resolved target separately.
+    The executor resolves its own Hermes credential stores.
     """
     # NT/device-namespace check runs on the RAW string, before resolve():
     # on Windows, resolving \??\UNC\host\share (or \\?\UNC\, GLOBALROOT)
@@ -563,13 +572,20 @@ def get_read_block_error(path: str) -> Optional[str]:
     nt_error = get_nt_namespace_error(path, verb="Read")
     if nt_error:
         return nt_error
-    from tools.environments.sandbox_scope import sandbox_lexical_path
-    local = local_drive_spelling(path)
-    lexical = sandbox_lexical_path(local)
-    resolved = Path(lexical) if lexical is not None else Path(local).expanduser().resolve()
-    hermes_dirs = _credential_store_dirs()
+    if ssh_path:
+        resolved = PurePosixPath(path)
+        hermes_dirs = ()
+        device_path = path
+    else:
+        from tools.environments.sandbox_scope import sandbox_lexical_path
+        local = local_drive_spelling(path)
+        lexical = sandbox_lexical_path(local)
+        resolved = Path(lexical) if lexical is not None else Path(local).expanduser().resolve()
+        hermes_dirs = _credential_store_dirs()
+        device_path = os.path.expanduser(local)
     reason = None
-    if is_blocked_device_path(os.path.expanduser(local)) or is_blocked_device_path(str(resolved)):
+    if (is_blocked_device_path(device_path, ssh_path=ssh_path)
+            or is_blocked_device_path(str(resolved), ssh_path=ssh_path)):
         reason = (
             "is a device or process file: reading it can hang or leak process state "
             "(environment, command line, memory layout)." + _DID_SUFFIX
