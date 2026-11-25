@@ -422,7 +422,7 @@ def _request_write_approvals(by_key: dict[str, list[str]]) -> str | None:
 
         try:
             import tools.approval as _approval
-        except Exception:
+        except ImportError:
             return blocked.format(why=_APPROVAL_UNAVAILABLE)
 
         result = _approval._run_approval_gate(
