@@ -113,6 +113,15 @@ def container_backend_for_task(task_id: str = "default") -> str | None:
     return _terminal_env_type_for_task(task_id) if _uses_container_paths(task_id) else None
 
 
+def uses_ssh_for_task(task_id: str) -> bool:
+    """Check the scoped SSH policy before consulting the task's live backend."""
+    from tools.terminal_scope import get_terminal_scope, terminal_env
+
+    if get_terminal_scope() is not None and terminal_env("TERMINAL_ENV").lower() == "ssh":
+        return True
+    return _terminal_env_type_for_task(task_id) == "ssh"
+
+
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
     """Normalize path syntax without following host symlinks: container paths are
     meaningful inside the sandbox, and a host-side ``/workspace`` symlink must not rewrite them."""

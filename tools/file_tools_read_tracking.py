@@ -502,7 +502,10 @@ def _mark_verification_stale(task_id: str, resolved_paths: list[str],
     try:
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import mark_workspace_edited
+        from tools.file_tools_paths import uses_ssh_for_task
 
+        if uses_ssh_for_task(task_id):
+            return
         parents = [str(Path(p).parent) for p in paths]
         cwd = (next((c for c in parents if project_facts_for(c)), None)
                or _authoritative_workspace_root(task_id) or parents[0])

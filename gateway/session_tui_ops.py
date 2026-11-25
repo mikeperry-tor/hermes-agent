@@ -250,15 +250,23 @@ async def rollback(connection, ref, params, *, kind):
         cwd = policy.cwd
         if not mgr.enabled and kind in ('list', 'session_diff'):
             return {'enabled': False, 'checkpoints': []} if kind == 'list' else {'enabled': False}
-        # Host checkpoints are not a container-backed session's tree (main's _container_checkpoint_refusal),
-        # classified under the session's frozen terminal policy, not the owner's ambient one.
+        # Classify with the session's frozen terminal policy before looking up a checkpoint.
         from agent.runtime_scope import bind_terminal_policy
         from tools.terminal_scope import reset_terminal_scope
         token = bind_terminal_policy(terminal, profile_home=authority.profile_id)
         try:
             refusal = mgr.unsupported_backend_reason(task_id)
+            workspace_refusal = mgr.unsupported_backend_reason(task_id, allow_host_listing=True) if refusal else None
         finally:
             reset_terminal_scope(token)
+        if kind == 'list' and workspace_refusal:
+            if params.get('undo_since') is not None:
+                return {'enabled': True, 'checkpoints': []}
+            raise AuthorityRefusal('unsupported_terminal_backend', field='checkpoint', detail=workspace_refusal)
+        if workspace_refusal and kind == 'diff':
+            raise AuthorityRefusal('unsupported_terminal_backend', field='checkpoint', detail=workspace_refusal)
+        if workspace_refusal and kind == 'restore':
+            return {'success': False, 'error': workspace_refusal}
         if kind == 'list':
             # The TUI renders ``message``; the manager calls it ``reason``.
             listed = {'enabled': True, 'checkpoints': [
@@ -298,9 +306,9 @@ async def rollback(connection, ref, params, *, kind):
             if rendered := render_diff(raw, 80):
                 payload['rendered'] = rendered
             return payload
+        # Main's whole-tree /rollback keeps the user's hand-edits unless ``--all`` (``all``) says otherwise.
         if refusal:
             return {'success': False, 'error': refusal}
-        # Main's whole-tree /rollback keeps the user's hand-edits unless ``--all`` (``all``) says otherwise.
         from agent.checkpoints.undo_hint import checkpoint_taken_at
         taken.append(checkpoint_taken_at(cwd, target))
         return mgr.restore(cwd, target, file_path=file_path or None,

@@ -749,16 +749,14 @@ class GatewaySlashCommandsMixin(
         mgr = self._checkpoint_manager(event.source)
         if mgr is None:
             return t("gateway.rollback.not_enabled")
-        cwd = self._terminal_cwd()
         # --all / --force: classic full restore, overwriting user edits too.
         tokens = event.get_command_args().strip().split()
         restore_all = any(tok.lower() in ("--all", "--force") for tok in tokens)
         arg = " ".join(tok for tok in tokens if tok.lower() not in ("--all", "--force"))
-        # Container-backed session: host checkpoints belong to another tree, so a restore is
-        # refused; the bare listing stays visible, prefixed with the reason (same as the CLI).
         reason = mgr.unsupported_backend_reason()
-        if reason and arg:
+        if reason and (arg or mgr.unsupported_backend_reason(allow_host_listing=True)):
             return reason
+        cwd = self._terminal_cwd()
         checkpoints = mgr.list_checkpoints(cwd)
         if not arg:
             listing = format_checkpoint_list(checkpoints, cwd)
@@ -791,7 +789,6 @@ class GatewaySlashCommandsMixin(
         mode = "working"
         for low in args:
             mode = _DIFF_MODE_BY_ARG.get(low, mode)
-        cwd = self._terminal_cwd()
         if mode == "session":
             # Cumulative checkpoint-baseline diff.
             mgr = self._checkpoint_manager(event.source)
@@ -799,10 +796,10 @@ class GatewaySlashCommandsMixin(
                 return t("gateway.diff.not_enabled")
             if reason := mgr.unsupported_backend_reason():  # host baseline is not this session's tree
                 return reason
-            result = await asyncio.to_thread(mgr.session_diff, cwd)
+            result = await asyncio.to_thread(mgr.session_diff, self._terminal_cwd())
         else:
             from tools.working_diff import collect_working_diff
-            result = await asyncio.to_thread(collect_working_diff, cwd, mode)
+            result = await asyncio.to_thread(collect_working_diff, self._terminal_cwd(), mode)
         if not result.get("success"):
             return t("gateway.diff.failed", error=result.get("error") or t("gateway.diff.err_default"))
         return self._render_diff_result(result, stat_only)

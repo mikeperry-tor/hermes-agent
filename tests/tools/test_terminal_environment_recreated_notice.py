@@ -53,3 +53,21 @@ def test_docker_recovery_marks_pending_and_finalizer_warns(monkeypatch):
     clean = json.loads(finalize_foreground_result(
         result={"output": "hi", "returncode": 0}, **common))
     assert "environment_recreated" not in clean
+
+
+def test_ssh_result_omits_host_verification_evidence(monkeypatch):
+    from types import SimpleNamespace
+    from tools import terminal_tool_result
+
+    def fail_lookup(*args):
+        raise AssertionError("SSH commands must not verify a local project")
+
+    monkeypatch.setattr(terminal_tool_result, "_verification_evidence", fail_lookup)
+    result = json.loads(finalize_foreground_result(
+        command="pytest", result={"output": "passed", "returncode": 0},
+        env=SimpleNamespace(_hermes_backend_name="ssh"), env_type="ssh",
+        effective_task_id="remote", task_id="remote", session_id=None, session_key="remote",
+        workdir="/project", command_cwd="/project", approval_note=None,
+    ))
+    assert result["output"] == "passed"
+    assert "verification_evidence" not in result

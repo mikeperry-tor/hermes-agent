@@ -167,6 +167,12 @@ export const describeRpcError = (err: unknown): string => {
   const { code, message } = rpcShape(err)
   const text = message ?? (typeof err === 'string' && err.trim() ? err : t('rpc.requestFailed'))
 
+  const data = (err as { data?: { detail?: unknown; field?: unknown } } | null)?.data
+
+  if (text === 'unsupported_terminal_backend' && data?.field === 'checkpoint') {
+    return typeof data.detail === 'string' && data.detail ? data.detail : t('userMessages.rpc.checkpointWorkspaceUnavailable')
+  }
+
   if (isVersionSkewError(err)) {
     logReplacedWireText(code, text)
 

@@ -430,11 +430,19 @@ def _any_live_session_claims_key(target: str) -> bool:
     return False
 
 
-def _with_checkpoints(session, fn):
-    """``fn(mgr, cwd)`` under the session's profile scope: the store is ``<profile home>/checkpoints``
-    (``_resolve_checkpoint_base`` reads the bound HERMES_HOME), the one the session's turns wrote to."""
+def _with_checkpoints(session, fn, *, allow_host_listing=False):
+    """Call ``fn(mgr, cwd, refusal)`` under the session's profile scope."""
+    mgr = session["agent"]._checkpoint_mgr
+    task_id = session.get("session_key") or "default"
     with _session_profile_runtime_scope(session, hydrate_secrets=False):
-        return fn(session["agent"]._checkpoint_mgr, _session_cwd(session))
+        tokens = _set_session_context(task_id, cwd=str(session.get("cwd") or ""))
+        try:
+            refusal = (mgr.unsupported_backend_reason(task_id, allow_host_listing=True)
+                       if allow_host_listing else mgr.unsupported_backend_reason(task_id))
+        finally:
+            _clear_session_context(tokens)
+        cwd = "" if refusal else _session_cwd(session)
+        return fn(mgr, cwd, refusal)
 
 
 # ── Methods: session ─────────────────────────────────────────────────
