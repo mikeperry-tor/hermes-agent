@@ -925,12 +925,20 @@ class CheckpointManager:
         """Reset per-turn dedup.  Call at the start of each agent iteration."""
         self._checkpointed_dirs.clear()
 
-    def unsupported_backend_reason(self, task_id: str = "default") -> Optional[str]:
-        """Explain why host checkpoints are off limits for a container-backed session.
+    @staticmethod
+    def unsupported_backend_reason(task_id: str = "default", *, allow_host_listing: bool = False) -> Optional[str]:
+        """Explain why a session cannot use the host checkpoint store."""
+        from tools.file_tools_paths import container_backend_for_task, uses_ssh_for_task
+        from tools.terminal_scope import TerminalPolicyUnavailable
 
-        Classifies the task's backend at call time (nothing is remembered), so /rollback is
-        refused before the first mutation and follows a backend change within the session."""
-        from tools.file_tools_paths import container_backend_for_task
+        try:
+            ssh = uses_ssh_for_task(task_id)
+        except TerminalPolicyUnavailable:
+            return "Filesystem checkpoints are unavailable when the terminal policy cannot be read."
+        if ssh:
+            return "Filesystem checkpoints and rollback are unavailable for terminal.backend=ssh."
+        if allow_host_listing:
+            return None
         backend = container_backend_for_task(task_id)
         if backend is None:
             return None

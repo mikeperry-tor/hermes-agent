@@ -54,6 +54,19 @@ def test_verify_on_stop_env_can_enable(clear_verify_env):
     clear_verify_env.setenv("HERMES_SESSION_PLATFORM", "telegram")
     assert verify_on_stop_enabled({"agent": {}}) is True
 
+
+def test_verify_on_stop_skips_host_project_lookup_for_ssh(monkeypatch):
+    from types import SimpleNamespace
+    from agent.turn_stop_gates import _verify_on_stop_nudge
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    calls = []
+    monkeypatch.setattr("agent.verification_stop.build_verify_on_stop_nudge", lambda **kwargs: calls.append(kwargs))
+    agent = SimpleNamespace(session_id="ssh-stop", _turn_file_mutation_paths={"/workspace/main.py"})
+    assert _verify_on_stop_nudge(agent) is None
+    assert not calls
+
 @pytest.mark.parametrize("source", ["cli", "tui", "desktop", "codex", "local"])
 def test_verify_on_stop_auto_on_for_interactive_surfaces(clear_verify_env, source):
     # Under "auto", CLI/TUI/desktop coding surfaces resolve ON.

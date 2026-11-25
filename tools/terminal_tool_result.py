@@ -7,6 +7,7 @@ notes/hints, spill redaction, verification evidence) + exit-code tables. Lazy
 import json
 import logging
 import os
+import posixpath
 import re
 import signal
 from contextlib import contextmanager
@@ -257,9 +258,11 @@ def finalize_foreground_result(
     failure_hint = _failure_hint(command, returncode, output, exit_note)
     # cwd echo when the command changed directory (gated on the observation
     # flag so an interrupted command can't echo another session's cwd).
+    ssh = env_type == "ssh" or getattr(env, "_hermes_backend_name", None) == "ssh"
+    normalize_cwd = posixpath.normpath if ssh else os.path.realpath
     changed_cwd = None
     with _quiet("cwd comparison"):
-        if observed_cwd and command_cwd and os.path.realpath(str(observed_cwd)) != os.path.realpath(str(command_cwd)):
+        if observed_cwd and command_cwd and normalize_cwd(str(observed_cwd)) != normalize_cwd(str(command_cwd)):
             changed_cwd = str(observed_cwd)
     # rc=130 is an interrupt only with the executor's marker — a command can
     # legitimately `exit 130` itself. An interrupted approved run keeps the
@@ -275,7 +278,7 @@ def finalize_foreground_result(
         ("environment_recreated", _ENV_RECREATED_NOTE if result.get("environment_recreated") else None),
         ("cwd_fallback", _cwd_fallback_note(result.get("cwd_fallback"))),
         *_redact_spill_file(result.get("full_output_path"), result.get("output_total_chars"), command),
-        ("verification_evidence", _verification_evidence(
+        ("verification_evidence", None if ssh else _verification_evidence(
             command, command_cwd, session_id or task_id or effective_task_id or "default",
             returncode, output, result.get("pipeline_status"))),
         ("approval", approval_note or None),

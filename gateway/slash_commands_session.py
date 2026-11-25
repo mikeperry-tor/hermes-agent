@@ -778,13 +778,29 @@ class GatewaySessionCommandsMixin:
         preview = target_text[:200] + "..." if len(target_text) > 200 else target_text
         reply = t("gateway.undo.removed", turns=result["turns_undone"],
                   count=result["rewound_count"], preview=preview)
-        if (mgr := self._checkpoint_manager(source)) is not None:
-            # Same manager and cwd /rollback lists.
-            from agent.checkpoints.undo_hint import format_undo_rollback_hint, undo_changed_files
-            files = await asyncio.to_thread(undo_changed_files, mgr, self._terminal_cwd(), result.get("undo_since"))
-            if line := format_undo_rollback_hint(files):
-                reply += "\n" + line
+        if (since := result.get("undo_since")) and (line := await asyncio.to_thread(
+                self._undo_checkpoint_hint, source, since)):
+            reply += "\n" + line
         return reply
+
+    def _undo_checkpoint_hint(self, source, since) -> str:
+        from agent.checkpoints.undo_hint import format_undo_rollback_hint, undo_changed_files
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.config_backend import ConfigBackendUnavailable
+        from tui_gateway.launch_profile_policy import launch_profile_scope_if_multiplexed
+
+        try:
+            home = self._profile_scope_key_for_source(source)
+            scope = (_profile_runtime_scope(home, hydrate_secrets=False) if home is not None
+                     else launch_profile_scope_if_multiplexed())
+            with scope:
+                mgr = self._checkpoint_manager(source)
+                if mgr is not None and not mgr.unsupported_backend_reason():
+                    return format_undo_rollback_hint(
+                        undo_changed_files(mgr, self._terminal_cwd(), since, task_id=None))
+        except (Exception, ConfigBackendUnavailable):  # health: allow BLE001 -- the hint follows a committed rewind
+            logger.debug("undo rollback hint skipped", exc_info=True)
+        return ""
 
     # --------------------------------------------------------------------- /compress
 

@@ -52,7 +52,7 @@ def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
 
 def undo_rollback_hint_for(session: dict, target_message: dict, kept_history: list) -> dict | None:
     """``/undo``'s changed-files line for a sidecar session (``agent/checkpoints/undo_hint.py``): the same
-    manager, cwd and container refusal its ``rollback.*`` methods use. None: no line.
+    manager, cwd and backend refusal its ``rollback.*`` methods use. None: no line.
 
     The store is the SESSION's profile's (``_resolve_checkpoint_base`` reads the bound HERMES_HOME), so the
     whole read runs under that profile's runtime scope: an RPC thread otherwise holds the launch profile's."""
@@ -62,8 +62,8 @@ def undo_rollback_hint_for(session: dict, target_message: dict, kept_history: li
     from agent.checkpoints.undo_hint import undo_hint_payload, undo_span_start
     from tui_gateway import server  # method bodies are bound onto server.py's globals (method_ctx.py)
 
-    def hint(mgr, cwd):  # under the same profile scope rollback.restore runs in (_with_checkpoints)
-        if server._container_checkpoint_refusal(session, mgr, cwd):
+    def hint(mgr, cwd, refusal):
+        if refusal:
             return None
         since = undo_span_start((target_message or {}).get("timestamp"), kept_history)
         return undo_hint_payload(mgr, cwd, since, task_id=None)

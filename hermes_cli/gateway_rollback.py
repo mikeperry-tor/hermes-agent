@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 
 from agent.i18n import t
-from hermes_cli.gateway_client import GatewayClientError
+from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
 
 
 def _t(key, **kw):
@@ -47,6 +47,9 @@ def rollback(cli, connection, command):
             params["all"] = True  # main's --all/--force: also revert the user's hand-edits
         _restored(cli, connection, connection.call("rollback.restore", **params), params.get("file_path"))
     except GatewayClientError as exc:
+        if (isinstance(exc, GatewayRPCError) and str(exc) == "unsupported_terminal_backend"
+                and exc.data.get("field") == "checkpoint"):
+            return print(f"  {exc.data.get('detail') or 'Filesystem checkpoints are unavailable for this session.'}")
         print(f"  ❌ {exc}")
 
 

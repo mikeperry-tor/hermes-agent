@@ -346,6 +346,14 @@ export function desktopReadCommandHandlers<C extends { arg: string }>(env: Deskt
 
         out.render(text)
       } catch (err) {
+        if (err instanceof Error && err.message === 'unsupported_terminal_backend') {
+          const data = (err as { data?: { detail?: unknown; field?: unknown } }).data
+
+          if (data?.field === 'checkpoint' && typeof data.detail === 'string' && data.detail) {
+            return out.render(data.detail)
+          }
+        }
+
         out.render(errorText(err))
       }
     },
