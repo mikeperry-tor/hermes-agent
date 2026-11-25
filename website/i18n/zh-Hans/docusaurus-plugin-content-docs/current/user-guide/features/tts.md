@@ -39,7 +39,10 @@ Hermes Agent 支持跨所有消息平台的文字转语音（TTS）输出和语�
 | Telegram | 语音气泡（内联播放） | Opus `.ogg` |
 | Discord | 语音气泡（Opus/OGG），回退为文件附件 | Opus/MP3 |
 | WhatsApp | 音频文件附件 | MP3 |
-| CLI | 保存至 `~/.hermes/audio_cache/` | MP3 |
+| CLI | 保存至当前配置档案的音频缓存 | 默认为 MP3 |
+
+`text_to_speech` 工具将文件保存到当前配置档案主目录下的 `cache/audio/`。
+如果该配置档案已有非空的旧版 `audio_cache/` 目录，工具将使用该目录。
 
 ### 配置
 
