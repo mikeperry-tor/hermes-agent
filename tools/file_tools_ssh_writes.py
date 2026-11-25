@@ -128,7 +128,7 @@ def _publish_whole_file(ops, requested, inspected, content, expected, policy, so
             before = original if ext == ".py" and pre_content is not None else pre_content
             after = content if ext == ".py" else _strip_bom(content)[0]
             lint = ops._check_lint_delta(path, pre_content=before, post_content=after)
-        except Exception as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             # The executor has already confirmed publication. Keep the receipt even if lint fails.
             logger.warning("Post-write SSH lint failed (%s)", type(exc).__name__)
             lint = LintResult(skipped=True, message="The SSH file was saved, but lint could not run.")

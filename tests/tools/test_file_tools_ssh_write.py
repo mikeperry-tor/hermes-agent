@@ -3,6 +3,7 @@
 import io
 import json
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,8 +13,8 @@ from tools.environments.ssh import SSHEnvironment
 from tools.file_operations import ShellFileOperations
 
 
-@pytest.mark.platforms("posix")
-def test_ssh_whole_write_checks_versions_and_policy(tmp_path, monkeypatch, capsys):
+@pytest.fixture
+def ssh_files(tmp_path, monkeypatch, capsys):
     executor_home = tmp_path / "home"
     executor_home.mkdir()
     monkeypatch.setenv("HOME", str(executor_home))
@@ -21,18 +22,6 @@ def test_ssh_whole_write_checks_versions_and_policy(tmp_path, monkeypatch, capsy
     project = tmp_path / "project"
     project.mkdir()
     monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(project))
-    host_sibling = tmp_path / "sibling.txt"
-    host_sibling.write_text("sibling")
-    target = project / "notes.txt"
-    target.write_bytes(b"\xef\xbb\xbffirst\r\nsecond\r\n")
-    target.chmod(0o755)
-    alias = project / "alias"
-    alias.symlink_to(target)
-    blocked = project / "blocked"
-    blocked.symlink_to(host_sibling)
-    instruction = project / "AGENTS.md"
-    approval = MagicMock(return_value="approval required")
-    monkeypatch.setattr("tools.file_tools_write_guards._request_protected_instruction_approval", approval)
 
     def execute(snippet, *, stdin_data=None):
         with monkeypatch.context() as patch:
@@ -56,6 +45,32 @@ def test_ssh_whole_write_checks_versions_and_policy(tmp_path, monkeypatch, capsy
     def patch(path, old, new):
         return json.loads(file_tools.patch_tool(path=str(path), old_string=old, new_string=new,
                                                 task_id="guarded-ssh-writes"))
+
+    def apply_v4a(*operations):
+        patch_text = "\n".join(("*** Begin Patch", *operations, "*** End Patch"))
+        return json.loads(file_tools.patch_tool(mode="patch", patch=patch_text, task_id="guarded-ssh-writes"))
+
+    return SimpleNamespace(home=executor_home, project=project, backend=operations, execute=execute,
+                           write=write, read=read, patch=patch, apply_v4a=apply_v4a)
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_file_tools_check_scope_versions_and_output(ssh_files, tmp_path, monkeypatch):
+    executor_home, project = ssh_files.home, ssh_files.project
+    write, read, patch, apply_v4a = ssh_files.write, ssh_files.read, ssh_files.patch, ssh_files.apply_v4a
+    operations = ssh_files.backend
+    host_sibling = tmp_path / "sibling.txt"
+    host_sibling.write_text("sibling")
+    target = project / "notes.txt"
+    target.write_bytes(b"\xef\xbb\xbffirst\r\nsecond\r\n")
+    target.chmod(0o755)
+    alias = project / "alias"
+    alias.symlink_to(target)
+    blocked = project / "blocked"
+    blocked.symlink_to(host_sibling)
+    instruction = project / "AGENTS.md"
+    approval = MagicMock(return_value="approval required")
+    monkeypatch.setattr("tools.file_tools_write_guards._request_protected_instruction_approval", approval)
 
     assert write(target)["stale_write_blocked"]
     assert read(alias, limit=1)["content"].rstrip("\r") == "1|first"
@@ -89,10 +104,6 @@ def test_ssh_whole_write_checks_versions_and_policy(tmp_path, monkeypatch, capsy
     assert patch(target, "patched", "checked patch")["success"]
     assert write(target, "after checked patch\n")["verified"]
     assert target.read_text() == "after checked patch\n"
-
-    def apply_v4a(*operations):
-        patch_text = "\n".join(("*** Begin Patch", *operations, "*** End Patch"))
-        return json.loads(file_tools.patch_tool(mode="patch", patch=patch_text, task_id="guarded-ssh-writes"))
 
     added, relocated = project / "added.txt", project / "relocated.txt"
     multi = apply_v4a(
@@ -280,6 +291,11 @@ def test_ssh_whole_write_checks_versions_and_policy(tmp_path, monkeypatch, capsy
     assert "credential file" in patch(outbound, "updated referent next", "invalid target")["error"]
     assert target.read_text() == "updated referent next\n"
 
+
+@pytest.mark.platforms("posix")
+def test_ssh_patch_keeps_validated_versions_and_confirms_prior_entries(ssh_files, monkeypatch):
+    project, operations, execute = ssh_files.project, ssh_files.backend, ssh_files.execute
+    patch, apply_v4a = ssh_files.patch, ssh_files.apply_v4a
     move_source = project / "move-source"
     move_source.write_text("before validate\n")
     move_target = project / "move-target"

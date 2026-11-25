@@ -1093,6 +1093,25 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str], list[st
     return paths, content_paths, entry_paths
 
 
+def _patch_ssh_tool(mode, path, old_string, new_string, replace_all, patch, task_id):
+    try:
+        if mode == "patch":
+            if not patch:
+                return tool_error("patch content required")
+            return patch_ssh_v4a(_get_ssh_file_ops(task_id), patch, task_id)
+        if mode != "replace":
+            return tool_error(f"Unknown mode: {mode}")
+        if not path or old_string is None or new_string is None:
+            return tool_error("path, old_string, and new_string are required.")
+        if error := get_nt_namespace_error(path, verb="Write"):
+            return tool_error(error)
+        requested = _anchor_ssh_path(_hosted_tilde(path, task_id), task_id)
+        return patch_ssh_replace(_get_ssh_file_ops(task_id), requested, old_string,
+                                 new_string, replace_all, task_id)
+    except (OSError, ValueError) as exc:
+        return tool_error(str(exc))
+
+
 def patch_tool(mode: str = "replace", path: str | None = None, old_string: str | None = None,
                new_string: str | None = None, replace_all: bool = False, patch: str | None = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -1102,25 +1121,8 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
     bypass only; unadvertised).
     """
-    if mode == "replace" and uses_ssh_for_task(task_id):
-        if not path or old_string is None or new_string is None:
-            return tool_error("path, old_string, and new_string are required.")
-        if error := get_nt_namespace_error(path, verb="Write"):
-            return tool_error(error)
-        try:
-            requested = _anchor_ssh_path(_hosted_tilde(path, task_id), task_id)
-            return patch_ssh_replace(_get_ssh_file_ops(task_id), requested, old_string,
-                                     new_string, replace_all, task_id)
-        except (OSError, ValueError) as exc:
-            return tool_error(str(exc))
-
-    if mode == "patch" and uses_ssh_for_task(task_id):
-        if not patch:
-            return tool_error("patch content required")
-        try:
-            return patch_ssh_v4a(_get_ssh_file_ops(task_id), patch, task_id)
-        except (OSError, ValueError) as exc:
-            return tool_error(str(exc))
+    if uses_ssh_for_task(task_id):
+        return _patch_ssh_tool(mode, path, old_string, new_string, replace_all, patch, task_id)
 
     _paths_to_check = [path] if path else []
     _content_write_paths = list(_paths_to_check)
