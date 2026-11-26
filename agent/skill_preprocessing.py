@@ -89,13 +89,13 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     return elide(output, _INLINE_SHELL_MAX_OUTPUT)
 
 
-def expand_inline_shell(content: str, skill_dir: Path | None, timeout: int) -> str:
+def expand_inline_shell(content: str, skill_dir: Path | None, timeout: int, *, run=None) -> str:
     """Replace every !`cmd` snippet with its stdout, run with the skill dir as CWD."""
     if "!`" not in content:
         return content
     def _replace(match: re.Match) -> str:
         cmd = match.group(1).strip()
-        return run_inline_shell(cmd, skill_dir, timeout) if cmd else ""
+        return (run or run_inline_shell)(cmd, skill_dir, timeout) if cmd else ""
     return _INLINE_SHELL_RE.sub(_replace, content)
 
 
@@ -146,14 +146,60 @@ def preprocess_skill_content(
     content: str,
     skill_dir: Path | None,
     session_id: str | None = None,
-    skills_cfg: dict | None = None,
+    skills_cfg: dict | None = None, *, executor_project: bool = False,
 ) -> str:
     """Apply configured SKILL.md template and inline-shell preprocessing."""
     if not content:
         return content
     cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return _preprocess_managed(content, skill_dir, session_id, cfg, executor_project=executor_project)
     if cfg.get("template_vars", True):
         content = substitute_template_vars(content, skill_dir, session_id)
     if cfg.get("inline_shell", False) and not _is_community_hub_skill(skill_dir):
         content = expand_inline_shell(content, skill_dir, int(cfg.get("inline_shell_timeout", 10) or 10))
     return content
+
+
+def _preprocess_managed(content, skill_dir, session_id, cfg, *, executor_project):
+    from agent.ssh_skill_shell import managed_skill_workspace, run_managed_inline_shell
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from tools.hosted_tool_policy import host_feature_refusal
+
+    from agent.ssh_project_skills import project_skill_allows_shell
+
+    expands = cfg.get("inline_shell", False) and "!`" in content
+    if expands and not executor_project:
+        expands = not _is_community_hub_skill(skill_dir)
+    if not expands and not cfg.get("template_vars", True):
+        return content
+    refusal = host_feature_refusal("skill_inline_shell", "Inline skill shell")
+    try:
+        if skill_dir is None or refusal:
+            raise SshWorkspaceFsError("EACCES", refusal or "This skill has no managed SSH directory.")
+        backend, remote = managed_skill_workspace(skill_dir, project=executor_project)
+        if expands and executor_project:
+            expands = project_skill_allows_shell(remote)
+    except (OSError, ValueError, SshWorkspaceFsError) as exc:
+        if expands:
+            return _INLINE_SHELL_RE.sub(lambda _, reason=str(exc): f"[inline-shell refused: {reason}]", content)
+        return content
+    if cfg.get("template_vars", True):
+        content = substitute_template_vars(content, Path(remote), session_id)
+    if not expands:
+        return content
+
+    if not executor_project:
+        try:
+            backend.sync_skill_files()
+        except (OSError, ValueError, RuntimeError) as exc:
+            return _INLINE_SHELL_RE.sub(lambda _, reason=str(exc): f"[inline-shell refused: {reason}]", content)
+
+    def execute(cmd, _, timeout):
+        try:
+            return run_managed_inline_shell(backend, cmd, remote, timeout)
+        except (OSError, ValueError, SshWorkspaceFsError) as exc:
+            return f"[inline-shell error: {exc}]"
+
+    return expand_inline_shell(content, Path(remote), int(cfg.get("inline_shell_timeout", 10) or 10), run=execute)

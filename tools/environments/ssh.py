@@ -171,11 +171,17 @@ class SSHEnvironment(BaseEnvironment):
             self._prefer_nonlogin = True
             return
         if sync_files:
+            from hermes_cli.main_resume_args import uses_managed_executor
+
+            base = f"{self._remote_home}/.hermes"
+            skill_roots = (tuple(f"{base}/{part}" for part in ("skills", "external_skills", "project_skills"))
+                           if uses_managed_executor() else ())
             self._ensure_remote_dirs()
             self._sync_manager = FileSyncManager(
-                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                get_files_fn=lambda: iter_sync_files(base),
                 upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-                bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
+                bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download,
+                upload_only_remote_roots=skill_roots)
             self._sync_manager.sync(force=True)
         self.init_session()
 

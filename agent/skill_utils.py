@@ -449,13 +449,13 @@ def skill_candidate_rank(skill_md, root) -> tuple[bool, int]:
     return (skill_md.name != "SKILL.md", len(skill_md.relative_to(root).parts))
 
 
-def pick_skill_candidate(candidates) -> tuple[Optional[int], list[int]]:
+def pick_skill_candidate(candidates, *, compare_copies=True) -> tuple[Optional[int], list[int]]:
     """Winner index among one identifier's ``(tier, root, rank, skill_md)`` candidates, plus the
     winning tier's contender indexes. The lowest tier wins; inside it a lone candidate wins, identical
     copies under one root resolve to the strictly best ``rank``, anything else is ambiguous (None)."""
     top = min(c[0] for c in candidates)
     contenders = [i for i, c in enumerate(candidates) if c[0] == top]
-    if len(contenders) > 1 and len({candidates[i][1] for i in contenders}) == 1 and provably_same_skill(
+    if compare_copies and len(contenders) > 1 and len({candidates[i][1] for i in contenders}) == 1 and provably_same_skill(
             [candidates[i][3] for i in contenders]):
         ranked = sorted(contenders, key=lambda i: candidates[i][2])
         if candidates[ranked[0]][2] != candidates[ranked[1]][2]:
@@ -487,7 +487,7 @@ def resolve_skill_catalog(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
     for alias, idxs in owners.items():
         won, _ = pick_skill_candidate([
             (out[j]["tier"], str(out[j]["root"]), skill_candidate_rank(out[j]["path"], out[j]["root"]), out[j]["path"])
-            for j in idxs])
+            for j in idxs], compare_copies=not any(out[j].get("executor_project") for j in idxs))
         winner[alias] = None if won is None else idxs[won]
     for i, e in enumerate(out):
         name, rel = str(e["name"]), e["relative_path"]
@@ -498,7 +498,8 @@ def resolve_skill_catalog(entries: list[dict[str, Any]]) -> list[dict[str, Any]]
             key = (str(e["path"]), *sorted(str(out[j]["path"]) for j in higher))
             if higher and key not in _SHADOW_CHECKED:
                 _SHADOW_CHECKED.add(key)
-                if not any(provably_same_skill([e["path"], out[j]["path"]]) for j in higher):
+                if not any(not out[j].get("executor_project") and not e.get("executor_project")
+                           and provably_same_skill([e["path"], out[j]["path"]]) for j in higher):
                     logger.warning("Skill '%s' at %s is shadowed by a higher-precedence copy "
                                    "(project > local > create_dir > external_dirs)", name, e["path"])
         elif winner[name] == i:
@@ -596,12 +597,18 @@ def _current_project_root(trusted: bool) -> Optional[Path]:
 
 def get_project_skills_dirs() -> list[Path]:
     """Trusted project-local skill dirs for the current cwd (may be empty)."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return []
     root = _current_project_root(trusted=True)
     return _candidate_project_skills_dirs(root) if root is not None else []
 
 
 def get_untrusted_project_skills_root() -> Optional[tuple[Path, int]]:
     """(root, skill_count) when cwd's project has skills but is NOT trusted, else None."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return None
     root = _current_project_root(trusted=False)
     count = 0
     for d in _candidate_project_skills_dirs(root) if root is not None else ():

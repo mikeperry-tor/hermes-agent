@@ -154,6 +154,11 @@ def _resolve_skill_commands_project() -> Optional[str]:
     """The project root the scan's project skills resolve from (None outside a repo). One multi-session
     host serves sessions in different repos; without this tag the first session's project skills stayed
     published for every other session's ``get_skill_commands`` lookup (#114359)."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        from tools.terminal_scope import get_terminal_scope
+        terminal = get_terminal_scope() or {}
+        return terminal.get("TERMINAL_CWD")
     from agent.skill_utils import find_project_root
     root = find_project_root()
     return str(root) if root is not None else None
@@ -218,6 +223,8 @@ def format_missing_skills(missing: list[str]) -> str:
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
     """Append a ``[Skill config: ...]`` block with resolved ``metadata.hermes.config``
     values so the agent needn't read config.yaml. Any failure leaves the message without it."""
+    if loaded_skill.get("executor_project"):
+        return
     try:
         from agent.skill_utils import extract_skill_config_vars, parse_frontmatter, resolve_skill_config_values
         raw_content = str(loaded_skill.get("raw_content") or loaded_skill.get("content") or "")
@@ -256,7 +263,7 @@ def _supporting_files(loaded_skill: dict[str, Any], skill_dir: Path | None) -> l
     """Skill-relative support file paths: from ``linked_files`` or a disk walk."""
     linked = (loaded_skill.get("linked_files") or {}).values()
     supporting = [Path(entry).as_posix() for entries in linked if isinstance(entries, list) for entry in entries]
-    if not supporting and skill_dir:
+    if not supporting and skill_dir and not loaded_skill.get("executor_project"):
         for subdir in ("references", "templates", "scripts", "assets"):
             files = sorted((skill_dir / subdir).rglob("*"))
             # as_posix so listed paths match the footer's examples (scripts/foo.js)
@@ -278,27 +285,36 @@ def _build_skill_message(
     # Preprocess first so downstream blocks see the expanded content.
     content = preprocess_skill_content(
         str(loaded_skill.get("content") or ""), skill_dir, session_id, skills_cfg=_load_skills_config(),
+        executor_project=bool(loaded_skill.get("executor_project")),
     )
     parts = [activation_note, "", content.strip()]
     # Absolute skill dir lets the agent run bundled scripts without a skill_view() round-trip.
-    if skill_dir:
-        parts += ["", f"[Skill directory: {skill_dir}]", _SKILL_DIR_NOTE]
+    visible_dir = skill_dir
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if skill_dir and uses_managed_executor() and not loaded_skill.get("executor_project"):
+        from agent.ssh_skill_shell import skill_execution_directory
+        visible_dir = skill_execution_directory(skill_dir)
+    if visible_dir:
+        parts += ["", f"[Skill directory: {visible_dir}]", _SKILL_DIR_NOTE]
     _inject_skill_config(loaded_skill, parts)
     setup_note = _setup_note(loaded_skill)
     if setup_note:
         parts += ["", f"[Skill setup note: {setup_note}]"]
     supporting = _supporting_files(loaded_skill, skill_dir)
-    if supporting and skill_dir:
-        try:
-            skill_view_target = str(skill_dir.relative_to(_skills_dir()))
-        except ValueError:
-            skill_view_target = str(loaded_skill.get("name") or skill_dir.name)
+    if supporting and visible_dir and skill_dir:
+        if loaded_skill.get("executor_project"):
+            skill_view_target = str(loaded_skill.get("path") or skill_dir.name)
+        else:
+            try:
+                skill_view_target = str(skill_dir.relative_to(_skills_dir()))
+            except ValueError:
+                skill_view_target = str(loaded_skill.get("name") or skill_dir.name)
         parts += ["", "[This skill has supporting files (paths relative to the skill directory above):]"]
         parts += [f"- {sf}" for sf in supporting]
         parts.append(
             f'\nLoad any of these with skill_view(name="{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '
-            f"(e.g. `node {skill_dir}{_SUPPORTING_FILES_END}"
+            f"(e.g. `node {visible_dir}{_SUPPORTING_FILES_END}"
         )
     stable_prefix = None
     if user_instruction:
@@ -388,12 +404,16 @@ def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dic
     if not skill_matches_platform(frontmatter) or not skill_matches_environment(frontmatter) or not skill_matches_apps(frontmatter):
         return
     name = frontmatter.get('name', skill_md.parent.name)
-    if name in seen_names or name in disabled:
-        return
     description = frontmatter.get('description', '') or next(
         (line.strip()[:80] for line in body.strip().split('\n') if line.strip() and not line.strip().startswith('#')),
         '',
     )
+    _register_skill_command(name, description, skill_md, disabled, seen_names, commands)
+
+
+def _register_skill_command(name, description, skill_md, disabled, seen_names, commands, *, executor=False):
+    if name in seen_names or name in disabled:
+        return
     seen_names.add(name)
     cmd_name = slugify_skill_name(name)
     if not cmd_name:
@@ -413,6 +433,9 @@ def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: dic
         return
     commands[cmd_key] = {"name": name, "description": description or f"Invoke the {name} skill",
                          "skill_md_path": str(skill_md), "skill_dir": str(skill_md.parent)}
+    if executor:
+        commands[cmd_key]["skill_identifier"] = name
+        commands[cmd_key]["executor_project"] = True
 
 
 def scan_skill_commands() -> dict[str, dict[str, Any]]:
@@ -441,7 +464,11 @@ def scan_skill_commands() -> dict[str, dict[str, Any]]:
         for entry in _skill_catalog():
             if entry["status"] == "unique":
                 try:
-                    _scan_skill_md(Path(entry["path"]), disabled, seen_names, commands)
+                    if entry.get("executor_project"):
+                        _register_skill_command(entry["name"], entry["description"], entry["path"],
+                                                disabled, seen_names, commands, executor=True)
+                    else:
+                        _scan_skill_md(Path(entry["path"]), disabled, seen_names, commands)
                 except Exception:
                     continue
     except Exception:
@@ -745,7 +772,12 @@ def build_skill_invocation_message(
 ) -> Optional[str]:
     """Build the user message for a skill slash command, or None if not found."""
     skill_info = get_interactive_skill_commands().get(cmd_key)
-    loaded = _load_skill_payload(skill_info.get("skill_identifier") or skill_info["skill_dir"], task_id=task_id) if skill_info else None
+    if skill_info:
+        identifier = skill_info.get("skill_identifier") or skill_info["skill_dir"]
+    else:
+        from hermes_cli.main_resume_args import uses_managed_executor
+        identifier = cmd_key.lstrip("/") if uses_managed_executor() else ""
+    loaded = _load_skill_payload(identifier, task_id=task_id)
     if not loaded:
         return None
     note = (f'[IMPORTANT: The user has invoked the "{loaded[2]}" skill, indicating they want '
