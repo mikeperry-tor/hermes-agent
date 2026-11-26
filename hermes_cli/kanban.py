@@ -733,6 +733,10 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    try:
+        kbw._require_local_workspace()
+    except ValueError as exc:
+        return _err(str(exc))
     with kbc.connect_closing() as conn:
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:

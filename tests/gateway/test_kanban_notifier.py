@@ -796,3 +796,51 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_managed_kanban_notification_delivers_only_an_owned_staged_blob(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from hermes_cli import main_resume_args
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notifier.db"))
+    monkeypatch.setenv("HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "0")
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: True)
+    kb.init_db()
+
+    decoy = tmp_path / "hermes-copy.txt"
+    decoy.write_bytes(b"Never deliver this workstation copy.")
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="managed handoff", assignee="worker", workspace_kind="dir",
+                             workspace_path=str(tmp_path))
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1", notifier_profile="default")
+        kb.store_attachment_bytes(conn, tid, "staged.txt.", b"The staged deliverable.")
+        path = kb.list_attachments(conn, tid)[0].stored_path
+        Path(path[:-1]).write_bytes(b"An unrecorded sibling.")
+        # Older task records can point outside their own attachment storage.
+        kb.add_attachment(conn, tid, filename=decoy.name, stored_path=str(decoy))
+        assert kb.request_review(conn, tid, summary=f"Review {path}. Other {decoy}.",
+                                 metadata={"artifacts": [str(decoy), path], "_staged_artifacts": [str(decoy)]})
+        assert kb.complete_task(conn, tid, summary=f"Completed {decoy}", result=f'Deliver "{path}".')
+        assert len(kb.list_attachments(conn, tid)) == 2
+
+    class AttachmentAdapter(RecordingAdapter):
+        uploads = []
+
+        def extract_local_files(self, content):
+            raise AssertionError("Managed notifier probed a prose path on Hermes")
+
+        async def send_document(self, chat_id, file_path, metadata=None):
+            self.uploads.append((chat_id, Path(file_path).read_bytes()))
+
+    adapter = AttachmentAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_dispatcher_lock_handle = None
+    runner._kanban_notifier_profile = "default"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2
+    assert adapter.uploads == [("chat-1", b"The staged deliverable.")] * 2
+    assert _unseen_terminal_events(tid) == []
+    assert decoy.read_bytes() == b"Never deliver this workstation copy."
