@@ -107,6 +107,21 @@ class TestBuildSSHCommand:
         managed._scp_upload("source", "destination")
         assert captured[-1][:7] == ["scp", *cmd[1:7]]
 
+    @pytest.mark.platforms("posix")
+    def test_fresh_ssh_probe_never_connects_to_or_closes_the_terminal_master(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ssh_env, "_SSH_MULTIPLEX", True)
+        path = str(tmp_path / "ssh-config")
+        env = SSHEnvironment(host="h", user="u", ssh_config=path, fresh_connections=True)
+        cmd = env._build_ssh_command()
+        assert cmd[7:9] == ["-S", "none"]
+        assert "ControlMaster=auto" not in cmd
+        assert "StrictHostKeyChecking=yes" in cmd
+        assert "ConnectTimeout=10" in cmd
+        close_sockets = MagicMock()
+        monkeypatch.setattr(env, "_control_sockets", close_sockets)
+        env.cleanup()
+        close_sockets.assert_not_called()
+
     def test_relative_ssh_config_is_refused_before_connecting(self, monkeypatch):
         establish = MagicMock()
         monkeypatch.setattr(SSHEnvironment, "_establish_connection", establish)
@@ -485,3 +500,25 @@ class TestRealSSHBackend:
         assert _run(f"wc -c < {shlex.quote(path)}")["output"].strip() == str(len(content.encode()))
         read = json.loads(read_file_tool(path, task_id="ssh_test"))
         assert "beta: ünïcödé ✓" in read["content"], read
+
+
+def test_file_transport_skips_profile_bootstrap_and_passthrough(monkeypatch):
+    from tools.environments import ssh
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("fixed SSH file calls must not use profile shell setup")
+
+    monkeypatch.setattr(ssh, "_ensure_ssh_available", lambda: None)
+    monkeypatch.setattr(ssh.SSHEnvironment, "_establish_connection", lambda _: None)
+    monkeypatch.setattr(ssh.SSHEnvironment, "_detect_remote_home", lambda _: "/home/runner")
+    monkeypatch.setattr(ssh.SSHEnvironment, "init_session", forbidden)
+    monkeypatch.setattr(ssh, "resolve_passthrough_env", forbidden)
+    calls = []
+    monkeypatch.setattr(ssh, "_popen_bash", lambda args, data: calls.append((args, data)))
+
+    env = ssh.SSHEnvironment(host="executor", user="runner", cwd="/", sync_files=False,
+                             fresh_connections=True, file_transport=True)
+    env._run_bash("printf test", login=True, stdin_data="data")
+    assert env.cwd == "/"
+    assert "-l" not in calls[0][0] and "SendEnv" not in " ".join(calls[0][0])
+    assert calls[0][1] == "data"

@@ -98,6 +98,104 @@ def read_bytes(path, expected, maximum):
     with open_regular(path, expected) as stream:
         return base64.b64encode(stream.read(maximum + 1)).decode('ascii')
 
+def read_reference_window(path, expected, start, end, maximum):
+    with open_regular(path, expected) as stream:
+        sample = stream.read(4096)
+        stream.seek(0)
+        if start is None:
+            data = stream.read(maximum + 1)
+        else:
+            line = 1
+            while line < start:
+                chunk = stream.readline(65536)
+                if not chunk:
+                    break
+                if chunk.endswith(b'\\n'):
+                    line += 1
+            data = bytearray()
+            while start <= line <= end and len(data) <= maximum:
+                chunk = stream.readline(maximum + 1 - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                line += 1
+    return [base64.b64encode(part).decode('ascii') for part in (sample, data)]
+
+def rg_reference_rows(limit):
+    import subprocess
+    try:
+        result = subprocess.run(['rg', '--files', '-0', '.'], capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    rows = {}
+    for raw in result.stdout.split(b'\\x00'):
+        if not raw:
+            continue
+        path = os.fsdecode(raw)
+        if os.path.isabs(path) or '..' in path.split('/'):
+            continue
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        parent = os.path.dirname(path)
+        while parent not in ('', '.') and len(rows) < limit:
+            rows.setdefault(os.path.relpath(parent), None)
+            parent = os.path.dirname(parent)
+        if len(rows) >= limit:
+            break
+        rows[os.path.relpath(path)] = info.st_size
+    return sorted(rows.items())
+
+def recursive_reference_rows(limit):
+    if (rows := rg_reference_rows(limit)) is not None:
+        return rows
+    rows = []
+    for root, directories, files in os.walk('.'):
+        directories[:] = sorted(name for name in directories
+                                if not name.startswith('.') and name != '__pycache__'
+                                and not os.path.islink(os.path.join(root, name)))
+        for name in (*directories, *sorted(files)):
+            if name.startswith('.'):
+                continue
+            path = os.path.join(root, name)
+            info = os.lstat(path)
+            if stat.S_ISDIR(info.st_mode):
+                rows.append((os.path.relpath(path), None))
+            elif stat.S_ISREG(info.st_mode):
+                rows.append((os.path.relpath(path), info.st_size))
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+def reference_directory(path, expected, limit, recursive=False, prefix='', include_hidden=False):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        if metadata(os.fstat(fd)) != expected:
+            raise OSError('directory changed before opening')
+        if recursive:
+            os.fchdir(fd)
+            rows = recursive_reference_rows(limit)
+        else:
+            rows = []
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    if ((not include_hidden and entry.name.startswith('.')) or entry.is_symlink()
+                            or not entry.name.lower().startswith(prefix.lower())):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        rows.append((entry.name, None))
+                    elif entry.is_file(follow_symlinks=False):
+                        rows.append((entry.name, entry.stat(follow_symlinks=False).st_size))
+                    if len(rows) >= limit:
+                        break
+        if metadata(os.fstat(fd)) != expected or metadata(os.lstat(path)) != expected:
+            raise OSError('directory changed while open')
+        return sorted(rows)
+    finally:
+        os.close(fd)
+
 def directory_names(path, limit):
     try:
         return sorted(name for name in os.listdir(path) if not name.startswith('.'))[:limit]
