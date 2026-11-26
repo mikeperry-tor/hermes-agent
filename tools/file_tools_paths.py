@@ -113,6 +113,15 @@ def container_backend_for_task(task_id: str = "default") -> str | None:
     return _terminal_env_type_for_task(task_id) if _uses_container_paths(task_id) else None
 
 
+def uses_ssh_for_task(task_id: str) -> bool:
+    """Check the scoped SSH policy before consulting the task's live backend."""
+    from tools.terminal_scope import get_terminal_scope, terminal_env
+
+    if get_terminal_scope() is not None and terminal_env("TERMINAL_ENV").lower() == "ssh":
+        return True
+    return _terminal_env_type_for_task(task_id) == "ssh"
+
+
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
     """Normalize path syntax without following host symlinks: container paths are
     meaningful inside the sandbox, and a host-side ``/workspace`` symlink must not rewrite them."""
@@ -274,17 +283,17 @@ def _ssh_remote_home(task_id: str) -> str | None:
     return home if isinstance(home, str) and posixpath.isabs(home) else None
 
 
-def _resolve_ssh_path(filepath: str, task_id: str) -> PurePosixPath:
-    """Resolve *filepath* in the SSH target's namespace, never via the Hermes host
-    (``Path.resolve()`` and ``get_subprocess_home()`` both name host directories).
-
-    ``~`` becomes the remote home once the live environment has detected it, so the
-    result is absolute and the write guards see the real target. Before that it stays
-    ``~``-prefixed for the remote shell; ``~user`` always does.
-    """
-    text = str(filepath or "").strip()
+def _anchor_ssh_path(filepath: str, task_id: str) -> str:
+    """Join the SSH session directory without interpreting symlinks or parent components."""
+    text = str(filepath or "")
     if not text.startswith("~") and not posixpath.isabs(text):
         text = posixpath.join(_ssh_remote_anchor(task_id), text)
+    return text
+
+
+def _resolve_ssh_path(filepath: str, task_id: str) -> PurePosixPath:
+    """Normalize a path for display without examining the SSH filesystem."""
+    text = _anchor_ssh_path(str(filepath or "").strip(), task_id)
     if text == "~" or text.startswith("~/"):
         home = _ssh_remote_home(task_id)
         text = home + text[1:] if home else text

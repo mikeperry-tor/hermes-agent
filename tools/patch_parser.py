@@ -134,12 +134,15 @@ def _split_hunk(hunk: Hunk) -> tuple[list[str], list[str]]:
             [l.content for l in hunk.lines if l.prefix != '-'])
 
 
-def _no_match_hint(error: Optional[str], search_pattern: str, content: str) -> str:
-    """Best-effort 'Did you mean...' suffix; never lets a hint failure mask the real error."""
+def _no_match_detail(error: Optional[str], search_pattern: str, content: str, file_ops: Any, path: str) -> str:
+    """Report fuzzy-match errors and suggestions only when the source can be shown."""
+    if _visible_patch_text(file_ops, path, content) != content:
+        return "The matching details are hidden because the edit includes redacted text."
+    hint = ""
     with contextlib.suppress(Exception):
         from tools.fuzzy_match import format_no_match_hint
-        return format_no_match_hint(error, 0, search_pattern, content)
-    return ""
+        hint = format_no_match_hint(error, 0, search_pattern, content)
+    return (error or "") + hint
 
 
 def _hint_ambiguity(content: str, hint: str, tail: str = "") -> tuple[int, str]:
@@ -148,7 +151,7 @@ def _hint_ambiguity(content: str, hint: str, tail: str = "") -> tuple[int, str]:
     return n, f"context hint '{hint}' is ambiguous ({n} occurrences){tail}" if n > 1 else ""
 
 
-def _overlay_key(path: str, file_ops: Any) -> str:
+def _overlay_key(path: str, file_ops: Any, *, entry: bool = False) -> str:
     """One validation-overlay key per backend file, however the patch spells it.
 
     Lexical only (the parser cannot resolve paths on a remote backend): ``x``, ``./x``,
@@ -161,6 +164,9 @@ def _overlay_key(path: str, file_ops: Any) -> str:
     host path under a docker workspace mount -> the container path) runs first. A trailing
     ``/`` or ``/.`` needs a directory, so it keeps a marker and never shares the file's key.
     """
+    key_for_path = getattr(file_ops, "patch_path_key", None)
+    if callable(key_for_path) and isinstance(key := key_for_path(path, entry=entry), str):
+        return key
     env = getattr(file_ops, "env", None)
     cwd = getattr(env, "cwd", None) or getattr(file_ops, "cwd", None)
     cwd = cwd if isinstance(cwd, str) else ""
@@ -195,15 +201,25 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
     # keyed by _overlay_key so path aliases share one entry.
     pending_content: dict = {}
     removed_paths: set = set()
+    virtual_paths: dict[str, str] = {}
+
+    def _entry(path: str) -> str:
+        return _overlay_key(path, file_ops, entry=True)
+
+    def _content_key(path: str) -> str:
+        physical = _entry(path)
+        return virtual_paths.get(physical, _overlay_key(path, file_ops))
 
     def _read_checked(path: str) -> tuple[Optional[str], Optional[str], bool]:
         """(content, error, too_large): too_large means the file exists on disk but is past
         read_file_raw's cap; the patch's own overlay always answers first."""
-        key = _overlay_key(path, file_ops)
+        key = _content_key(path)
+        if _entry(path) in removed_paths:
+            return None, "file not found", False
+        if key in removed_paths:
+            return None, "the patch removes this entry's referent", False
         if key in pending_content:
             return pending_content[key], None, False
-        if key in removed_paths:
-            return None, "file not found", False
         r = file_ops.read_file_raw(path)
         if r.error:
             return None, r.error, bool(getattr(r, "_too_large", False))
@@ -217,11 +233,11 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
         the path absent (``not_found``) frees it: a read that FAILED (no byte transport, a
         directory, an unreadable file) says nothing about what is there, and taking it as free
         writes over the file the check exists to protect."""
-        key = _overlay_key(path, file_ops)
-        if key in pending_content:
-            return "exists"
-        if key in removed_paths:
+        physical = _entry(path)
+        if physical in removed_paths:
             return None
+        if physical in virtual_paths or _content_key(path) in pending_content:
+            return "exists"
         r = file_ops.read_file_raw(path)
         if not r.error:
             return "exists"
@@ -249,6 +265,9 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
                                       f"'{hunk.context_hint}' not found")
                     elif ambiguous:
                         errors.append(f"{op.file_path}: addition-only hunk {ambiguous}")
+                    if occurrences != 1:
+                        continue
+                simulated, _ = _insert_addition_only(simulated, hunk, '\n'.join(replace_lines))
                 continue
             search_pattern, replacement = '\n'.join(search_lines), '\n'.join(replace_lines)
             new_simulated, count, _strategy, match_error = fuzzy_find_and_replace(
@@ -258,16 +277,16 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
             elif not is_already_applied(simulated or "", search_pattern, replacement):
                 # Already-applied hunks are no-ops (apply performs the same skip).
                 label = f"'{hunk.context_hint}'" if hunk.context_hint else "(no hint)"
-                errors.append(
-                    f"{op.file_path}: hunk {hunk_index} {label} not found"
-                    + (f" — {match_error}" if match_error else "")
-                    + _no_match_hint(match_error, search_pattern, simulated))
-        pending_content[_overlay_key(op.file_path, file_ops)] = simulated
+                detail = _no_match_detail(match_error, search_pattern, simulated, file_ops, op.file_path)
+                errors.append(f"{op.file_path}: hunk {hunk_index} {label} not found"
+                              + (f" — {detail}" if detail else ""))
+        pending_content[_content_key(op.file_path)] = simulated
 
     def _remove(path: str) -> None:
-        key = _overlay_key(path, file_ops)
+        key = _entry(path)
         removed_paths.add(key)
         pending_content.pop(key, None)
+        virtual_paths.pop(key, None)
 
     for op in operations:
         if op.operation == OperationType.UPDATE:
@@ -294,7 +313,12 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
             elif dst_taken:
                 errors.append(f"{op.new_path}: {dst_taken}")
             elif not src_err:  # only a cleanly-validated move updates the overlay
-                pending_content[_overlay_key(op.new_path, file_ops)] = src_content if src_content is not None else ""
+                destination = _entry(op.new_path)
+                referent = _content_key(op.file_path)
+                new_key = destination if referent == _entry(op.file_path) else referent
+                virtual_paths[destination] = new_key
+                removed_paths.discard(destination)
+                pending_content[new_key] = src_content if src_content is not None else ""
                 _remove(op.file_path)
         elif op.operation == OperationType.ADD:
             # An Add must create a NEW file. If the target already exists, write_file
@@ -310,8 +334,10 @@ def _validate_operations(operations: list[PatchOperation], file_ops: Any) -> lis
             elif add_taken:
                 errors.append(f"{op.file_path}: {add_taken}")
             else:
-                removed_paths.discard(_overlay_key(op.file_path, file_ops))
-                pending_content[_overlay_key(op.file_path, file_ops)] = '\n'.join(
+                destination = _entry(op.file_path)
+                removed_paths.discard(destination)
+                virtual_paths[destination] = destination
+                pending_content[destination] = '\n'.join(
                     line.content for hunk in op.hunks for line in hunk.lines if line.prefix == '+')
     if not errors and real_change_count == 0:
         errors.append("Patch contains no changes (only context lines were provided)")
@@ -343,14 +369,23 @@ def _written(result: Any, diff: str, path: str, read_sha256: Optional[str]) -> A
     return ApplyResult(True, diff, getattr(result, "lsp_diagnostics", None), getattr(result, "lint", None), write)
 
 
-def _unified_diff(path: str, old: str, new: Optional[str]) -> str:
+def _visible_patch_text(file_ops: Any, path: str, text: str) -> str:
+    visible_text = getattr(file_ops, "patch_visible_text", None)
+    if callable(visible_text) and isinstance(visible := visible_text(path, text), str):
+        return visible
+    return text
+
+
+def _unified_diff(path: str, old: str, new: Optional[str], file_ops: Any = None) -> str:
     """Unified diff ``a/path`` -> ``b/path`` (``new=None`` = deletion, ``/dev/null``)."""
     return ''.join(difflib.unified_diff(
-        old.splitlines(keepends=True), [] if new is None else new.splitlines(keepends=True),
+        _visible_patch_text(file_ops, path, old).splitlines(keepends=True),
+        [] if new is None else _visible_patch_text(file_ops, path, new).splitlines(keepends=True),
         fromfile=f"a/{path}", tofile="/dev/null" if new is None else f"b/{path}"))
 
 
-def apply_v4a_operations(operations: list[PatchOperation], file_ops: Any) -> PatchResult:
+def apply_v4a_operations(operations: list[PatchOperation], file_ops: Any, *,
+                         stop_on_apply_error: bool = False) -> PatchResult:
     """Two-phase: validate everything, then apply (atomic on validation failure). A phase-2
     failure (validate/apply race) carries a ``git diff`` note since state may be inconsistent.
     ``file_ops`` needs read_file_raw/write_file/delete_file/move_file."""
@@ -378,6 +413,8 @@ def apply_v4a_operations(operations: list[PatchOperation], file_ops: Any) -> Pat
         if not ok:
             prefix = f"Failed to {verb}" if ok is False else "Error processing"
             errors.append(f"{prefix} {op.file_path}: {payload}")
+            if stop_on_apply_error:
+                break
             continue
         is_move = op.operation is OperationType.MOVE
         files[bucket].append(f"{op.file_path} -> {op.new_path}" if is_move else op.file_path)
@@ -425,7 +462,8 @@ def _apply_add(op: PatchOperation, file_ops: Any) -> ApplyResult:
         return _fail(f"{op.file_path}: could not confirm the path is free — {read_back.error}")
     content_lines = [line.content for hunk in op.hunks for line in hunk.lines if line.prefix == '+']
     result = file_ops.write_file(op.file_path, '\n'.join(content_lines))
-    diff = f"--- /dev/null\n+++ b/{op.file_path}\n" + '\n'.join(f"+{line}" for line in content_lines)
+    visible = _visible_patch_text(file_ops, op.file_path, '\n'.join(content_lines)).split('\n') if content_lines else []
+    diff = f"--- /dev/null\n+++ b/{op.file_path}\n" + '\n'.join(f"+{line}" for line in visible)
     return _written(result, diff, op.file_path, "")
 
 
@@ -434,9 +472,10 @@ def _apply_delete(op: PatchOperation, file_ops: Any) -> ApplyResult:
     read_result = file_ops.read_file_raw(op.file_path)  # re-read guards validate/apply races
     too_large = getattr(read_result, "_too_large", False)  # exists, just past the read cap: no diff
     if read_result.error and not too_large:
-        return _fail(f"Cannot delete {op.file_path}: file not found")
+        return _fail(f"Cannot delete {op.file_path}: {read_result.error}")
     result = file_ops.delete_file(op.file_path)
-    diff = (None if too_large else _unified_diff(op.file_path, read_result.content, None)) \
+    entry_only = getattr(read_result, "_entry_only", False) is True
+    diff = (None if too_large or entry_only else _unified_diff(op.file_path, read_result.content, None, file_ops)) \
         or f"# Deleted: {op.file_path}"
     return _fail(result.error) if result.error else ApplyResult(True, diff)
 
@@ -511,12 +550,12 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> ApplyResult:
             # Mirror validation's already-applied skip, else the two phases disagree and fail here.
             if is_already_applied(new_content, search_pattern, replacement):
                 continue
-            hint = _no_match_hint(error, search_pattern, new_content)
-            return _fail(f"Could not apply hunk: {error}" + hint)
+            detail = _no_match_detail(error, search_pattern, new_content, file_ops, op.file_path)
+            return _fail(f"Could not apply hunk: {detail}")
     # Pass pre_content to skip a redundant re-read inside write_file when supported.
     extra = {"pre_content": current_content} if _write_file_accepts_pre_content(file_ops) else {}
     write_result = file_ops.write_file(op.file_path, new_content, **extra)
-    result = _written(write_result, _unified_diff(op.file_path, current_content, new_content),
+    result = _written(write_result, _unified_diff(op.file_path, current_content, new_content, file_ops),
                       op.file_path, getattr(read_result, "_content_sha256", None))
     if not result.ok:
         return result

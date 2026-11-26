@@ -1122,14 +1122,16 @@ def _(rid, params: dict) -> dict:
 
 @_rpc("rollback.list", live_session=True, fail_code=5020)
 def _(rid, params: dict, session) -> dict:
-    def go(mgr, cwd):
+    def go(mgr, cwd, refusal):
         if not mgr.enabled:
             return _ok(rid, {"enabled": False, "checkpoints": []})
+        if refusal:
+            return _err(rid, 5020, refusal)
         # The TUI renders ``message``; the manager calls it ``reason``.
         rows = [{"hash": c.get("hash", ""), "timestamp": c.get("timestamp", ""), "message": c.get("reason", "")}
                 for c in mgr.list_checkpoints(cwd)]
         return _ok(rid, {"enabled": True, "checkpoints": rows})
-    return _with_checkpoints(session, go)
+    return _with_checkpoints(session, go, allow_host_listing=True)
 
 
 @_rpc("rollback.restore", live_session=True, fail_code=5021)
@@ -1145,9 +1147,9 @@ def _(rid, params: dict, session) -> dict:
     if not file_path and session.get("running"):
         return _err(rid, 4009, busy_message("rollback restore", bool(session.get("_manual_compress_active"))))
 
-    def go(mgr, cwd):
-        if reason := _container_checkpoint_refusal(session, mgr, cwd):
-            return {"success": False, "error": reason}
+    def go(mgr, cwd, refusal):
+        if refusal:
+            return {"success": False, "error": refusal}
         # A whole-tree restore keeps the user's hand-edits unless ``all`` (main's --all), as on the owner.
         commit = _resolve_checkpoint_hash(mgr, cwd, target)
         taken = _tools_mod("agent.checkpoints.undo_hint").checkpoint_taken_at(cwd, commit)
@@ -1178,10 +1180,9 @@ def _(rid, params: dict, session) -> dict:
     if not (target := params.get("hash", "")):
         return _err(rid, 4014, "hash required")
 
-    def go(mgr, cwd):
-        # Host tree vs host checkpoint is not this session's diff either (same refusal as /rollback diff).
-        if reason := _container_checkpoint_refusal(session, mgr, cwd):
-            return _err(rid, 5022, reason)
+    def go(mgr, cwd, refusal):
+        if refusal:
+            return _err(rid, 5022, refusal)
         r = mgr.diff(cwd, _resolve_checkpoint_hash(mgr, cwd, target))
         raw = r.get("diff", "")[:4000]
         payload = {"stat": r.get("stat", ""), "diff": raw}
@@ -1189,22 +1190,6 @@ def _(rid, params: dict, session) -> dict:
             payload["rendered"] = rendered
         return _ok(rid, payload)
     return _with_checkpoints(session, go)
-
-
-def _container_checkpoint_refusal(session, mgr, cwd) -> str | None:
-    """Why host checkpoints are off limits for a container-backed session, else ``None``.
-
-    Classifies with the identity and scopes a turn binds (prompt_turn.py): the session key is the
-    tool-call task id, the session context drives the terminal registry lookup, and the profile
-    scope supplies the terminal policy; otherwise a cached launch-profile environment or the launch
-    config would answer for another profile's session."""
-    task_id = session.get("session_key") or "default"
-    tokens = _set_session_context(task_id, cwd=cwd)
-    try:
-        with _session_profile_runtime_scope(session):
-            return mgr.unsupported_backend_reason(task_id)
-    finally:
-        _clear_session_context(tokens)
 
 
 @method("browser.manage")

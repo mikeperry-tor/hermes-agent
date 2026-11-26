@@ -26,11 +26,36 @@ import os
 import stat
 import threading
 import time
+from typing import NamedTuple
 
 from tools.file_state import _evict_oldest
 from tools.file_tools_paths import _authoritative_workspace_root, _resolve_path_for_task
 
 logger = logging.getLogger("tools.file_tools")
+
+
+class SSHFileKey(NamedTuple):
+    host: str
+    port: int
+    user: str
+    path: str
+
+    @classmethod
+    def for_backend(cls, environment, path: str):
+        return cls(environment.host, environment.port, environment.user, path)
+
+
+def ssh_write_baseline(task_id: str, key: SSHFileKey) -> tuple | None:
+    with _read_tracker_lock:
+        return (_read_tracker.get(task_id) or {}).get("full_write_baselines", {}).get(key)
+
+
+def record_ssh_write(task_id: str, key: SSHFileKey, version: tuple) -> None:
+    with _read_tracker_lock:
+        task_data = _task_data(task_id)
+        task_data["full_write_baselines"][key] = version
+        task_data["read_coverage"].pop(key, None)
+        _cap_read_tracker_data(task_data)
 
 
 class _PerAgentTracker(dict):
@@ -207,7 +232,8 @@ def _dedup_lookup(task_id: str, dedup_key: tuple) -> tuple[dict, object, bool]:
                 dedup_key in task_data["dedup_generation_reads"] and not _programmatic_read.get())
 
 
-def _note_read_served(task_data: dict, dedup_key: tuple, path: str, offset: int, limit: int) -> tuple[int, dict]:
+def _note_read_served(task_data: dict, dedup_key: tuple, path: str, offset: int, limit: int,
+                      *, version: tuple | None = None) -> tuple[int, dict]:
     """Record that a read's content was served; returns ``(consecutive count, dedup map)``. Lock
     must be held. A programmatic read leaves the model-facing state alone: count 1 and a
     throwaway map, so a later read by the model is never told it already has these bytes."""
@@ -215,7 +241,10 @@ def _note_read_served(task_data: dict, dedup_key: tuple, path: str, offset: int,
         return 1, {}  # the map is discarded: nothing is remembered as shown to the model
     task_data["dedup_hits"].pop(dedup_key, None)
     task_data["dedup_generation_reads"].add(dedup_key)
-    return _bump_consecutive(task_data, ("read", path, offset, limit)), task_data["dedup"]
+    read_key = ("read", path, offset, limit)
+    if version is not None:
+        read_key += (version,)
+    return _bump_consecutive(task_data, read_key), task_data["dedup"]
 
 
 def _bump_consecutive(task_data: dict, key: tuple) -> int:
@@ -254,7 +283,8 @@ def reset_file_dedup(task_id: str | None = None):
         candidates = [(task_data, dict(task_data.get("full_write_baselines", {})))
                       for task_data in targets]
     for task_data, baselines in candidates:
-        changed = {p for p, version in baselines.items() if _file_metadata(p) != version[:-1]}
+        changed = {p for p, version in baselines.items()
+                   if not isinstance(p, SSHFileKey) and _file_metadata(p) != version[:-1]}
         if changed:
             with _read_tracker_lock:
                 for p in changed:
@@ -502,7 +532,10 @@ def _mark_verification_stale(task_id: str, resolved_paths: list[str],
     try:
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import mark_workspace_edited
+        from tools.file_tools_paths import uses_ssh_for_task
 
+        if uses_ssh_for_task(task_id):
+            return
         parents = [str(Path(p).parent) for p in paths]
         cwd = (next((c for c in parents if project_facts_for(c)), None)
                or _authoritative_workspace_root(task_id) or parents[0])

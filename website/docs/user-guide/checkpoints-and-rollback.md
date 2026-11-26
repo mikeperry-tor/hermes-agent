@@ -278,7 +278,9 @@ from the nested repository's own working directory.
 
 ### Container Backends
 
-With a container terminal backend (`docker`, `modal`, `daytona`, `vercel_sandbox`, or a container plugin such as `singularity`), file paths belong to the sandbox rather than the host. Hermes therefore does not take checkpoints or record the agent-write ledger for those paths, and `/rollback` explains the limitation: it still lists existing host checkpoints but refuses diff and restore, on the CLI and in messaging-gateway chats alike; `/diff session` answers with the same reason. The TUI and Desktop behave the same: `/rollback list` still works while `/rollback diff` and `/rollback <N>` are refused with that reason. Local and SSH backends are unaffected. To point `terminal.cwd` at the container-side view of a mounted directory see [`terminal.docker_mount_cwd_to_workspace`](./configuration.md).
+With a container terminal backend (`docker`, `modal`, `daytona`, `vercel_sandbox`, or a container plugin such as `singularity`), file paths belong to the sandbox. Hermes skips automatically taking checkpoints and recording the agent-write ledger for those paths. `/rollback` can still list existing host checkpoints. Checkpoint diff, restore, and `/diff session` report that the session uses a separate filesystem. To point `terminal.cwd` at the container-side view of a mounted directory, see [`terminal.docker_mount_cwd_to_workspace`](./configuration.md).
+
+SSH sessions use the remote filesystem. Automatic checkpoints, `/rollback`, and `/diff session` are unavailable for SSH workspaces. `hermes checkpoints` still manages the profile's local checkpoint store.
 
 - **Git availability** — if `git` is not found on `PATH`, checkpoints are transparently disabled.
 - **Directory scope** — Hermes skips overly broad directories: root `/`, your home `$HOME`, and every directory that contains your home (such as `/home` or `/Users`). It also never snapshots its own checkpoint store, even when the project is `~/.hermes` itself.

@@ -187,6 +187,7 @@ printf '__HERMES_FS_SIZE__:%s\\n' "$size"
         target = self.normalize(path)
         command = f"""
 p={shlex.quote(target)}
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then printf '__HERMES_FS_ERROR__:ENOENT\\n'; exit 44; fi
 target=$(realpath "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null) || {{ printf '__HERMES_FS_ERROR__:ENOENT\\n'; exit 44; }}
 if [ ! -f "$target" ]; then printf '__HERMES_FS_ERROR__:ENOTREG\\n'; exit 45; fi
 size=$(stat -c %s "$target" 2>/dev/null || stat -f %z "$target" 2>/dev/null) || {{ printf '__HERMES_FS_ERROR__:EACCES\\n'; exit 46; }}
