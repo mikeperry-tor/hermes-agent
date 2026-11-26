@@ -220,7 +220,7 @@ def _iter_gateway_skills(platform: str):
     for cmd_key in sorted(skill_cmds):
         info = skill_cmds[cmd_key]
         skill_path = info.get("skill_md_path", "")
-        if not skill_path:
+        if not skill_path or info.get("executor_project"):
             continue
         sp = Path(skill_path).resolve()
         if sp.is_relative_to(hub_dir):

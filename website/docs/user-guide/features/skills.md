@@ -494,6 +494,8 @@ hermes skills untrust           # revoke
 
 Trusted roots are stored in `skills.trusted_project_dirs` in `~/.hermes/config.yaml`. Set `skills.project_discovery: false` to turn the feature off entirely (no scanning, no notices).
 
+With [managed SSH workspaces](../managed-scope.md), trusted project skills are discovered and read from the SSH executor, and eligible `skills.inline_shell` snippets run on the executor in the mapped skill directory rather than on the Hermes host. Project skills on the executor cannot install packages into the Hermes runtime or request profile environment variables and credential files from Hermes, and synced skill directories remain upload-only so remote edits do not overwrite Hermes-owned skills.
+
 ### Precedence
 
 Project skills are the **highest-precedence tier**: `project → local (~/.hermes/skills/) → skills.create_dir → external_dirs`. A project skill named `deploy` overrides a same-named profile or bundled skill for sessions inside that repo — that's the point: vendored repo skills win on their home turf, without touching your global profile. Project skills are tagged `[project]` in the agent's skill index so provenance stays visible.

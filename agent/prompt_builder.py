@@ -1392,6 +1392,9 @@ def _build_skills_system_prompt_inner(
     # Skill files are part of the key: another process (a hub install in a second terminal, the curator
     # inside the gateway, a git pull of an external dir) never clears this process's LRU, so a key of
     # config alone served the pre-change index to every running session until restart (#92313).
+    from agent.ssh_project_skills import project_skill_metadata
+
+    executor_rows = project_skill_metadata()
     manifest = _build_skills_manifest(skills_dir)
     files = frozenset((rel, *sig) for rel, sig in manifest.items())
     files |= {(str(d), rel, *sig) for _, d in extra_roots for rel, sig in _build_skills_manifest(d).items()}
@@ -1408,7 +1411,7 @@ def _build_skills_system_prompt_inner(
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
-        if cached is not None and not app_gated:
+        if not executor_rows and cached is not None and not app_gated:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
 
@@ -1437,6 +1440,12 @@ def _build_skills_system_prompt_inner(
     rows: list[tuple[dict, bool]] = []
     for root in project_roots:
         rows += _scan_extra_root(root, iter_project_skill_files(root), TIER_PROJECT, "Error reading project skill %s: %s")
+    rows += [
+        ({**_build_snapshot_entry(file, root, metadata, extract_skill_description(metadata)),
+          "tier": TIER_PROJECT, "root": root, "executor_project": True},
+         skill_matches_platform(metadata) and skill_matches_environment(metadata) and skill_matches_apps(metadata))
+        for root, file, metadata in executor_rows
+    ]
     rows += [({**entry, "tier": TIER_LOCAL, "root": skills_dir}, ok) for entry, ok in candidates]
     for tier, root in ((t, d) for t, d in extra_roots if t != TIER_PROJECT and d.exists()):
         rows += _scan_extra_root(root, iter_skill_index_files(root, "SKILL.md"), tier, "Error reading external skill %s: %s")
@@ -1467,6 +1476,8 @@ def _build_skills_system_prompt_inner(
 
     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
     result = _render_skills_index(skills_by_category, compact_categories, available_tools, unloadable)
+    if executor_rows:
+        return result
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
