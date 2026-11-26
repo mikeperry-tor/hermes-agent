@@ -297,7 +297,12 @@ class ReadRangeRequestParams(ServerRequestParams):
     count: int | None = None
 
 
-server_request("terminal.read", params=ReadRangeRequestParams, result=ValueResult,
+class TerminalReadRequestParams(ReadRangeRequestParams):
+    owner_profile: str | None = None
+    relay_read_scope: str | None = None
+
+
+server_request("terminal.read", params=TerminalReadRequestParams, result=ValueResult,
                doc="Read the visible in-app terminal buffer (JSON text answer).")
 server_request("preview.read", params=ReadRangeRequestParams, result=ValueResult,
                doc="Read the in-app browser preview's text (JSON text answer).")

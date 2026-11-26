@@ -32,7 +32,7 @@ import { bindTerminalDrop } from './terminal-drop'
 import { prepareTerminalFontFamily } from './terminal-font'
 import { bindTerminalActivity, bindTerminalClipboard } from './terminal-input-bindings'
 import { createSessionAttemptController } from './terminal-session-attempt'
-import type { TerminalStatus } from './terminal-session-attempt'
+import type { SessionAttemptController, TerminalStatus } from './terminal-session-attempt'
 import { redrawAllTerminals, registerWebglRefresh } from './terminals'
 import { useTerminalFontController } from './use-terminal-font'
 
@@ -96,6 +96,7 @@ export function useTerminalSession({
   const termRef = useRef<Terminal | null>(null)
   const webglRef = useRef<WebglAddon | null>(null)
   const sessionIdRef = useRef<string | null>(null)
+  const executorReadScopeRef = useRef<SessionAttemptController['executorReadScope'] | null>(null)
   // Snapshot the revive buffer once: live snapshots feed updateTerminalReviveBuffer
   // and would otherwise re-arm replay on every store-driven re-render.
   const initialReviveBufferRef = useRef(reviveBuffer)
@@ -291,6 +292,8 @@ export function useTerminalSession({
         }
       }
     })
+    executorReadScopeRef.current = session.executorReadScope
+    cleanup.push(() => { executorReadScopeRef.current = null })
 
     const initialReviveBuffer = initialReviveBufferRef.current ?? ''
     const history = createReviveHistory(term, initialReviveBuffer, session.isPersistent)
@@ -561,7 +564,7 @@ export function useTerminalSession({
 
     const term = termRef.current
 
-    return term ? registerTerminalReader(id, makeTerminalReader(term)) : undefined
+    return term ? registerTerminalReader(id, makeTerminalReader(term), () => executorReadScopeRef.current?.() ?? null) : undefined
   }, [id, status])
 
   // On (re)activation: a WebGL terminal doesn't paint while visibility:hidden, so

@@ -175,6 +175,22 @@ def test_an_oauth_socket_ticket_is_minted_with_the_bearer(remote, monkeypatch):
     assert ticket_call["authorization"] == "Bearer at-1"
 
 
+def test_socket_ticket_pins_the_account_while_allowing_its_token_to_rotate(remote, monkeypatch):
+    cid = _save(authMode='oauth')
+    _sign_in(remote, cid)
+    target = reach.resolve_dial_target(cid)
+    tokens = store.read_tokens(cid)
+    monkeypatch.setattr(reach, '_post_ticket', lambda base, headers: oauth._client().post(
+        f'{base}/api/auth/ws-ticket', headers=headers))
+
+    store.write_tokens(cid, {**tokens, 'accessToken': 'new-token'})
+    assert reach.mint_ws_ticket(cid, for_dial=target) == 'tk-1'
+
+    store.write_tokens(cid, {**tokens, 'userId': 'different-account'})
+    with pytest.raises(oauth.OAuthSignInError, match='connection changed'):
+        reach.mint_ws_ticket(cid, for_dial=target)
+
+
 def test_the_routes_serve_only_the_webapp_and_the_callback_never_shows_a_token(remote, monkeypatch):
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
     monkeypatch.setattr(web_server.app.state, "ui_surface", "webapp", raising=False)

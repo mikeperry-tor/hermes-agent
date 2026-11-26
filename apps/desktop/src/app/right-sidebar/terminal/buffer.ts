@@ -1,5 +1,7 @@
 import type { Terminal } from '@xterm/xterm'
 
+import type { HermesTerminalReadScope } from '@/global'
+
 // Serialized view of the in-app terminal, handed to the agent's `read_terminal`
 // tool. Line indices are absolute into xterm's buffer (0 = oldest scrollback
 // line), so the agent can page with start_line/count against `total_lines`.
@@ -23,11 +25,12 @@ type Reader = (opts: TerminalReadOptions) => TerminalReadResult
 // (driven by the tab selection) decides which one the agent's `read_terminal`
 // tool sees. Keying by id keeps switching race-free — a deactivating tab's
 // cleanup can't null out the tab that just activated.
-const readers = new Map<string, Reader>()
+const readers = new Map<string, { read: Reader; executorScope?: () => HermesTerminalReadScope | null }>()
 let activeId: string | null = null
 
 /** Register a live terminal's reader; returns an idempotent unregister. */
-export function registerTerminalReader(id: string, reader: Reader): () => void {
+export function registerTerminalReader(id: string, read: Reader, executorScope?: () => HermesTerminalReadScope | null): () => void {
+  const reader = { read, executorScope }
   readers.set(id, reader)
 
   return () => {
@@ -41,10 +44,19 @@ export function setActiveTerminalId(id: string | null): void {
   activeId = id
 }
 
-export function readActiveTerminal(opts: TerminalReadOptions = {}): TerminalReadResult | null {
+export function readActiveTerminal(opts: TerminalReadOptions = {}, scope?: HermesTerminalReadScope): TerminalReadResult | null {
   const reader = activeId === null ? null : readers.get(activeId)
 
-  return reader ? reader(opts) : null
+  if (scope) {
+    const verified = reader?.executorScope?.()
+
+    if (!verified || verified.profile !== scope.profile || verified.connectionId !== scope.connectionId ||
+        verified.relayReadScope !== scope.relayReadScope) {
+      return null
+    }
+  }
+
+  return reader ? reader.read(opts) : null
 }
 
 export function makeTerminalReader(term: Terminal): Reader {

@@ -46539,6 +46539,68 @@
         "title": "TerminalOutputPayload",
         "type": "object"
       },
+      "TerminalReadRequestParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Start"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Count"
+          },
+          "owner_profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Owner Profile"
+          },
+          "relay_read_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Relay Read Scope"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "TerminalReadRequestParams",
+        "type": "object"
+      },
       "TerminalResizeParams": {
         "additionalProperties": false,
         "properties": {
@@ -51890,7 +51952,7 @@
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/ReadRangeRequestParams"
+            "$ref": "#/components/schemas/TerminalReadRequestParams"
           }
         }
       ],

@@ -78,7 +78,8 @@ const {
   ensureGatewayForProfile,
   openGatewayForAgent,
   pruneSecondaryGateways,
-  setPrimaryGateway
+  setPrimaryGateway,
+  setPrimaryGatewayConnectionId
 } = await import('./gateway')
 
 function installDesktop(stub: Record<string, unknown>): void {
@@ -433,6 +434,16 @@ describe('server→client request routing without a registry handler (#112791)',
     expect(onServerRequest).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'srq-1', method: 'clarify', profile: 'work' })
     )
+  })
+
+  it('tags a primary socket request with its own gateway while a secondary is in view', () => {
+    const onServerRequest = vi.fn()
+    configureGatewayRegistry({ activeConnectionId: () => 'other', onEvent: vi.fn(), onServerRequest } as never)
+    setPrimaryGatewayConnectionId('local')
+    const request = { fail: vi.fn(), id: 'srq-1', method: 'terminal.read', params: {}, respond: vi.fn() }
+
+    expect(dispatchPrimaryServerRequest(request, 'default')).toBe(true)
+    expect(onServerRequest).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'local' }))
   })
 })
 

@@ -26,7 +26,7 @@ from hermes_cli.pty_session import (
 )
 from hermes_cli.web_host_terminal import ExecutorTerminalError
 from hermes_cli.web_host_terminal import META_PREFIX
-from hermes_constants import assert_named_profile_home_live, get_hermes_home
+from hermes_constants import assert_named_profile_home_live, get_hermes_home, profile_name_for_home
 
 # No survival across backend restart. Disconnects retain a bounded ANSI tail.
 RETENTION_SECONDS = 15 * 60
@@ -75,6 +75,7 @@ class HostOwner:
     shell: str
     cwd: str
     environment: str = field(default="gateway", kw_only=True)
+    admitted_profile: str | None = field(default=None, kw_only=True)
 
     def current(self) -> bool:
         """Blocking filesystem reads (home, tombstone): call off-loop."""
@@ -143,12 +144,15 @@ class HostTerminalRegistry(PtySessionRegistry):
         if getattr(ws.state, "ssh_terminal", None) is None:
             from hermes_cli.web_host_terminal import prepare, environment
             def request_live_home():
-                home = _request_home(ws.query_params.get("profile"))
+                requested = (ws.query_params.get("profile") or "").strip()
+                home = _request_home(requested)
                 if not _home_live(home):
                     raise TerminalExpired()
-                return home
+                profile = (requested if requested and requested.lower() != "current"
+                           else profile_name_for_home(get_hermes_home()))
+                return home, profile
 
-            home = await asyncio.to_thread(request_live_home)
+            home, profile = await asyncio.to_thread(request_live_home)
             # Remote preparation must never hold the PTY registry's spawn lock.
             prepared = await prepare(home, ws.query_params.get("cwd"), mode=environment(ws.app),
                                      ssh_config=getattr(ws.app.state, "executor_ssh_config", ""))
@@ -162,7 +166,8 @@ class HostTerminalRegistry(PtySessionRegistry):
                 if not _home_live(home):
                     raise TerminalExpired()
                 argv, cwd, env, shell, terminal_cwd = prepared
-                owner = HostOwner(identity, home, shell, terminal_cwd, environment=environment(ws.app))
+                owner = HostOwner(identity, home, shell, terminal_cwd, environment=environment(ws.app),
+                                  admitted_profile=profile)
             bridge = PtyBridge.spawn(
                 argv, cwd=cwd, env=env,
                 cols=query_dimension(ws.query_params.get("cols"), 80, 2000),
@@ -296,8 +301,11 @@ async def host_terminal_lifespan(app):
 
 
 def _metadata(token, owner, registry, *, reconnected, truncated):
+    placement = {}
+    if type(owner) is HostOwner:
+        placement = {"environment": owner.environment, "profile": owner.admitted_profile}
     return META_PREFIX + json.dumps({
-        **({"environment": owner.environment} if type(owner) is HostOwner else {}),
+        **placement,
         "shell": owner.shell, "terminalId": token, "cwd": owner.cwd,
         "reconnected": reconnected, "retentionSeconds": registry._ttl,
         "truncated": truncated,

@@ -19,15 +19,25 @@ session token as ``?token=`` (``connection-config.ts::buildGatewayWsUrl``) and n
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
 
 from hermes_cli import gateway_connections as store
 from hermes_cli import gateway_connections_oauth as oauth
+from hermes_cli.gateway_connections_normalize import dial_fingerprint
 
 SESSION_TOKEN_HEADER = "X-Hermes-Session-Token"
 _TICKET_TIMEOUT_S = 8.0
+
+
+@dataclass(frozen=True)
+class ResolvedDial:
+    base_url: str
+    headers: dict[str, str] = field(repr=False)
+    dial: str = field(repr=False)
+    principal: tuple[str, str] | None = field(default=None, repr=False)
 
 
 def _entry(connection_id: str) -> dict:
@@ -37,12 +47,13 @@ def _entry(connection_id: str) -> dict:
     return entry
 
 
-def _remote_target(entry: dict, rejected_token: str) -> tuple[str, dict[str, str]]:
+def _remote_target(entry: dict, rejected_token: str) -> ResolvedDial:
     if entry.get("authMode") == "oauth":
         # The token comes back with the address it was issued by and that read's extra headers:
         # one snapshot, never this entry's (possibly older) URL paired with a newer sign-in.
         grant = oauth.ensure_access_token(entry["id"], rejected_token=rejected_token)
-        return grant.base_url, {**grant.headers, "Authorization": f"Bearer {grant.access_token}"}
+        return ResolvedDial(grant.base_url, {**grant.headers, "Authorization": f"Bearer {grant.access_token}"},
+                            grant.dial, grant.principal)
     snap = store.dial_snapshot(entry["id"])
     if snap["url"] is None or snap["entry"].get("kind") not in ("remote", "cloud") \
             or snap["entry"].get("authMode") == "oauth":
@@ -50,21 +61,26 @@ def _remote_target(entry: dict, rejected_token: str) -> tuple[str, dict[str, str
     headers = dict(snap["headers"])
     if snap["token"]:
         headers[SESSION_TOKEN_HEADER] = snap["token"]
-    return snap["url"], headers
+    return ResolvedDial(snap["url"], headers, dial_fingerprint(snap["entry"]))
 
 
-def _ssh_target(entry: dict, _rejected_token: str) -> tuple[str, dict[str, str]]:
+def _ssh_target(entry: dict, _rejected_token: str) -> ResolvedDial:
     from hermes_cli import gateway_connections_ssh as ssh
 
     tunnel = ssh.ensure_tunnel(entry)
-    return tunnel.base_url, {SESSION_TOKEN_HEADER: tunnel.token}
+    return ResolvedDial(tunnel.base_url, {SESSION_TOKEN_HEADER: tunnel.token}, dial_fingerprint(entry))
 
 
 _BY_KIND = {"remote": _remote_target, "cloud": _remote_target, "ssh": _ssh_target}
 
 
 def resolve_target(connection_id: str, *, rejected_token: str = "") -> tuple[str, dict[str, str]]:
-    """``(base_url, headers)`` to reach *connection_id* as a normal client of that gateway.
+    target = resolve_dial_target(connection_id, rejected_token=rejected_token)
+    return target.base_url, target.headers
+
+
+def resolve_dial_target(connection_id: str, *, rejected_token: str = "") -> ResolvedDial:
+    """Return the credentials and identity of the saved dial used to reach the gateway.
 
     Raises :class:`store.NoSuchConnection` (404), :class:`store.ConnectionStoreError` (400: the
     local entry, or a remote with no URL), :class:`oauth.NotSignedIn` (the user must sign in),
@@ -84,21 +100,24 @@ def _post_ticket(base_url: str, headers: dict[str, str]) -> httpx.Response:
         return client.post(f"{base_url}/api/auth/ws-ticket", headers=headers)
 
 
-def mint_ws_ticket(connection_id: str, *, for_base_url: Optional[str] = None) -> Optional[str]:
+def mint_ws_ticket(connection_id: str, *, for_base_url: Optional[str] = None,
+                   for_dial: Optional[ResolvedDial] = None) -> Optional[str]:
     """The remote's one-use socket ticket for an oauth-mode *connection_id*; ``None`` for the auth
     modes whose socket carries the session token instead. One forced rotation on a 401.
 
     With *for_base_url* (the address the socket will dial), a ticket is minted only by that
     gateway: an entry re-pointed meanwhile is refused rather than handing one host's ticket to
-    another."""
+    another. ``for_dial`` pins the saved authentication and routing fields as well."""
     entry = _entry(connection_id)
+    if for_dial is not None and dial_fingerprint(entry) != for_dial.dial:
+        raise oauth.OAuthSignInError("The connection changed while connecting; try again.")
     if entry.get("kind") not in ("remote", "cloud") or entry.get("authMode") != "oauth":
         return None
-    base_url, headers = _ticket_target(connection_id, "", for_base_url)
+    base_url, headers = _ticket_target(connection_id, "", for_base_url, for_dial)
     response = _post_ticket(base_url, headers)
     if response.status_code == 401:
         rejected = headers["Authorization"].removeprefix("Bearer ")
-        base_url, headers = _ticket_target(connection_id, rejected, for_base_url or base_url)
+        base_url, headers = _ticket_target(connection_id, rejected, for_base_url or base_url, for_dial)
         response = _post_ticket(base_url, headers)
     if response.status_code != 200:
         raise oauth.OAuthSignInError(f"{base_url} refused a socket ticket ({response.status_code}).")
@@ -108,11 +127,14 @@ def mint_ws_ticket(connection_id: str, *, for_base_url: Optional[str] = None) ->
     return ticket
 
 
-def _ticket_target(connection_id: str, rejected_token: str, for_base_url: Optional[str]) -> tuple[str, dict[str, str]]:
-    base_url, headers = resolve_target(connection_id, rejected_token=rejected_token)
-    if for_base_url is not None and base_url != for_base_url.rstrip("/"):
+def _ticket_target(connection_id: str, rejected_token: str, for_base_url: Optional[str],
+                   for_dial: Optional[ResolvedDial]) -> tuple[str, dict[str, str]]:
+    target = resolve_dial_target(connection_id, rejected_token=rejected_token)
+    if for_base_url is not None and target.base_url != for_base_url.rstrip("/"):
         raise oauth.OAuthSignInError("The connection changed address while connecting; try again.")
-    return base_url, headers
+    if for_dial is not None and (target.dial != for_dial.dial or target.principal != for_dial.principal):
+        raise oauth.OAuthSignInError("The connection changed while connecting; try again.")
+    return target.base_url, target.headers
 
 
 def forget(connection_id: str) -> None:

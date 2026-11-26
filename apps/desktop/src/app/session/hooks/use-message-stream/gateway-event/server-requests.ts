@@ -1,4 +1,4 @@
-import type { SetupBeat } from '@hermes/shared'
+import { LOCAL_CONNECTION_ID, type SetupBeat } from '@hermes/shared'
 
 import {
   hasLivePreviewSurface,
@@ -17,6 +17,7 @@ import { pendingClarifyToolPayload } from '@/app/session/hooks/use-session-actio
 import { translateNow } from '@/i18n'
 import { restorePendingClarifyToolCall } from '@/lib/chat-messages'
 import { hostHas } from '@/lib/host-capabilities'
+import { isBrowserHostedDesktop } from '@/lib/platform'
 import type { PreviewActAction } from '@/lib/preview-act/act-in-page'
 import type { TourAction, TourStep } from '@/lib/tour'
 import { type AppearanceValues, applyAppearance, THEME_MODES } from '@/store/appearance-apply'
@@ -32,8 +33,10 @@ import {
   setVaultUnlockRequest
 } from '@/store/prompts'
 import { rememberServerRequest } from '@/store/server-requests'
-import { $selectedStoredSessionId, $sessions, lineageAliases, sessionMatchesStoredId } from '@/store/session'
+import { $selectedStoredSessionId, $sessions, getSessionOwnerHint, lineageAliases, sessionMatchesStoredId } from '@/store/session'
+import { $focusedStoredSessionId } from '@/store/session-focus'
 import {
+  $focusedRuntimeId,
   $sessionStates,
   $sessionTiles,
   previewScopeForRuntime,
@@ -438,9 +441,30 @@ const vaultUnlockPrompt: Handler = ctx => {
 
 // ── Desktop-surface bridges (answered immediately, no card) ─────────────────
 
-const terminalRead: Handler = ({ request }) => {
-  // read_terminal tool: serialize the renderer's xterm buffer. Empty = no live pane.
+const terminalRead: Handler = ({ request }) =>
   answerValue(request, readActiveTerminal({ count: num(request.params.count), start: num(request.params.start) }))
+
+function browserTerminalRead(request: ScopedServerRequest, sessionId: string) {
+  const focusedRuntimeId = $focusedRuntimeId.get()
+  const focusedStoredId = $focusedStoredSessionId.get()
+  const route = focusedStoredId && focusedStoredId !== $selectedStoredSessionId.get()
+    ? $sessionTiles.get().find(tile => tile.storedSessionId === focusedStoredId && tile.runtimeId === focusedRuntimeId)?.ownerRoute
+    : getSessionOwnerHint(focusedStoredId ?? focusedRuntimeId ?? '')
+  const profile = route?.targetProfile || route?.profile
+  const connectionId = request.connectionId
+  const relayReadScope = str(request.params.relay_read_scope) || undefined
+  const result =
+    !request.replayed && sessionId === focusedRuntimeId && connectionId && profile && route?.connectionId === connectionId &&
+    profile === request.params.owner_profile && (connectionId === LOCAL_CONNECTION_ID || relayReadScope)
+      ? readActiveTerminal({ count: num(request.params.count), start: num(request.params.start) },
+          { connectionId, profile, relayReadScope })
+      : null
+
+  if (result) {
+    answerValue(request, result)
+  } else {
+    request.decline?.('This window has no verified Code terminal for the chat.')
+  }
 }
 
 const previewRead: Handler = ({ request, sessionId }) => {
@@ -848,6 +872,11 @@ export function handleServerRequest(
   }
 
   const sessionId = str(request.params.session_id)
+  if (request.method === 'terminal.read' && isBrowserHostedDesktop()) {
+    browserTerminalRead(request, sessionId)
+
+    return true
+  }
 
   // Resolve a request's runtime session id to its stored id through the state
   // cache the message stream maintains (rotation-aware: auto-compression

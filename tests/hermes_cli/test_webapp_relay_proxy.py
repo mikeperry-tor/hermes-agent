@@ -221,10 +221,20 @@ def live_other(webapp, monkeypatch):
         await ws.accept()
         await host_terminal(ws)
 
+    async def chat_socket(ws: WebSocket):
+        if ws.query_params.get('token') != TOKEN:
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        await ws.send_json({'jsonrpc': '2.0', 'method': 'terminal.read', 'id': 'srq-fixture',
+                            'params': {'owner_profile': 'default', 'session_id': 'fixture'}})
+        await ws.receive()
+
     app = Starlette(routes=[Route("/set", set_cookie), Route("/echo", set_cookie), Route("/api/profiles", profiles),
                             Route("/auth/native/refresh", refresh, methods=["POST"]),
                             Route("/api/webapp/socket-ticket", mint_terminal, methods=["POST"]),
                             WebSocketRoute("/api/audio/speak-stream", speak),
+                            WebSocketRoute('/api/ws', chat_socket),
                             WebSocketRoute("/api/host-terminal", terminal_socket)],
                     lifespan=host_terminal_lifespan)
     app.state.terminal_environment = "executor"
@@ -250,6 +260,34 @@ def _relay_ticket(browser) -> str:
     minted = browser.post("/api/webapp/socket-ticket?socket=relay")
     assert minted.status_code == 200, minted.text
     return minted.json()["ticket"]
+
+
+def test_terminal_and_chat_sockets_share_a_tag_for_the_same_saved_dial(live_other, monkeypatch, tmp_path):
+    from hermes_cli import gateway_connections, web_host_terminal
+
+    webapp, connection_id, _seen, _stop = live_other
+
+    async def prepare(*_args, **_kwargs):
+        return ['/bin/sh', '-i'], str(tmp_path), {'HOME': str(tmp_path)}, 'Code', str(tmp_path)
+
+    monkeypatch.setattr(web_host_terminal, 'prepare', prepare)
+
+    def relay_url(path):
+        return f'ws://localhost/api/relay/{connection_id}/{path}?relay_ticket={_relay_ticket(webapp.browser)}'
+
+    with webapp.browser.websocket_connect(relay_url('api/host-terminal'), headers=_ORIGIN) as terminal:
+        meta = json.loads(terminal.receive_text().removeprefix(web_host_terminal.META_PREFIX))
+        assert meta['environment'] == 'executor' and meta['profile'] == 'default'
+        tag = meta['relay_read_scope']
+        assert len(tag) == 64 and TOKEN not in tag
+        with webapp.browser.websocket_connect(relay_url('api/ws'), headers=_ORIGIN) as chat:
+            assert chat.receive_json()['params']['relay_read_scope'] == tag
+
+        # Another writer changes the target's routing headers before the watch loop closes the terminal.
+        gateway_connections.save_connection({'id': connection_id, 'kind': 'remote', 'label': 'Live',
+                                             'headers': {'X-Route': 'another-tenant'}})
+        with webapp.browser.websocket_connect(relay_url('api/ws'), headers=_ORIGIN) as chat:
+            assert chat.receive_json()['params']['relay_read_scope'] != tag
 
 
 def test_an_oauth_connection_sends_its_bearer_and_a_refused_one_earns_one_forced_refresh(live_other):
@@ -362,7 +400,32 @@ def test_removing_a_connection_closes_its_relayed_socket(live_other):
         assert (closed.value.code, closed.value.reason) == (4404, "Gateway removed")
 
 
-def test_a_connection_removed_while_its_socket_dials_does_not_keep_that_socket(live_other, monkeypatch):
+def test_repointing_a_connection_while_its_socket_gets_credentials_blocks_the_dial(live_other, monkeypatch):
+    from hermes_cli import gateway_connections
+
+    webapp, connection_id, seen, _stop = live_other
+    url = f"ws://localhost/api/relay/{connection_id}/api/audio/speak-stream?relay_ticket={_relay_ticket(webapp.browser)}"
+    socket_credential = webapp_relay_proxy.reach.socket_credential
+
+    async def repoint_after_credential(target, path):
+        credential = await socket_credential(target, path)
+        gateway_connections.save_connection({
+            "id": connection_id, "kind": "remote", "label": target.label,
+            "url": "http://replacement.lan:8000",
+        })
+        webapp_relay_proxy.close_gateway_sockets(connection_id)
+        return credential
+
+    monkeypatch.setattr(webapp_relay_proxy.reach, "socket_credential", repoint_after_credential)
+    with pytest.raises(WebSocketDisconnect) as closed:
+        with webapp.browser.websocket_connect(url, headers=_ORIGIN):
+            pytest.fail("relay accepted the previous gateway")
+    assert (closed.value.code, closed.value.reason) == (4404, "Gateway changed")
+    assert not seen["dials"]
+
+
+@pytest.mark.parametrize('removed', [True, False])
+def test_a_changed_connection_while_its_socket_dials_does_not_keep_that_socket(live_other, monkeypatch, removed):
     import websockets.asyncio.client
 
     from hermes_cli import gateway_connections
@@ -371,14 +434,20 @@ def test_a_connection_removed_while_its_socket_dials_does_not_keep_that_socket(l
     url = f"ws://localhost/api/relay/{connection_id}/api/audio/speak-stream?relay_ticket={_relay_ticket(webapp.browser)}"
     dial = websockets.asyncio.client.connect
 
-    def removed_mid_dial(*args, **kwargs):
-        gateway_connections.remove_connection(connection_id)
-        webapp_relay_proxy.close_gateway_sockets(connection_id)  # what the remove route does next
+    def changed_mid_dial(*args, **kwargs):
+        if removed:
+            gateway_connections.remove_connection(connection_id)
+        else:
+            gateway_connections.save_connection({
+                'id': connection_id, 'kind': 'remote', 'label': 'Live',
+                'headers': {'X-Test-Gateway-Route': 'replacement'},
+            })
+        webapp_relay_proxy.close_gateway_sockets(connection_id)
         return dial(*args, **kwargs)
 
-    monkeypatch.setattr(websockets.asyncio.client, "connect", removed_mid_dial)
+    monkeypatch.setattr(websockets.asyncio.client, "connect", changed_mid_dial)
     with pytest.raises(WebSocketDisconnect) as closed:
         with webapp.browser.websocket_connect(url, headers=_ORIGIN) as ws:
             ws.send_text(json.dumps({"text": "hi"}))
             ws.receive_json()
-    assert (closed.value.code, closed.value.reason) == (4404, "Gateway removed")
+    assert (closed.value.code, closed.value.reason) == (4404, "Gateway removed" if removed else "Gateway changed")
