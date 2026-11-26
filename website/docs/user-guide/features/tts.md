@@ -41,7 +41,11 @@ Convert text to speech with eleven providers:
 | Telegram | Voice bubble (plays inline) | Opus `.ogg` |
 | Discord | Voice bubble (Opus/OGG), falls back to file attachment | Opus/MP3 |
 | WhatsApp | Audio file attachment | MP3 |
-| CLI | Saved to `~/.hermes/audio_cache/` | MP3 |
+| CLI | Saved in the active profile's audio cache | MP3 by default |
+
+The `text_to_speech` tool writes to `cache/audio/` inside the active profile
+home. If that profile has a populated legacy `audio_cache/` directory, the
+tool uses that directory.
 
 ### Configuration
 
