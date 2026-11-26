@@ -214,6 +214,12 @@ hermes --tui --resume latest --in ./my-project
 
 `--in` also pins the session to that directory: the resumed session's recorded working directory is not restored (as if `--no-restore-cwd` were passed).
 
+With [managed SSH workspaces](managed-scope.md), pass an absolute executor
+path to `--in`. It selects a workspace for new chats and scopes the lookup
+for `--resume latest`. An existing chat resumes in its saved executor
+directory. Use **Move to project** in the dashboard to change that chat's
+workspace.
+
 ### Resume Restores the Working Directory
 
 Resuming a CLI session also `cd`s back into the session's recorded working directory (its git repo root or project dir), so the conversation picks up in the workspace it belonged to. If you'd rather stay where you are, pass `--no-restore-cwd`:

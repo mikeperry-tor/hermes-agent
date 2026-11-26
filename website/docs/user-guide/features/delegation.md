@@ -132,6 +132,8 @@ Delivery follows the same routing as user-attached images (`agent.image_input_mo
 
 Forwarding is best-effort: unreadable paths are skipped with a log line, and any failure in the image plumbing falls back to the plain text goal — it can never break a spawn. Images are for things the child must *see*; put text file paths in `context` as usual.
 
+With [managed SSH workspaces](../managed-scope.md), model-supplied image paths are read from the SSH executor (explicitly staged uploads keep their owning attachment path) and subagents keep their selected executor directory across resume and parent project switches instead of probing or invoking Git in the Hermes host filesystem.
+
 ## Practical Examples
 
 ### Parallel Research
