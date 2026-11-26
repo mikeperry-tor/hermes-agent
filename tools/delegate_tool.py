@@ -240,6 +240,8 @@ def _build_child_agent(
     subagent_id: Optional[str] = None,
     session_id: Optional[str] = None,
     expect_endpoint: Optional[tuple] = None,  # endpoint_identity it first ran on; a different one refuses
+    continued_cwd: Optional[str] = None,
+    continued_project_selected: bool | None = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
@@ -249,6 +251,7 @@ def _build_child_agent(
     from agent.delegation_context import delegated_child_context
     from tools.delegate_tool_resumable import endpoint_identity
     from tools.delegate_tool_routes import delegated_profile_scope
+    from tools.delegate_tool_workspace import resolve_child_project
     # Role is depth-derived: a child may delegate iff the kill switch is on and
     # depth budget remains below max_spawn_depth. The `role` arg is ignored.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
@@ -265,8 +268,11 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = delegate_tool_config._load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    project = resolve_child_project(parent_agent, continued_cwd, continued_project_selected)
     child_prompt = _build_child_system_prompt(
-        workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
+        workspace_path=project.cwd if project is not None else _resolve_workspace_hint(parent_agent),
+        executor_project=project,
+        role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -364,6 +370,7 @@ def _build_child_agent(
     from agent.prompt_cache_scope import conversation_id, sibling_cache_scope
     child._inherited_conversation_id = conversation_id(parent_agent)
     child._delegate_context = context  # rides the first user turn, not the system prompt
+    child._delegate_executor_project = project
     child._inherited_cache_scope = sibling_cache_scope(parent_agent)
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
     _apply_child_compression_cap(child, delegation_cfg)

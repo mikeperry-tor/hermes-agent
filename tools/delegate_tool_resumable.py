@@ -173,14 +173,16 @@ def _git_lines(args: list[str], cwd: str) -> list[str]:
 
 def _worktrees_of(cwd: Optional[str]) -> list[str]:
     """Every worktree of the repository *cwd* is in (``git worktree list``), or ``[]``."""
-    if not cwd or not os.path.isdir(cwd):
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if not cwd or uses_managed_executor() or not os.path.isdir(cwd):
         return []
     return [os.path.realpath(line[9:]) for line in _git_lines(["worktree", "list", "--porcelain"], cwd)
             if line.startswith("worktree ")]
 
 
 def _toplevel(cwd: Optional[str]) -> Optional[str]:
-    if not cwd or not os.path.isdir(cwd):
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if not cwd or uses_managed_executor() or not os.path.isdir(cwd):
         return None
     lines = _git_lines(["rev-parse", "--show-toplevel"], cwd)
     return os.path.realpath(lines[0]) if lines else None
@@ -195,6 +197,9 @@ def _pin_paths(record: dict[str, Any]) -> list[str]:
     """Where the child was when it STOPPED: its last terminal cwd's worktree, its isolation worktree, and every
     worktree a repository it worked in gained since it first entered it (a ``git worktree add`` it ran without
     cd-ing into it), wherever its cwd went afterwards. Each repository is compared with its own baseline."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return []
     cwd = record.get("cwd")
     paths = [p for p in (_toplevel(cwd), (record.get("worktree") or {}).get("path")) if p]
     paths += _new_worktrees(record.get("start_cwd") or cwd, record.get("worktrees_at_start") or ())
@@ -217,6 +222,9 @@ def _live_pins(record: dict[str, Any], *, memo: bool = True) -> list[str]:
     discovered at once, while the record itself is always read fresh. The only thing a cached answer can miss is a
     worktree created within the TTL, and a tree that new is never past the sweep's idle tier. Recovery and reclaim
     store their answer as the stopped record's pins, so they pass ``memo=False``."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return []
     if not memo:
         return sorted({*(record.get("pin_paths") or ()), *_pin_paths(record)})
     key = json.dumps([record.get(k) for k in ("cwd", "start_cwd", "worktrees_at_start", "repo_baselines")]
@@ -283,6 +291,7 @@ def record_start(run: Any) -> None:
     # The git probes run before the write transaction (seconds on a slow repo; no state.db lock held through them).
     earlier = _write(path, lambda ledger: _row(ledger, sid)) or {}
     start_cwd = earlier.get("start_cwd") or cwd
+    project = getattr(child, "_delegate_executor_project", None)
     start_trees = _worktrees_of(start_cwd)
     # ``lock`` serializes the start-record retries (heartbeat thread vs the stop path) with the terminal write, so a
     # retry still waiting on the busy timeout can never land after ``record_stop`` and flip the row back to running.
@@ -322,6 +331,8 @@ def record_start(run: Any) -> None:
             # must not hand its tree to the sweep. Bounded by the same TTL.
             columns: dict[str, Any] = dict(state="running", pinned=True,
                                            expires_at=time.time() + _settings()[0] * 3600)
+            if project is not None:
+                record["executor_project_selected"] = project.selected
             if origin == "auto":  # the parent's last word: a stop, /stop or replacement since the claim cancels it
                 from tools.delegate_tool_auto_resume import CANCELLED
                 if stored is None:
@@ -378,6 +389,10 @@ def _child_cwd(run: Any) -> Optional[str]:
     from tools.terminal_tool import get_session_cwd
     with child_profile_scope(run.child):
         cwd = get_session_cwd(run.child_task_id)
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        from hermes_cli.ssh_project_probe import _absolute_project
+        return cwd if _absolute_project(cwd) else None
     return os.path.realpath(cwd) if isinstance(cwd, str) and cwd else None
 
 
@@ -710,6 +725,10 @@ def last_workspace(parent_agent: Any, sid: str) -> Optional[dict[str, Any]]:
     """``{cwd, worktree}`` the child stopped in, for a continue to start there instead of the parent's cwd."""
     record = _write(_db_path_for(parent_agent), lambda ledger: _row(ledger, sid)) or {}
     cwd = record.get("cwd")
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        from hermes_cli.ssh_project_probe import _absolute_project
+        return {"cwd": cwd, "worktree": None, "executor_project_selected": record.get("executor_project_selected")} if _absolute_project(cwd) else None
     if not (isinstance(cwd, str) and os.path.isdir(cwd)):
         return None
     worktree = record.get("worktree") if isinstance(record.get("worktree"), dict) else None

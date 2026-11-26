@@ -546,7 +546,10 @@ def _file_to_data_url(path: Path) -> Optional[str]:
     except Exception as exc:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
-    mime = _guess_mime(path, raw=raw)
+    return _image_bytes_to_data_url(raw, _guess_mime(path, raw=raw), path)
+
+
+def _image_bytes_to_data_url(raw: bytes, mime: str, path: Path) -> Optional[str]:
     if mime not in _accepted_mimes():
         if (transcoded := _transcode_to_png(raw)) is None:
             logger.warning(
