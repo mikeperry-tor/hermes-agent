@@ -416,15 +416,10 @@ def build_subprocess_env(
     all BEFORE the scrub, so those values pass the same scrub / passthrough rules as any other."""
     env: dict[str, str] = dict(base) if base is not None else os.environ.copy()
     if strip_launch_profile:
-        strip_launch_profile_env(env)
         from agent.secret_scope import current_secret_scope, is_multiplex_active
-        if is_multiplex_active():
-            # Single-profile: the scope IS os.environ, so overlaying it would only re-sanitize
-            # values the child already inherits byte-identical.
-            env.update(current_secret_scope() or {})
-            # Administrator-managed values keep their precedence over the routed profile's own .env,
-            # exactly as they do in the launch process (``_apply_managed_env`` applies them last).
-            restore_managed_env(env)
+
+        scope = (current_secret_scope() or {}) if is_multiplex_active() else None
+        strip_launch_profile_env(env, scope=scope)
     if scrub_secrets:
         return _sanitize_subprocess_env(env, dict(extra) if extra else None)
     if inherit_profile_home:
@@ -566,7 +561,9 @@ def _is_routed_home(target_home: str | Path) -> bool:
         return True
 
 
-def strip_launch_profile_env(env: dict, target_home: str | Path | None = None) -> dict:
+def strip_launch_profile_env(
+    env: dict, target_home: str | Path | None = None, *, scope: Mapping[str, str] | None = None,
+) -> dict:
     """Drop the LAUNCH profile's residue from a child env built for another served profile.
     ``os.environ`` holds the default profile's ``.env`` and its bridged ``TERMINAL_*`` settings;
     the secret scrub removes credentials but not settings (``HERMES_MODEL``, ``TERMINAL_ENV``,
@@ -575,55 +572,48 @@ def strip_launch_profile_env(env: dict, target_home: str | Path | None = None) -
     defaults to the active home override; no-op when there is no target or the target IS the
     launch profile. The authority test is "does this task serve a routed home", not "is the
     gateway-wide multiplex flag on": the Desktop/dashboard backend serves ``?profile=B`` by
-    installing a HERMES_HOME override without that flag."""
+    installing a HERMES_HOME override without that flag. Overlay an optional bound scope
+    before restoring administrator-managed values for the target."""
     from agent.secret_scope import _is_global_env, load_env_file
+    from hermes_cli.env_loader import (
+        launch_dotenv_keys, managed_dotenv_keys, managed_env_claims, resolve_home_dotenv,
+        routed_dotenv_lookup_env, source_supplied_names,
+    )
     from hermes_constants import get_hermes_home_override, get_routing_process_hermes_home
     target = target_home or get_hermes_home_override()
     if not target or not _is_routed_home(target):
+        if scope is not None:
+            env.update(scope)
+            env.update((key, os.environ[key]) for key in managed_env_claims() if key in os.environ)
         return env
     launch_home = get_routing_process_hermes_home()
     from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
-    # Folded strip: on Windows the env block is case-insensitive, so residue
-    # stored under a variant casing is the same variable and must go too. The
-    # selection folds the same way so a lowercase ``path`` in .env is still
-    # recognized as a global name and left alone.
-    # Current file AND every key any dotenv load put into os.environ this process lifetime: a key
-    # removed or renamed in the launch .env after boot is still in os.environ with the old value, and
-    # a re-parse of the file alone no longer names it (#107695 review). External secret sources
-    # (vault, 1Password, ...) write their names into the same shared os.environ, and a name the
-    # LAUNCH profile's source supplied is not the target profile's to see; the caller's scope
-    # overlay puts back exactly the ones the target's own sources supply. The administrator-managed
-    # .env is NOT residue: its values are policy for every profile (``_apply_managed_env`` applies
-    # it last, with override, so it beats the user's own .env) — leave them in place. Neither is
-    # the config backend's deployment (which backend, which plane, which instance): it is the
-    # instance's, and a child without it reads the target profile's config from another backend.
     from hermes_cli.config_backend import deployment_env_names
-    from hermes_cli.env_loader import launch_dotenv_keys, managed_dotenv_keys, source_supplied_names
-    managed_names = {key.upper() for key in managed_dotenv_keys()} | set(deployment_env_names())
-    residue_names = {
-        key.upper() for key in
+
+    # Track historical names because dotenv reload leaves removed values in the process env.
+    # Backend deployment coordinates belong to the instance. Other managed values are recomputed
+    # for this profile so templates cannot inherit a private launch-profile expansion.
+    deployment = {key.upper() for key in deployment_env_names()}
+    managed = {key.upper() for key in managed_env_claims()} - deployment
+    residue = {key.upper() for key in (
         set(load_env_file(launch_home / ".env")) | set(launch_dotenv_keys())
         | set(TERMINAL_CONFIG_ENV_MAP.values()) | set(source_supplied_names())
-        if not _is_global_env(key.upper()) or key.upper().startswith("TERMINAL_")} - managed_names
-    drop_bridge_markers(env)  # the LAUNCH profile's YAML values and their markers, never the target's
-    for key in [k for k in env if k.upper() in residue_names]:
-        del env[key]
-    # Authorization gates are the one residue a name list cannot see: a unit-file ``Environment=``
-    # or an operator export never appears in the launch ``.env``, the secret scrub ignores
-    # non-credentials, and the target's own ``.env`` rarely defines the key to overwrite it (#113270).
-    return strip_profile_gate_env(env)
-
-
-def restore_managed_env(env: dict) -> dict:
-    """Re-apply the administrator-managed ``.env`` values over *env* — call AFTER a routed profile's scope
-    has been overlaid. ``_apply_managed_env`` gives those keys precedence over the user's own ``.env`` in
-    the launch process; a routed child must see the same precedence, or the routed user's value for a
-    managed key (``ORG_POLICY_FLAG=user-value``) silently wins over policy."""
-    from hermes_cli.env_loader import managed_dotenv_keys
-    for key in managed_dotenv_keys():
-        if key in os.environ:
-            env[key] = os.environ[key]
-    return env
+    ) if not _is_global_env(key.upper()) or key.upper().startswith("TERMINAL_")}
+    drop_bridge_markers(env)
+    historical = {key.upper() for key in managed_dotenv_keys()}
+    strip_names = (residue | historical | managed) - deployment
+    for key in list(env):
+        if key.upper() in strip_names:
+            del env[key]
+    if scope is not None:
+        # Strip ambient authorization grants before adding the bound profile's grants.
+        strip_profile_gate_env(env)
+        protected = managed | deployment
+        env.update((key, value) for key, value in scope.items() if key.upper() not in protected)
+    if managed:
+        scoped = resolve_home_dotenv(Path(target), lookup_env=routed_dotenv_lookup_env(), managed_only=True)
+        env.update((key, value) for key, value in scoped.items() if key.upper() in managed)
+    return strip_profile_gate_env(env) if scope is None else env
 
 
 # --- Shell discovery ---
@@ -860,17 +850,13 @@ def routed_terminal_base() -> dict:
     so a served profile's commands run with its own ``.env``/source names (launch-residue values
     lose, managed policy keys keep precedence) instead of only the names the launch process also
     happened to define (#142798). The caller's scrub still filters every value."""
-    base = strip_launch_profile_env(os.environ.copy())
     from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+    # First-party context credentials retain the process value when the context entitles them.
+    scope = None
     if is_multiplex_active():
-        # First-party context credentials (``BUZZ_*``) keep the process value when the
-        # context entitles them — the scope is the routed profile's ``.env``, never the
-        # platform context ("never scope-resolved", as in ``_filter_secret_env``).
-        base.update(
-            {k: v for k, v in (current_secret_scope() or {}).items()
-             if not _is_terminal_first_party_env(k)})
-        restore_managed_env(base)
-    return base
+        scope = {k: v for k, v in (current_secret_scope() or {}).items() if not _is_terminal_first_party_env(k)}
+    return strip_launch_profile_env(os.environ.copy(), scope=scope)
 
 
 def _make_run_env(env: dict) -> dict:

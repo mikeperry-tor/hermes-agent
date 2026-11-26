@@ -82,3 +82,61 @@ def test_gateway_env_bridge_honors_managed(homes, monkeypatch):
     raw = yaml.safe_load((home / "config.yaml").read_text())
     bridged = managed_scope.apply_managed_overlay(raw)
     assert bridged.get("timezone") == "Asia/Tokyo"
+
+
+def test_strict_managed_read_distinguishes_absent_invalid_and_inaccessible(homes, monkeypatch):
+    from pathlib import Path
+
+    from hermes_cli import managed_scope
+
+    _, managed = homes
+    config = managed / 'config.yaml'
+    assert managed_scope.load_managed_config(strict=True) == {}
+    config.write_text('timezone: Etc/UTC\n')
+    assert managed_scope.load_managed_config(strict=True) == {'timezone': 'Etc/UTC'}
+    config.write_text('[]\n')
+    with pytest.raises(ValueError, match='must contain a mapping'):
+        managed_scope.load_managed_config(strict=True)
+    config.write_text('timezone: Etc/UTC\n')
+    stat = Path.stat
+
+    def inaccessible(path, *args, **kwargs):
+        if path == config:
+            raise PermissionError('managed directory is inaccessible')
+        return stat(path, *args, **kwargs)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, 'stat', inaccessible)
+        with pytest.raises(PermissionError):
+            managed_scope.load_managed_config(strict=True)
+
+
+@pytest.mark.parametrize("contents", ["null\n", "~\n", "", "# no policy document\n"])
+def test_strict_managed_read_rejects_absent_yaml_root_in_a_present_file(homes, contents):
+    from hermes_cli import managed_scope
+
+    _, managed = homes
+    config = managed / 'config.yaml'
+    config.write_text(contents)
+    # An earlier non-strict read must not cache a permissive fallback.
+    assert managed_scope.load_managed_config() == {}
+    with pytest.raises(ValueError, match='must contain a mapping'):
+        managed_scope.load_managed_config(strict=True)
+    config.write_text('{}\n')
+    assert managed_scope.load_managed_config(strict=True) == {}
+
+
+def test_explicit_managed_overlay_uses_validated_snapshot(homes):
+    from hermes_cli import config_effective, managed_scope
+
+    home, managed = homes
+    (home / 'config.yaml').write_text('display:\n  skin: profile\n  compact: true\n')
+    config = managed / 'config.yaml'
+    config.write_text('display:\n  skin: managed\n')
+    selected = managed_scope.load_managed_config(strict=True)
+    config.write_text('[]\n')
+    result = managed_scope.apply_managed_overlay(
+        {'display': {'skin': 'profile', 'compact': True}}, managed_snapshot=selected)
+    assert result['display'] == {'skin': 'managed', 'compact': True}
+    effective = config_effective.load_user_config_effective(fail_closed=True, managed_snapshot=selected)
+    assert effective['display'] == {'skin': 'managed', 'compact': True}

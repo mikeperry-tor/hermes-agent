@@ -646,6 +646,12 @@ browser:
   # auto_local_for_private_urls: true
 
 # =============================================================================
+# Context references
+# Disable automatic @url: fetching while continuing to expand other references.
+# context_references:
+#   fetch_urls: false  # defaults to true
+
+# =============================================================================
 # Tool Loop Guardrails
 # =============================================================================
 # Soft warnings are enabled by default. They append guidance to repeated failed

@@ -40,7 +40,9 @@ the managed files but cannot edit them.
 
 Either file is optional. A missing managed directory or missing file simply
 means "no managed scope," and configuration resolves exactly as it does without
-the feature.
+the feature. When `/etc/hermes/config.yaml` is present, it must contain a YAML
+mapping (use `{}` for an empty policy); strict policy readers treat a blank,
+null, or non-mapping file as an error until it is repaired.
 
 ### Relocating the directory
 
@@ -103,6 +105,14 @@ too — otherwise it would not be "managed." This is the one place that inverts 
 usual "an environment variable overrides config.yaml" rule, and it applies only
 to the specific keys the managed layer specifies.
 :::
+
+Managed `.env` values stay in effect across profile environment reloads, and a
+transient read error leaves already-applied managed assignments in place. When
+serving a routed profile, `${VAR}` templates in managed `.env` expand against
+that profile's `.env` and original process environment rather than values
+published by the launch profile. In file-backed deployments that rely on
+managed YAML policy, pin `HERMES_CONFIG_BACKEND=file` in managed `.env` so a
+profile cannot switch the config backend.
 
 When the managed `config.yaml` pins a non-empty `terminal.backend`, a profile
 `.env` or `.op.env` that exists but cannot be read (a sandbox launcher withholds

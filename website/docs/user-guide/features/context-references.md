@@ -43,6 +43,27 @@ Check @file:main.py, and also @file:test.py.
 
 Trailing punctuation (`,`, `.`, `;`, `!`, `?`) is automatically stripped from reference values.
 
+## Disable implicit URL fetching
+
+By default, `@url:` references fetch page content. To keep URL text and chips
+without automatically fetching their contents, set this in `config.yaml`:
+
+```yaml
+context_references:
+  fetch_urls: false
+```
+
+Other reference kinds continue expanding. Disabled URL references do not consume
+reference-count or injected-content limits. Explicit web tool calls and browser
+image loading have separate controls. To apply the same setting deployment-wide,
+set it in the [managed configuration](../managed-scope.md).
+This setting takes precedence over profiles, including in safe/config-bypass
+sessions. Without a managed setting, those sessions use built-in defaults.
+
+Hermes blocks messages containing URL references if their settings cannot be
+read or validated. Use a YAML boolean for `fetch_urls`. Messages without URL
+references can still expand. Repair the setting or configuration source and retry.
+
 ## CLI Tab Completion
 
 In the interactive CLI, typing `@` triggers autocomplete:
@@ -97,9 +118,11 @@ Binary files are detected via MIME type and null-byte scanning. Known text exten
 
 ## Platform Availability
 
-Context references are primarily a **CLI feature**. They work in the interactive CLI where `@` triggers tab completion and references are expanded before the message is sent to the agent.
-
-In **messaging platforms** (Telegram, Discord, etc.), the `@` syntax is not expanded by the gateway — messages are passed through as-is. The agent itself can still reference files via the `read_file`, `search_files`, and `web_extract` tools.
+The interactive CLI offers completion for `@` references. Local gateway
+sessions and inbound text from messaging platforms such as Telegram or Discord
+also support explicit context references. The gateway expands them before
+sending the turn to the agent, subject to the session's workspace and
+`context_references.fetch_urls` policy.
 
 ## Interaction with Context Compression
 

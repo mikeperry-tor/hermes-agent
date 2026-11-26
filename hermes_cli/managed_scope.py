@@ -34,6 +34,9 @@ _CACHE_LOCK = threading.Lock()
 # path_key -> (*file_cache_version, parsed)
 _CONFIG_CACHE: dict[str, tuple] = {}
 _ENV_CACHE: dict[str, tuple] = {}
+# Last dotenv applied by the process. Keep source templates for routed scopes
+# so they never receive values expanded against another profile's environment.
+_APPLIED_ENV: tuple[Path, list[tuple[str, str | None]], dict[str, str]] | None = None
 
 
 def _under_pytest() -> bool:
@@ -42,12 +45,13 @@ def _under_pytest() -> bool:
     return "PYTEST_CURRENT_TEST" in os.environ
 
 
-def get_managed_dir() -> Optional[Path]:
+def get_managed_dir(*, strict: bool = False) -> Optional[Path]:
     """Resolve the managed-scope directory, or None when no scope is present.
 
     Priority: ``$HERMES_MANAGED_DIR`` (IT-only bootstrap override; never persisted to any .env;
     honored only when non-empty AND the directory exists), then ``/etc/hermes`` when it exists.
-    A missing directory resolves to None — the common case, so it must be cheap + side-effect-free.
+    In strict mode return the selected path directly so stat on the file distinguishes absence from
+    an inaccessible directory. Normal callers keep the optional existing-directory check.
     """
     override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
     if override:
@@ -56,7 +60,12 @@ def get_managed_dir() -> Optional[Path]:
         return None
     else:
         p = _DEFAULT_MANAGED_DIR
-    return p if p.is_dir() else None
+    if strict:
+        return p
+    try:
+        return p if p.is_dir() else None
+    except OSError:
+        return None
 
 
 def invalidate_managed_cache() -> None:
@@ -104,11 +113,18 @@ def _cached_read(path: Path, cache: dict[str, tuple], parse, *, strict: bool = F
 
 
 def _load_managed_file(name: str, cache: dict[str, tuple], parse, *, strict: bool = False) -> dict:
-    managed_dir = get_managed_dir()
+    managed_dir = get_managed_dir(strict=strict)
     if managed_dir is None:
         return {}
     parsed = _cached_read(managed_dir / name, cache, parse, strict=strict)
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_managed_config(path: Path) -> dict:
+    parsed = fast_safe_load(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(parsed, dict):
+        raise ValueError("managed config.yaml must contain a mapping")
+    return parsed
 
 
 def load_managed_config(*, strict: bool = False) -> dict:
@@ -119,33 +135,74 @@ def load_managed_config(*, strict: bool = False) -> dict:
 
     if not get_config_backend().honors_managed_config():
         return {}
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {},
+    return _load_managed_file("config.yaml", _CONFIG_CACHE, _parse_managed_config,
                               strict=strict)
 
 
+def remember_applied_managed_env(path: Path, raw: list[tuple[str, str | None]], values: dict[str, str]) -> None:
+    global _APPLIED_ENV
+    with _CACHE_LOCK:
+        _APPLIED_ENV = (path, raw, values)
+
+
+def applied_managed_env(path: Path | None) -> tuple[list[tuple[str, str | None]], dict[str, str]]:
+    """Return the ordered source and the subset that was published at that path."""
+    with _CACHE_LOCK:
+        saved = _APPLIED_ENV
+        if saved is not None and saved[0] == path:
+            return saved[1].copy(), saved[2].copy()
+        return [], {}
+
+
+def retain_managed_env_claims(path: Path | None, names: frozenset[str]) -> None:
+    """Forget values whose assignments the administrator removed."""
+    global _APPLIED_ENV
+    with _CACHE_LOCK:
+        saved = _APPLIED_ENV
+        if saved is not None and saved[0] == path:
+            path, raw, values = saved
+            active = {name: values[name] for name in names & values.keys()}
+            _APPLIED_ENV = (path, raw, active) if active else None
+
+
 def load_managed_env() -> dict[str, str]:
-    """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
-    return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
+    """Parsed managed .env, retaining templates for applied names on a read error."""
+    directory = get_managed_dir(strict=True)
+    if directory is None:
+        return {}
+    path = directory / ".env"
+    try:
+        parsed = _cached_read(path, _ENV_CACHE, _parse_managed_env, strict=True) or {}
+    except FileNotFoundError:
+        parsed = {}
+    except OSError:
+        raw, applied = applied_managed_env(path)
+        return {name: value for name, value in dict(raw).items() if value is not None and name in applied}
+    except UnicodeError as exc:
+        logger.warning("Could not parse managed dotenv %s: %s", path, exc)
+        return {}
+    retain_managed_env_claims(path, frozenset(parsed))
+    return parsed
 
 
 def _parse_managed_env(path: Path) -> dict[str, str]:
-    from agent.secret_scope import load_env_file
+    from agent.secret_scope import _parse_env_text
 
-    path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
-    return load_env_file(path)
+    return _parse_env_text(path.read_text(encoding="utf-8-sig"))
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, *, managed_snapshot: Optional[dict] = None) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
     shadow a managed literal via a ref they control; a bare root ``model: x/y`` string is promoted
     to ``model.default`` so it can't clobber the dict shape callers expect; managed values
     deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
-    ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
+    ``config`` unchanged when no scope is present or on an error. An explicit validated snapshot is
+    applied without rereading the file, and expansion/merge errors then propagate.
     """
     try:
-        managed = load_managed_config()
+        managed = load_managed_config() if managed_snapshot is None else managed_snapshot
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
@@ -159,6 +216,8 @@ def apply_managed_overlay(config: dict) -> dict:
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded)
     except Exception:
+        if managed_snapshot is not None:
+            raise
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
 

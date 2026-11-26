@@ -759,3 +759,31 @@ def test_home_scoped_reset_preserves_sibling_snapshot(tmp_path, monkeypatch, _fr
     assert env_loader.get_secret_source_values(home) == {}
     assert env_loader.get_secret_source_values(sibling) == {"GLM_API_KEY": "vault-b"}
     assert hermes_home_key(sibling) in env_loader._APPLIED_HOMES
+
+
+def test_managed_values_are_not_snapshotted_as_secret_source_writes(tmp_path, monkeypatch):
+    from agent.secret_sources import registry
+    from agent.secret_sources.base import FetchResult
+    from agent.secret_sources.registry import AppliedVar, ApplyReport, SourceReport
+
+    name = "ORG_MANAGED"
+    (tmp_path / ".env").write_text(f"{name}=admin\n")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path))
+    monkeypatch.delenv(name, raising=False)
+    env_loader._apply_managed_env()
+    monkeypatch.setattr(env_loader, "_load_secrets_config", lambda _home: {"command": {"enabled": True}})
+
+    def apply(_cfg, _home, environ):
+        environ[name] = "source"
+        return ApplyReport(
+            sources=[SourceReport("command", "command", FetchResult(), applied=[name])],
+            provenance={name: AppliedVar(name, "command", "bulk", True, authoritative=True)},
+        )
+
+    monkeypatch.setattr(registry, "apply_all", apply)
+    env_loader._apply_external_secret_sources(tmp_path, managed_claims=env_loader.managed_env_claims())
+
+    assert os.environ[name] == "admin"
+    assert env_loader.get_secret_source(name) is None
+    assert env_loader.get_secret_source_values(tmp_path) == {}
+    assert all(write[1] != name for write in env_loader._recorded_environ_writes())
