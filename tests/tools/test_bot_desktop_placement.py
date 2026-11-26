@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from unittest.mock import Mock
 
 import pytest
 
@@ -92,13 +93,13 @@ def test_sandbox_status_offers_the_image_switch_instead_of_a_config_hint(monkeyp
     monkeypatch.setattr(placement, "_terminal_backend", lambda: "docker")
     monkeypatch.setattr(placement, "terminal_environment", lambda *, create=True: _FakeDocker())
     monkeypatch.setattr(sandbox_host, "missing_binaries", lambda env: ["Xvnc"])
-    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile: {})
+    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile, **_: {})
 
     monkeypatch.setattr(sw, "pending", lambda: sw.PendingSwitch("old/base:1", "nousresearch/hermes-sandbox:desktop", ["hermes-a"]))
     st = runtime.status()
     assert st.image_switch == {"current_image": "old/base:1", "target_image": "nousresearch/hermes-sandbox:desktop", "containers": 1}
     assert "old/base:1" in st.blocker and "/root and /workspace" in st.blocker
-    assert st.installed and not st.running
+    assert not st.installed and not st.running and st.missing == ["Xvnc"]
 
     monkeypatch.setattr(sw, "pending", lambda: None)
     st = runtime.status()
@@ -184,7 +185,7 @@ def test_terminal_placement_starts_the_sandbox_screen_instead_of_running_on_the_
     monkeypatch.setattr(runtime, "sandbox_screen_running", lambda: bool(started))
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":20", "XAUTHORITY": "/x"} if started else {})
     monkeypatch.setattr(runtime, "start", lambda **kw: started.append("started"))
-    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
+    monkeypatch.setattr(runtime, "tool_sandbox", lambda: (_FakeDocker(), runtime.published_env()))
     monkeypatch.setattr(runtime, "touch_activity", lambda: None)
     monkeypatch.setattr(browser_session_sandbox, "create_sandbox_session", lambda key: {
         "session_name": "sb_1", "cdp_url": "ws://127.0.0.1:45004/devtools/browser/abc",
@@ -199,7 +200,7 @@ def test_terminal_placement_starts_the_sandbox_screen_instead_of_running_on_the_
     monkeypatch.setattr(sandbox_host, "_user_for", lambda e: "pn")
     monkeypatch.setattr(streams, "exec_prefix", lambda e, *, user=None, interactive=True:
                         ["docker", "exec", "-i", "-u", user, e._container_id])
-    (command, args), child_env = cb.sandbox_mcp_invocation()
+    (command, args), child_env, _ = cb.sandbox_mcp_invocation()
     assert command == "docker" and "cua-driver mcp" in args[-1] and "export DISPLAY=:20" in args[-1]
     assert set(child_env) == {"PATH"}  # the host driver's env never reaches the sandbox driver
 
@@ -303,7 +304,7 @@ def test_stop_and_status_follow_the_recorded_owner_not_the_current_setting(monke
     monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda marker: True)
     monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
     monkeypatch.setattr(sandbox_host, "missing_binaries", lambda env: [])
-    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile: {"DISPLAY": ":20"})
+    monkeypatch.setattr(sandbox_host, "published_env", lambda env, profile, **_: {"DISPLAY": ":20"})
 
     st = runtime.status()
     assert st.running and st.display == ":20" and st.placement.startswith("terminal:")
@@ -353,18 +354,20 @@ def test_forward_port_carries_bytes_both_ways_through_the_exec_stream(monkeypatc
 def test_sandbox_cdp_endpoint_is_rewritten_to_the_forwarded_local_port(monkeypatch):
     """The sandbox Chromium's DevTools port is the sandbox's loopback: the session hands browser_exec the
     forwarded LOCAL port, keeping Chromium's browser id path."""
-    from tools import browser_session
+    from tools import browser_session, browser_session_sandbox
     from tools.bot_desktop import sandbox_host
 
     host_launches = _local_sessions(monkeypatch)
     _placed(monkeypatch, "terminal", "docker")
     monkeypatch.setattr(runtime, "sandbox_screen_running", lambda: True)
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":20"})
-    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create: _FakeDocker())
+    monkeypatch.setattr(runtime, "tool_sandbox", lambda: (_FakeDocker(), {"DISPLAY": ":20"}))
     monkeypatch.setattr(sandbox_host, "_user_for", lambda e: "pn")
     monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda e: "/home/pn/.hermes/bot-desktop/browser-profile")
 
     def run_in(env, argv, **_kw):
+        if browser_session_sandbox._RECOVER_LAUNCH in argv:
+            return subprocess.CompletedProcess(argv, browser_session_sandbox._NOT_OURS_RC, b"", b"")
         out = b"9223\n/devtools/browser/abc\n" if "DevToolsActivePort" in " ".join(argv) else b""
         return subprocess.CompletedProcess(argv, 0, out, b"")
     monkeypatch.setattr(streams, "run_in", run_in)

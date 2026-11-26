@@ -12,13 +12,21 @@ import json
 import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use import cua_backend_driver as _driver
 from tools.computer_use.cua_backend_parse import _extract_tool_result, _mcp_field, _tool_envelope
 
 logger = logging.getLogger("tools.computer_use.cua_backend")
+dispatch_fence = ContextVar("cua_dispatch_fence", default=None)
+_request_cancelled = ContextVar[Optional[threading.Event]]("cua_request_cancelled", default=None)
+
+
+def _check_dispatch_fence() -> None:
+    if fence := dispatch_fence.get():
+        fence()
 
 
 class _AsyncBridge:
@@ -52,12 +60,23 @@ class _AsyncBridge:
     def run(self, coro, timeout: Optional[float] = 30.0) -> Any:
         from agent.async_utils import safe_schedule_threadsafe
         alive = self._loop is not None and self._thread is not None and self._thread.is_alive()
-        fut = safe_schedule_threadsafe(coro, self._loop) if alive else None  # closes the coroutine on failure
+        cancelled = threading.Event()
+        token = _request_cancelled.set(cancelled)
+        try:
+            fut = safe_schedule_threadsafe(coro, self._loop) if alive else None
+        finally:
+            _request_cancelled.reset(token)
         if fut is None:
             if asyncio.iscoroutine(coro):
                 coro.close()  # no-op when safe_schedule_threadsafe already closed it
             raise RuntimeError("cua-driver bridge not started")
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # The loop may be blocked in the lease check when cancellation is queued.
+            cancelled.set()
+            fut.cancel()
+            raise
 
     def stop(self) -> None:
         if self._loop and self._loop.is_running():
@@ -92,7 +111,8 @@ def _tool_field(obj: Any, *names: str) -> Any:
 
 _CLI_ATTEMPTS = 4  # CLI fallback transport retries (backoff 0.5s doubling)
 
-def _cli_run_json(cmd: list[str], env: dict[str, str], name: str, timeout: float) -> Any:
+def _cli_run_json(cmd: list[str], env: dict[str, str], name: str, timeout: float,
+                  check_desktop: Callable[[], None]) -> Any:
     """Run ``cua-driver call`` with backoff until it prints JSON; return the parsed value. "daemon is not running"
     is PERMANENT for this invocation (the CLI needs the machine-wide daemon socket, which Linux installs typically
     never start) -> fail fast, no ~3.5s backoff."""
@@ -101,6 +121,8 @@ def _cli_run_json(cmd: list[str], env: dict[str, str], name: str, timeout: float
 
     backoff, last_err = 0.5, ""
     for attempt in range(_CLI_ATTEMPTS):
+        check_desktop()
+        _check_dispatch_fence()
         try:
             proc = _subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                                    timeout=max(15.0, timeout), creationflags=windows_hide_flags(), env=env,
@@ -167,6 +189,10 @@ def _is_ended_session_result(result: Any) -> bool:
             and ("has ended" in message or "session ended" in message))
 
 
+class DesktopChanged(RuntimeError):
+    """The active driver no longer owns the configured computer-use desktop."""
+
+
 class _CuaDriverSession:
     """Holds the mcp ClientSession. Spawned lazily; re-entered on drop. Lifecycle ownership: one long-running
     coroutine (`_lifecycle_coro`) opens the stdio_client + ClientSession contexts, populates capabilities, sets
@@ -184,9 +210,12 @@ class _CuaDriverSession:
     # call_tool. Class-level default: tests that bypass __init__ see healthy.
     # See #74799.
     _timeout_suspect = False
+    _sandbox_transport: Optional[bool] = None
+    _sandbox_desktop = None
 
     def __init__(self, bridge: _AsyncBridge, embedded_daemon: Optional[Any] = None) -> None:
         self._bridge, self._embedded_daemon, self._session = bridge, embedded_daemon, None
+        self._sandbox_transport = None
         self._lock, self._started = threading.Lock(), False
         # Per-tool capability-token sets from `tools/list` (read via supports_capability). Raw input schemas are
         # the source of truth for action properties: 0.9-era drivers advertise delivery_mode in inputSchema
@@ -222,14 +251,30 @@ class _CuaDriverSession:
         # reports HOW FAR it got instead of an opaque "never reached ready".
         self._startup_phase = "binary-check"
         try:
-            driver_cmd = _driver.resolve_cua_driver_cmd()
-            if not driver_cmd and _cb.sandbox_mcp_invocation() is None:
+            self._assert_desktop()
+            if self._sandbox_transport is None:
+                remote = _cb.sandbox_mcp_invocation()
+            else:
+                remote = _cb.sandbox_mcp_invocation(expected_sandbox=self._sandbox_transport)
+            binding = remote[2] if remote is not None else None
+            if self._sandbox_desktop is not None and binding != self._sandbox_desktop:
+                raise DesktopChanged("The recorded desktop changed; retry with a fresh computer-use session")
+            self._sandbox_desktop = binding
+            self._sandbox_transport = remote is not None
+            if remote is not None and self._embedded_daemon is not None:
+                raise RuntimeError("Terminal desktop placement does not support a gateway-local permission daemon")
+            driver_cmd = None if remote else _driver.resolve_cua_driver_cmd()
+            if not driver_cmd and remote is None:
                 raise RuntimeError(_driver.cua_driver_install_hint())
             self._startup_phase = "manifest-discovery"
             daemon = self._embedded_daemon
-            (command, args), child_env = (
-                (daemon.proxy_invocation(), daemon.child_env()) if daemon is not None
-                else _cb.sandbox_mcp_invocation() or (_driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()))
+            if daemon is not None:
+                invocation, child_env = daemon.proxy_invocation(), daemon.child_env()
+            elif remote is not None:
+                invocation, child_env, _ = remote
+            else:
+                invocation, child_env = _driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()
+            command, args = invocation
             _t_manifest = _time.monotonic()
             # Telemetry policy first (default: disabled), then strip Hermes secrets.
             params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
@@ -305,6 +350,8 @@ class _CuaDriverSession:
                 f"{getattr(self, '_startup_phase', 'unknown')}). Run `hermes computer-use doctor` and check "
                 f"{display_hermes_home()}/logs/agent.log for the phase timings.")
         if self._setup_error is not None:
+            if isinstance(self._setup_error, DesktopChanged):
+                raise self._setup_error
             raise RuntimeError(f"cua-driver session setup failed: {self._setup_error}") from self._setup_error
         self._transport_generation += 1
         if self._transport_generation > 1:
@@ -345,7 +392,31 @@ class _CuaDriverSession:
             with contextlib.suppress(RuntimeError):  # loop closed — nothing to signal
                 loop.call_soon_threadsafe(event.set)
 
+    def _assert_desktop(self) -> None:
+        if self._sandbox_transport is None:
+            return
+        from tools.bot_desktop import placement, runtime
+
+        where = placement.resolve()
+        if where.where == placement.REFUSED:
+            raise DesktopChanged(where.reason)
+        if (where.where == placement.TERMINAL) != self._sandbox_transport:
+            raise DesktopChanged("The desktop placement changed; retry with a fresh computer-use session")
+        if self._sandbox_transport:
+            try:
+                env, published = runtime.tool_sandbox(reattach=False)
+            except (OSError, RuntimeError) as exc:
+                raise DesktopChanged(str(exc)) from exc
+            # The published session bus changes on each launcher, even when it
+            # reuses the display number and the same SSH or Docker target.
+            if (env, published) != self._sandbox_desktop or not runtime.owns_tool_sandbox(env):
+                raise DesktopChanged("The recorded desktop changed; retry with a fresh computer-use session")
+
     async def _call_tool_async(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.to_thread(self._assert_desktop)
+        _check_dispatch_fence()
+        if (cancelled := _request_cancelled.get()) is not None and cancelled.is_set():
+            raise asyncio.CancelledError
         return _extract_tool_result(await self._session.call_tool(name, args))
 
     # ── Capability detection ─────────────────────────────────────────
@@ -453,6 +524,10 @@ class _CuaDriverSession:
         working. Output is remapped to the ``_extract_tool_result`` shape. ``get_window_state`` routes its
         screenshot to a temp file (``screenshot_out_file``) so the daemon returns a tiny JSON body, not the
         multi-megabyte base64 blob that congests the socket; ``_cli_result`` reads it back."""
+        if self._sandbox_transport:
+            raise RuntimeError("Terminal desktop transport failed; reconnect to the terminal sandbox. "
+                               "Gateway-local CLI fallback is unavailable for this session.")
+        self._assert_desktop()
         import tempfile as _tempfile
         from tools.computer_use import cua_backend as _cb
         from tools.environments.local import _sanitize_subprocess_env
@@ -472,7 +547,8 @@ class _CuaDriverSession:
             socket_args = ["--socket", daemon.socket_path]
         cmd = [driver_command, "call", name, json.dumps(call_args), *socket_args]
         try:
-            return _cli_result(_cli_run_json(cmd, _sanitize_subprocess_env(child_env), name, timeout), shot_file)
+            return _cli_result(_cli_run_json(cmd, _sanitize_subprocess_env(child_env), name, timeout,
+                                             self._assert_desktop), shot_file)
         finally:
             if shot_file and os.path.exists(shot_file):
                 with contextlib.suppress(OSError):
@@ -513,7 +589,12 @@ class _CuaDriverSession:
                 return self._call_tool_via_cli(name, args, timeout)
             if not self._is_closed_session_error(e):
                 raise
-            self._recreate_session(name, timeout, "cua-driver MCP session closed during %s; reconnecting once")
+            try:
+                self._recreate_session(name, timeout, "cua-driver MCP session closed during %s; reconnecting once")
+            except RuntimeError:
+                if name in self._TRANSPORT_REPLAY_SAFE_TOOLS:
+                    raise
+                logger.warning("cua-driver could not reconnect after an uncertain %s outcome", name)
             if name not in self._TRANSPORT_REPLAY_SAFE_TOOLS:
                 return _outcome_unknown(name, e, "transport_outcome_unknown")
             result = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)

@@ -7,6 +7,7 @@ import json
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -86,7 +87,7 @@ def runtime(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("pause_at", ["after_lookup", "before_acquire"])
-@pytest.mark.parametrize("change", ["display", "mode", "release", "queued_display"])
+@pytest.mark.parametrize("change", ["display", "mode", "release", "queued_display", "queued_mode"])
 def test_dispatch_rechecks_admission(runtime, monkeypatch, pause_at, change):
     homes, created = runtime
     paused, resume = threading.Event(), threading.Event()
@@ -99,8 +100,8 @@ def test_dispatch_rechecks_admission(runtime, monkeypatch, pause_at, change):
             paused.set()
             assert resume.wait(10), "test did not release the waiting call"
 
-    def get(session_id=""):
-        backend = real_get(session_id)
+    def get(session_id="", **kwargs):
+        backend = real_get(session_id, **kwargs)
         if pause_at == "after_lookup":
             pause()
         return backend
@@ -123,16 +124,19 @@ def test_dispatch_rechecks_admission(runtime, monkeypatch, pause_at, change):
         if change == "release":
             assert cu.release_computer_use_session("shared")
         else:
-            if change == "mode":
+            if change in ("mode", "queued_mode"):
                 (homes[0] / "config.yaml").write_text("computer_use:\n  permission_mode: bounded\n", encoding="utf-8")
             else:
                 (homes[0] / "bot-desktop" / "env").write_text("DISPLAY=:39\n", encoding="utf-8")
-            if change != "queued_display":
+            if not change.startswith("queued_"):
                 assert real_get("shared") is not old
-        if change != "queued_display":
+        if not change.startswith("queued_"):
             assert old.stopped
         resume.set()
         value = result.result(timeout=10)
+        assert "fresh screen state" in value["error"], value
+        assert sum(backend.count for backend in created) == 0
+        value = _call()
         assert "error" not in value, value
         assert old.count == 0
         assert sum(backend.count for backend in created) == 1
@@ -141,6 +145,52 @@ def test_dispatch_rechecks_admission(runtime, monkeypatch, pause_at, change):
         resume.set()
         worker.join(timeout=10)
         assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("change", ["takeover", "hand_back", "permissions", "permissions_during_lease_read"])
+def test_transport_rechecks_admission_after_owner_probe(runtime, monkeypatch, change):
+    from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
+
+    homes, _ = runtime
+    backend = cu._get_backend("shared")
+    bridge = _AsyncBridge()
+    session = _CuaDriverSession(bridge)
+    send = AsyncMock()
+    session._session = Mock(call_tool=send)
+
+    def change_mode():
+        (homes[0] / "config.yaml").write_text("computer_use:\n  permission_mode: bounded\n", encoding="utf-8")
+
+    def change_during_probe():
+        if change == "permissions":
+            change_mode()
+        elif change in {"takeover", "hand_back"}:
+            lease.acquire("fixture-viewer")
+            if change == "hand_back":
+                lease.release("fixture-viewer")
+
+    read_lease = lease.get
+
+    def change_during_lease_read(profile_key=None):
+        if change == "permissions_during_lease_read" and threading.current_thread().name == "cua-driver-loop":
+            change_mode()
+        return read_lease(profile_key)
+
+    monkeypatch.setattr(session, "_assert_desktop", change_during_probe)
+    monkeypatch.setattr(lease, "get", change_during_lease_read)
+    backend.before_action = lambda: bridge.run(session._call_tool_async("list_apps", {}))
+    bridge.start()
+    try:
+        result = _call()
+        if change.startswith("permissions"):
+            assert "permissions changed" in result["error"]
+            assert backend.stopped
+            assert "error" not in _call()
+        else:
+            assert result["code"] == "human_has_control"
+        send.assert_not_awaited()
+    finally:
+        bridge.stop()
 
 
 @pytest.mark.parametrize("fail_action", [False, True])
@@ -203,8 +253,8 @@ def test_backend_retry_preserves_the_original_human_lease_epoch(runtime, monkeyp
     real_get = cu._get_backend
     old = real_get("shared")
 
-    def get(session_id=""):
-        backend = real_get(session_id)
+    def get(session_id="", **kwargs):
+        backend = real_get(session_id, **kwargs)
         if threading.current_thread().name == "waiting-call" and not paused.is_set():
             paused.set()
             assert resume.wait(10)
@@ -226,3 +276,39 @@ def test_backend_retry_preserves_the_original_human_lease_epoch(runtime, monkeyp
         resume.set()
         worker.join(timeout=10)
         assert not worker.is_alive()
+
+
+def test_destructive_action_requires_fresh_approval_after_permission_change(runtime, monkeypatch):
+    from tools import approval
+
+    def revoke_bypass_after_approval(*_args, allow_mode_bypass):
+        assert allow_mode_bypass
+        assert cu._cua_permission_mode("shared") == "unrestricted"
+        approval.disable_session_yolo("shared")
+
+    dispatch = Mock()
+    monkeypatch.setattr(cu, "_request_approval", revoke_bypass_after_approval)
+    monkeypatch.setattr(cu, "_dispatch", dispatch)
+    approval.enable_session_yolo("shared")
+    try:
+        result = json.loads(cu.handle_computer_use({"action": "click", "coordinate": [10, 10]}, session_id="shared"))
+    finally:
+        approval.disable_session_yolo("shared")
+    assert "permissions changed" in result["error"]
+    dispatch.assert_not_called()
+
+
+def test_restricted_action_cannot_inherit_a_transient_approval_bypass(runtime, monkeypatch):
+    from tools import approval
+
+    # The driver mode was read as standard but YOLO was enabled when approval
+    # consulted its bypass and had already returned to standard by dispatch.
+    monkeypatch.setattr(approval, "_yolo_active", lambda: True)
+    ask = Mock(return_value="deny")
+    monkeypatch.setattr(approval, "_presence", lambda _callback: (ask, True, False, False))
+    dispatch = Mock()
+    monkeypatch.setattr(cu, "_dispatch", dispatch)
+    result = json.loads(cu.handle_computer_use({"action": "click", "coordinate": [10, 10]}, session_id="shared"))
+    assert "denied" in result["error"].lower()
+    ask.assert_called_once()
+    dispatch.assert_not_called()
