@@ -1025,6 +1025,11 @@ def build_environment_hints() -> str:
     backend = (_tenv_read("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
     hints = [_remote_backend_hint(backend)] if is_remote_backend else _local_host_hints()
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if backend == "ssh" and uses_managed_executor():
+        from agent.runtime_cwd import scope_terminal_cwd
+        if cwd := scope_terminal_cwd():
+            hints.append(f"Selected executor working directory: {cwd}")
     # A host-placed Bot Screen is only reachable from a local backend (a sandboxed terminal cannot
     # open windows on the gateway host), and a sandbox-placed one is the sandbox probe's business.
     if not is_remote_backend:
@@ -1717,7 +1722,11 @@ def _project_context_suppressed(cwd: Optional[str], cwd_path: Path, allow_instal
 
 def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.hermes.md / HERMES.md — nearest match walking up to the git root."""
-    for label, path, content in _hermes_md_candidates(cwd_path):
+    return _render_hermes_md(_hermes_md_candidates(cwd_path), context_length)
+
+
+def _render_hermes_md(candidates, context_length) -> str:
+    for label, path, content in candidates:
         if content:
             return _context_section(_strip_yaml_frontmatter(content), label, ".hermes.md", path, context_length)
     return ""
@@ -1734,9 +1743,13 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     files) is deduplicated. With a single match — the common case, and always the case outside a git repo —
     output is identical to the historical single-file behavior.
     """
+    return _render_agents_md(_agents_md_candidates(cwd_path), cwd_path.resolve(), context_length)
+
+
+def _render_agents_md(candidates, cwd_path, context_length) -> str:
     sections: list[str] = []
     seen_content: set = set()
-    for label, candidate, content in _agents_md_candidates(cwd_path):
+    for label, candidate, content in candidates:
         if content and content not in seen_content:  # else: empty, or an identical copy along the chain
             seen_content.add(content)
             sections.append(_context_section(content, label, label, candidate, context_length))
@@ -1744,12 +1757,16 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         return sections[0] if sections else ""
     # Per-file budgets applied above; also cap the merged chain so a deep monorepo can't multiply the budget.
     return _truncate_content("\n\n".join(sections), "AGENTS.md (directory chain)", context_length=context_length,
-                             read_path=str(cwd_path.resolve() / "AGENTS.md"))
+                             read_path=str(cwd_path / "AGENTS.md"))
 
 
 def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """CLAUDE.md / claude.md — cwd only."""
-    for name, path, content in _claude_md_candidates(cwd_path):
+    return _render_claude_md(_claude_md_candidates(cwd_path), context_length)
+
+
+def _render_claude_md(candidates, context_length) -> str:
+    for name, path, content in candidates:
         if content:
             return _context_section(content, name, "CLAUDE.md", path, context_length)
     return ""
@@ -1757,9 +1774,13 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
 
 def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only, concatenated."""
+    return _render_cursorrules(_cursorrules_candidates(cwd_path), cwd_path, context_length)
+
+
+def _render_cursorrules(candidates, cwd_path, context_length) -> str:
     cursorrules_content = "".join(
         f"## {label}\n\n{_scan_context_content(content, label)}\n\n"
-        for label, _path, content in _cursorrules_candidates(cwd_path) if content
+        for label, _path, content in candidates if content
     )
     if not cursorrules_content:
         return ""
@@ -1767,9 +1788,21 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
                              read_path=str(cwd_path / ".cursorrules"))
 
 
+def render_executor_context(cwd, candidates, context_length):
+    """Use the project-file precedence, scanner, and budgets for SSH candidates."""
+    by_kind = {}
+    for kind, label, path, content in candidates:
+        by_kind.setdefault(kind, []).append((label, path, content))
+    return (_render_hermes_md(by_kind.get("hermes_md", ()), context_length)
+            or _render_agents_md(by_kind.get("agents_md", ()), cwd, context_length)
+            or _render_claude_md(by_kind.get("claude_md", ()), context_length)
+            or _render_cursorrules(by_kind.get("cursorrules", ()), cwd, context_length))
+
+
 def build_context_files_prompt(
     cwd: Optional[str] = None, skip_soul: bool = False, context_length: Optional[int] = None,
     allow_install_tree_fallback: bool = False, home_override: Path | None = None,
+    *, executor_cwd: str | None = None,
 ) -> str:
     """Discover and load context files for the system prompt (each capped, see ``_get_context_file_max_chars``).
 
@@ -1782,6 +1815,23 @@ def build_context_files_prompt(
 
     if safe_worker_enabled() or not host_feature_enabled("context_files"):
         return ""  # hosted: the project's files are in the agent's sandbox, this host's are not its
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        from agent.ssh_project_context import executor_context_candidates
+        context_cwd, candidates = executor_context_candidates(context_length, directory=executor_cwd)
+        sections = [render_executor_context(context_cwd, candidates, context_length)] if context_cwd else []
+    else:
+        sections = _local_project_context(cwd, context_length, allow_install_tree_fallback)
+    if not skip_soul:
+        sections.append(load_soul_md(context_length, home_override=home_override))
+    sections = [s for s in sections if s]
+    if not sections:
+        return ""
+    return ("# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n"
+            + "\n".join(sections))
+
+
+def _local_project_context(cwd, context_length, allow_install_tree_fallback):
     cwd_path = _context_cwd_path(cwd)
     if cwd_path is None:
         sections = []
@@ -1794,10 +1844,4 @@ def build_context_files_prompt(
     else:
         sections = [_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
                     or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length)]
-    if not skip_soul:
-        sections.append(load_soul_md(context_length, home_override=home_override))
-    sections = [s for s in sections if s]
-    if not sections:
-        return ""
-    return ("# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n"
-            + "\n".join(sections))
+    return sections

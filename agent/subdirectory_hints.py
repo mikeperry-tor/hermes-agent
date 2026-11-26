@@ -8,7 +8,8 @@ import hashlib
 import logging
 import os
 import shlex
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import posixpath
 from typing import Dict, Any, Optional, Set
 
 from agent.prompt_builder import _read_text_with_timeout, _scan_context_content, _truncate_content
@@ -157,12 +158,17 @@ class SubdirectoryHintTracker:
         # AGENTS.md/CLAUDE.md injection at startup must not get the same files spliced into
         # tool results later — cron jobs relaying exact stdout leaked them to chat (#9441).
         from tools.hosted_tool_policy import host_feature_enabled
+        from hermes_cli.main_resume_args import uses_managed_executor
+        self._managed = uses_managed_executor()
         if not host_feature_enabled("subdirectory_hints"):
             # Hosted: the working dir names the agent's sandbox. Nothing is resolved or read here.
             self.enabled, self.working_dir, self._home_is_working_dir = False, Path(working_dir or "/"), True
             self._loaded_dirs, self._loaded_digests = {self.working_dir}, set()
             return
         self.enabled = enabled
+        if self._managed:
+            self._reset_executor_directory(working_dir or "/")
+            return
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
         # $HOME is not a project (#76902): the packaged Desktop app with no default project
         # dir configured resolves its cwd (and TERMINAL_CWD) to home, and the containment
@@ -185,6 +191,10 @@ class SubdirectoryHintTracker:
         """Re-anchor hint discovery to *working_dir* (a session workspace adoption)."""
         from tools.hosted_tool_policy import host_feature_enabled
         if not host_feature_enabled("subdirectory_hints"):
+            return
+        if self._managed:
+            if str(self.working_dir) != working_dir:
+                self._reset_executor_directory(working_dir)
             return
         try:
             new_dir = Path(working_dir).expanduser().resolve()
@@ -212,10 +222,43 @@ class SubdirectoryHintTracker:
 
         if not self.enabled or safe_worker_enabled() or not host_feature_enabled("subdirectory_hints"):
             return None  # hosted: the paths name the agent's sandbox; nothing is resolved here
+        if self._managed:
+            return self._executor_hints(tool_name, tool_args)
         if self._home_is_working_dir:
             return None
         all_hints = [h for d in self._extract_directories(tool_name, tool_args) if (h := self._load_hints_for_directory(d))]
         return "\n\n" + "\n\n".join(all_hints) if all_hints else None
+
+    def _reset_executor_directory(self, directory: str) -> None:
+        self.working_dir = PurePosixPath(directory)
+        self._home_is_working_dir = False
+        self._loaded_dirs = {self.working_dir}
+        self._loaded_digests = set()
+
+    def _executor_hints(self, tool_name, tool_args):
+        from agent.ssh_project_context import _priority_names, _selected_workspace
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+        if tool_name not in _COMMAND_TOOLS and not _PATH_ARG_KEYS.intersection(tool_args):
+            return None
+        try:
+            workspace = _selected_workspace()
+        except SshWorkspaceFsError:
+            return None
+        if workspace is None:
+            return None
+        if str(self.working_dir) != workspace.cwd:
+            self._reset_executor_directory(workspace.cwd)
+        hints = []
+        for directory in sorted(self._extract_directories(tool_name, tool_args)):
+            entries = _priority_names(workspace, directory, directory, _HINT_FILENAMES, 4 * _MAX_HINT_CHARS)
+            for _, path, content in entries:
+                if content:
+                    self._loaded_dirs.add(directory)
+                    if hint := self._format_hint(path, content):
+                        hints.append(hint)
+                    break
+        return "\n\n" + "\n\n".join(hints) if hints else None
 
     def _extract_directories(self, tool_name: str, args: dict[str, Any]) -> list:
         """Extract directory paths from tool call arguments."""
@@ -233,6 +276,16 @@ class SubdirectoryHintTracker:
         """Add a raw path's directory and its ancestors (up to ``_MAX_ANCESTOR_WALK``
         levels, stopping at the first already-loaded dir) so reading
         ``project/src/main.py`` still discovers ``project/AGENTS.md``."""
+        if self._managed:
+            if raw_path.startswith("~"):
+                return
+            path = PurePosixPath(posixpath.normpath(posixpath.join(str(self.working_dir), raw_path)))
+            for directory in (path, *path.parents)[:_MAX_ANCESTOR_WALK]:
+                if directory in self._loaded_dirs:
+                    break
+                if self._within_working_dir(directory) and not self._is_excluded(directory):
+                    candidates.add(directory)
+            return
         try:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
@@ -318,22 +371,22 @@ class SubdirectoryHintTracker:
                 content = (_read_text_with_timeout(target) or "").strip()
                 if not content:
                     continue
-                digest = _digest(content)
-                if digest in self._loaded_digests:
-                    logger.debug("Skipping duplicate hint content at %s (digest %s)", hint_path, digest[:12])
-                    return None
-                self._loaded_digests.add(digest)
-                # Same security scan as startup context loading.
-                content = _scan_context_content(content, filename)
-                rel_path = self._display_path(hint_path)
-                content = _truncate_content(
-                    content, filename, max_chars=_MAX_HINT_CHARS, read_path=rel_path, queue_warning=False,
-                )
-                logger.debug("Loaded subdirectory hints from %s: %s", directory, [rel_path])
-                return f"[Subdirectory context discovered: {rel_path}]\n{content}"  # first match wins per directory
+                return self._format_hint(hint_path, content)
             except Exception as exc:
                 logger.debug("Could not read %s: %s", hint_path, exc)
         return None
+
+    def _format_hint(self, path, content):
+        digest = _digest(content)
+        if digest in self._loaded_digests:
+            return None
+        self._loaded_digests.add(digest)
+        rel_path = self._display_path(path)
+        content = _truncate_content(
+            _scan_context_content(content, path.name), path.name, max_chars=_MAX_HINT_CHARS,
+            read_path=rel_path, queue_warning=False,
+        )
+        return f"[Subdirectory context discovered: {rel_path}]\n{content}"
 
     def _display_path(self, hint_path: Path) -> str:
         """Working-dir-relative, else ``~/``-relative (POSIX rendering so Windows

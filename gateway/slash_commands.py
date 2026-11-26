@@ -12,6 +12,7 @@ import inspect
 import logging
 import os
 import re
+import json
 import shlex
 import sys
 import time
@@ -784,11 +785,21 @@ class GatewaySlashCommandsMixin(
     async def _handle_diff_command(self, event: MessageEvent) -> str:
         """Handle /diff — show git changes in the working directory.  Diff body is truncated hard
         here (chat is not a pager); platform senders clamp further."""
-        args = [a.lower() for a in event.get_command_args().strip().split()]
-        stat_only = bool({"--stat", "stat"} & set(args))
+        try:
+            args = shlex.split(event.get_command_args())
+        except ValueError as exc:
+            return t("gateway.diff.failed", error=str(exc))
+        stat_only = False
         mode = "working"
-        for low in args:
-            mode = _DIFF_MODE_BY_ARG.get(low, mode)
+        paths = []
+        for arg in args:
+            low = arg.lower()
+            if low in ("--stat", "stat"):
+                stat_only = True
+            elif low in _DIFF_MODE_BY_ARG or low == "working":
+                mode = _DIFF_MODE_BY_ARG.get(low, "working")
+            else:
+                paths.append(arg)
         if mode == "session":
             # Cumulative checkpoint-baseline diff.
             mgr = self._checkpoint_manager(event.source)
@@ -798,8 +809,17 @@ class GatewaySlashCommandsMixin(
                 return reason
             result = await asyncio.to_thread(mgr.session_diff, self._terminal_cwd())
         else:
-            from tools.working_diff import collect_working_diff
-            result = await asyncio.to_thread(collect_working_diff, self._terminal_cwd(), mode)
+            from hermes_cli.main_resume_args import uses_managed_executor
+            if uses_managed_executor():
+                from gateway.session_policy import policy_for_source
+                from tools.working_diff import collect_executor_working_diff
+                policy = policy_for_source(self, event.source)
+                terminal = json.loads(policy.terminal_json) if policy is not None else None
+                result = await asyncio.to_thread(collect_executor_working_diff, None, mode, paths or None,
+                                                 terminal_policy=terminal)
+            else:
+                from tools.working_diff import collect_working_diff
+                result = await asyncio.to_thread(collect_working_diff, self._terminal_cwd(), mode)
         if not result.get("success"):
             return t("gateway.diff.failed", error=result.get("error") or t("gateway.diff.err_default"))
         return self._render_diff_result(result, stat_only)

@@ -373,19 +373,36 @@ class RuntimeMode:
 
 def resolve_runtime_mode(
     *, platform: Optional[str] = None, cwd: Optional[str | Path] = None, config: Optional[dict[str, Any]] = None,
-    model: Optional[str] = None,
+    model: Optional[str] = None, workspace_block: str | None = None,
 ) -> RuntimeMode:
     """Resolve the operating posture once (a handful of ``stat`` calls) — the single entry
     point every domain should call; the result is safe to hold for the session. ``model``
     only steers edit-format guidance; ``agent.coding_instructions`` (str or list) becomes
     the trailing block so a user can pin workflow rules without editing the shipped brief."""
-    resolved_cwd = _resolve_cwd(cwd)
     mode = _coding_mode(config)
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    surface = (platform or "").strip().lower()
+    if uses_managed_executor():
+        from agent.runtime_cwd import scope_terminal_cwd
+        from agent.ssh_project_context import executor_coding_workspace
+        resolved_cwd = Path(scope_terminal_cwd() or "/workspace")
+        if mode == "on":
+            profile = CODING_PROFILE
+        elif mode == "off" or (surface and surface not in INTERACTIVE_CODING_PLATFORMS):
+            profile = GENERAL_PROFILE
+        else:
+            if workspace_block is None:
+                _, workspace_block = executor_coding_workspace()
+            profile = CODING_PROFILE if workspace_block else GENERAL_PROFILE
+    else:
+        resolved_cwd = _resolve_cwd(cwd)
+        profile = _detect_profile(mode, surface, resolved_cwd)
     raw = _agent_config_value(config, "coding_instructions", "", readonly=False)
     items = raw if isinstance(raw, (list, tuple)) else [raw or ""]
     instructions = "\n".join(str(item).strip() for item in items if str(item).strip())
     return RuntimeMode(
-        profile=_detect_profile(mode, (platform or "").strip().lower(), resolved_cwd),
+        profile=profile,
         surface=platform or "",
         cwd=resolved_cwd,
         config_mode=mode,
@@ -420,7 +437,8 @@ def coding_system_prompt_parts(
 ) -> tuple[list[str], list[str], list[str]]:
     """Return coding prefix, workspace snapshot, and trailing guidance.  ``workspace_block``
     replays the caller's pinned session-start snapshot instead of probing git again."""
-    mode = resolve_runtime_mode(platform=platform, cwd=cwd, config=config, model=model)
+    mode = resolve_runtime_mode(platform=platform, cwd=cwd, config=config, model=model,
+                                workspace_block=workspace_block)
     return mode.system_prompt_parts(valid_tool_names=valid_tool_names, workspace_block=workspace_block)
 
 
@@ -538,9 +556,13 @@ WORKSPACE_BLOCK_HEADER = "Workspace (snapshot at session start — re-check with
 def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
     """Workspace snapshot for the system prompt (empty outside a workspace): git state when
     in a repo, plus project facts — so marker-only (non-git) projects still get one."""
+    from hermes_cli.main_resume_args import uses_managed_executor
     from tools.hosted_tool_policy import host_feature_enabled
     if not host_feature_enabled("workspace_snapshot"):
         return ""  # the agent's workspace is in its sandbox; this host's cwd says nothing about it
+    if uses_managed_executor():
+        from agent.ssh_project_context import executor_coding_workspace
+        return executor_coding_workspace()[1]
     git_root, root = _workspace_roots(cwd)
     if root is None:
         return ""

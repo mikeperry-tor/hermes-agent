@@ -87,7 +87,11 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
 def _plugin_session_info(agent: Any) -> dict[str, str]:
     """Return immutable-at-render-time metadata exposed to prompt sections."""
     try:
-        cwd = str(resolve_context_cwd() or "")
+        from agent.runtime_cwd import scope_terminal_cwd
+        from hermes_cli.main_resume_args import uses_managed_executor, requested_executor_project
+
+        cwd = ((scope_terminal_cwd() or requested_executor_project() or "/workspace") if uses_managed_executor()
+               else str(resolve_context_cwd() or ""))
     except Exception:
         cwd = ""
     info = {k: str(getattr(agent, k, None) or "") for k in ("session_id", "model", "provider", "platform")}
@@ -322,7 +326,10 @@ def _skills_prompt(agent: Any) -> str:
     avail_toolsets = {model_tools.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names} - {None, ""}
     try:
         from agent.coding_context import coding_compact_skill_categories
-        _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
+        from hermes_cli.main_resume_args import uses_managed_executor
+
+        cwd = None if uses_managed_executor() else resolve_context_cwd()
+        _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=cwd)
     except Exception:
         _compact_cats = frozenset()
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
@@ -712,6 +719,9 @@ def _coding_parts(agent: Any) -> tuple[list[str], list[str], list[str]]:
         from agent.coding_context import coding_system_prompt_parts
         if not agent.valid_tool_names:
             return [], [], []
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if uses_managed_executor():
+            return _executor_coding_parts(agent)
         cwd = resolve_context_cwd()
         cwd_key = _workspace_pin_key()
         if getattr(agent, "_frozen_workspace_snapshot", None) is None:
@@ -727,6 +737,22 @@ def _coding_parts(agent: Any) -> tuple[list[str], list[str], list[str]]:
     except Exception:
         pass
     return [], [], []
+
+
+def _executor_coding_parts(agent):
+    from agent.coding_context import coding_system_prompt_parts
+    from agent.runtime_cwd import scope_terminal_cwd
+    from agent.ssh_project_context import executor_coding_workspace
+
+    key = "ssh:" + scope_terminal_cwd()
+    pinned = getattr(agent, "_frozen_workspace_snapshot", None)
+    if pinned is None or pinned[0] != key:
+        _, workspace_block = executor_coding_workspace()
+        agent._frozen_workspace_snapshot = (key, workspace_block)
+    else:
+        workspace_block = pinned[1]
+    return coding_system_prompt_parts(platform=agent.platform, model=agent.model,
+                                      valid_tool_names=agent.valid_tool_names, workspace_block=workspace_block)
 
 
 def _post_workspace_parts(agent: Any) -> list[str]:
@@ -755,8 +781,9 @@ def _context_files_part(agent: Any, ctx_len: Optional[int], soul_loaded: bool) -
     can reject Hermes's bundled AGENTS.md."""
     if agent.skip_context_files:
         return []
+    from hermes_cli.main_resume_args import uses_managed_executor
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
-    cwd = resolve_context_cwd(include_session_override=not launch_artifact)
+    cwd = None if uses_managed_executor() else resolve_context_cwd(include_session_override=not launch_artifact)
     return [_pb.build_context_files_prompt(
         cwd=cwd, skip_soul=soul_loaded, context_length=ctx_len,
         allow_install_tree_fallback=agent.platform in ("cli", "tui"), home_override=_agent_home(agent))]
