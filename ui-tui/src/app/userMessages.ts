@@ -191,11 +191,13 @@ export const describeRpcError = (err: unknown): string => {
 export const isUnsupportedCommand = (err: unknown): boolean =>
   (err as { data?: { reason?: string } } | null)?.data?.reason === 'unsupported_command'
 
-/** The shared owner refuses `!cmd` / `{!cmd}` for a session whose terminal backend is not local
- *  (gateway/session_shell.py): the command would run on the gateway host, outside the session's
- *  sandbox. Name the backend and point at the agent; other errors read as describeRpcError. */
+/** Explain a shell placement refusal or use the gateway's general error text. */
 export const describeShellExecError = (err: unknown): string => {
   const data = (err as { data?: { detail?: unknown; reason?: unknown } } | null)?.data
+
+  if (data?.reason === 'operator_shell_unavailable' && typeof data.detail === 'string') {
+    return data.detail
+  }
 
   if (data?.reason === 'unsupported_terminal_backend') {
     const backend = typeof data.detail === 'string' ? data.detail.trim() : ''
@@ -231,7 +233,7 @@ export const describeSlashExecError = (command: string, err: unknown): string =>
     return [t('userMessages.rpc.slashCrashed', command), detail].filter(Boolean).join('\n')
   }
 
-  return describeRpcError(err)
+  return describeShellExecError(err)
 }
 
 // slash.exec answers 4018 with exactly these texts when it does NOT own the

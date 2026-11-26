@@ -287,6 +287,35 @@ function copyMeasuredHeights(
   }
 }
 
+function useIdleQueueDrain<T>(
+  ui: { busy: boolean; gatewayConnected?: boolean; sid?: null | string },
+  composerActions: { dequeue: () => T | undefined },
+  composerRefs: { queueEditRef: { current: null | number }; queueRef: { current: readonly unknown[] } },
+  sendQueued: (item: T) => void
+): void {
+  // Drain one queued message whenever the session settles (busy -> false):
+  // agent turn ends, interrupt, shell.exec finishes, error recovered, or the
+  // session first comes up with pre-queued messages.
+  useEffect(() => {
+    if (
+      !ui.sid ||
+      ui.gatewayConnected === false ||
+      ui.busy ||
+      composerRefs.queueEditRef.current !== null ||
+      composerRefs.queueRef.current.length === 0
+    ) {
+      return
+    }
+
+    const next = composerActions.dequeue()
+
+    if (next) {
+      patchUiState({ busy: true, status: 'running…' })
+      sendQueued(next)
+    }
+  }, [ui.sid, ui.busy, ui.gatewayConnected, composerActions, composerRefs, sendQueued])
+}
+
 export function useMainApp(gw: GatewayClient) {
   const { exit } = useApp()
   const { stdout } = useStdout()
@@ -965,7 +994,7 @@ export function useMainApp(gw: GatewayClient) {
 
   sysRef.current = sys
 
-  const { dispatchSubmission, send, sendQueued, submit, submitLiteral } = useSubmission({
+  const { cancelShell, dispatchSubmission, send, sendQueued, submit, submitLiteral } = useSubmission({
     appendMessage,
     composerActions,
     composerRefs,
@@ -979,34 +1008,13 @@ export function useMainApp(gw: GatewayClient) {
 
   submitLiteralRef.current = submitLiteral
 
-  // Drain one queued message whenever the session settles (busy → false):
-  // agent turn ends, interrupt, shell.exec finishes, error recovered, or the
-  // session first comes up with pre-queued messages. Without this, shell.exec
-  // and error paths never emit message.complete, so anything enqueued while
-  // `!sleep` / a failed turn was running would stay stuck forever.
-  useEffect(() => {
-    if (
-      !ui.sid ||
-      ui.gatewayConnected === false ||
-      ui.busy ||
-      composerRefs.queueEditRef.current !== null ||
-      composerRefs.queueRef.current.length === 0
-    ) {
-      return
-    }
-
-    const next = composerActions.dequeue()
-
-    if (next) {
-      patchUiState({ busy: true, status: 'running…' })
-      sendQueued(next)
-    }
-  }, [ui.sid, ui.busy, ui.gatewayConnected, composerActions, composerRefs, sendQueued])
+  useIdleQueueDrain(ui, composerActions, composerRefs, sendQueued)
 
   const { pagerPageSize } = useInputHandlers({
     actions: {
       appendMessage,
       cancelClarify,
+      cancelShell,
       countPrompts: () => historyItemsRef.current.filter(msg => msg.role === 'user' && !msg.kind).length,
       die,
       dispatchSubmission,

@@ -427,6 +427,19 @@ function handlePagerKey(ch: string, key: Key, pagerPageSize: number) {
   }
 }
 
+function interruptActiveWork(actions: InputHandlerActions, gateway: GatewayServices, sid: string): void {
+  if (actions.cancelShell?.()) {
+    return
+  }
+
+  turnController.interruptTurn({
+    appendMessage: actions.appendMessage,
+    gw: gateway.gw,
+    sid,
+    sys: actions.sys
+  })
+}
+
 export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   const { actions, composer, gateway, terminal, voice, wheelStep } = ctx
   const { actions: cActions, refs: cRefs, state: cState } = composer
@@ -948,12 +961,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       }
 
       if (ctrlC === 'interrupt' && live.sid) {
-        return turnController.interruptTurn({
-          appendMessage: actions.appendMessage,
-          gw: gateway.gw,
-          sid: live.sid,
-          sys: actions.sys
-        })
+        return interruptActiveWork(actions, gateway, live.sid)
       }
 
       // An armed edit whose text was erased: this press cancels it and never exits.

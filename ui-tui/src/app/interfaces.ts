@@ -499,6 +499,7 @@ export interface UseComposerStateResult {
 export interface InputHandlerActions {
   appendMessage: (msg: Msg) => void
   cancelClarify: () => void
+  cancelShell?: () => boolean
   /** User prompts in the transcript on screen (gates the backtrack prime hint). */
   countPrompts: () => number
   die: () => void

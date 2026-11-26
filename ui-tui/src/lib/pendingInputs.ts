@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import type { SubmissionDestination } from '../app/submissionDestination.js'
 import type { QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
+import { hasShellSubmission } from '../protocol/paste.js'
 
 const directory = (home?: string) =>
   join(home ?? process.env.HERMES_HOME ?? join(homedir(), '.hermes'), 'tui-pending-inputs')
@@ -179,7 +180,11 @@ export function loadPendingInputs(destination: SubmissionDestination, durableRes
         return []
       }
 
-      return [{ ...record, inFlight: false, failed: Boolean(record.attempted) }]
+      // A fresh client can show an unfinished shell draft, but replay needs
+      // another operator action since shell commands have side effects.
+      const shellDraft = record.preparedText === undefined && hasShellSubmission(record.display, record.text)
+
+      return [{ ...record, inFlight: false, failed: Boolean(record.attempted) || shellDraft }]
     })
     .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
 }
