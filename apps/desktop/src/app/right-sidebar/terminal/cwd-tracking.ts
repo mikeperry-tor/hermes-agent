@@ -21,13 +21,13 @@ export function parseOscCwd(code: 7 | 9, payload: string): string | null {
       return null
     }
 
-    const raw = payload.slice(2).trim().replace(/^"|"$/g, '')
+    const raw = payload.slice(2).replace(/^"|"$/g, '')
 
     return raw || null
   }
 
   // OSC 7 — a file URI. Strip the scheme + authority and percent-decode.
-  const match = /^file:\/\/[^/]*(\/.*)$/.exec(payload.trim())
+  const match = /^file:\/\/[^/]*(\/.*)$/.exec(payload)
 
   if (!match) {
     return null
@@ -66,7 +66,7 @@ export function trackTerminalCwd(
   { getSessionId, lastObservedCwdRef, term, terminalApi }: TerminalCwdTrackerOptions
 ): { dispose: () => void; probe: () => void } {
   const recordCwd = (next: string | null | undefined) => {
-    const value = (next ?? '').trim()
+    const value = next ?? ''
 
     if (!value || value === lastObservedCwdRef.current) {
       return
