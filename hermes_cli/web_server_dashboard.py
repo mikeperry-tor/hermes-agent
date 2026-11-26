@@ -230,12 +230,15 @@ def mount_spa(application: FastAPI):
         # none, so a tab on any other profile names that profile on every request.
         from hermes_cli.web_server_profiles import serving_profile_name as _serving_profile_name
         serving_profile_js = json.dumps(_serving_profile_name()).replace("</", "<\\/")
+        from hermes_cli.web_host_terminal import environment as terminal_environment
+        terminal_environment_js = json.dumps(terminal_environment(application))
         bootstrap_script = (
             f"<script>{token_js}"
             f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
             f'window.__HERMES_BASE_PATH__="{prefix}";'
             f"window.__HERMES_AUTH_REQUIRED__={'true' if gated else 'false'};"
             f"window.__HERMES_INITIAL_PROFILE__={initial_profile_js};"
+            f"window.__HERMES_TERMINAL_ENVIRONMENT__={terminal_environment_js};"
             f"{surface_js}"
             f"window.__HERMES_DASHBOARD_PROFILE__={serving_profile_js};"
             f"</script>"

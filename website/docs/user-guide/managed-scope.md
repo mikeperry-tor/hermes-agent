@@ -160,8 +160,10 @@ sudo chmod 0644 /etc/hermes/config.yaml /etc/hermes/.env
 ```
 
 Changes take effect on the next Hermes start (a malformed managed file is logged
-loudly and ignored — it never blocks startup, but the admin should check
-`hermes doctor` to confirm the policy is being applied).
+loudly and ignored by optional overlay readers, while strict deployment readers
+such as `webapp.terminal_environment: executor` and `webapp.executor_ssh_config`
+fail closed until `/etc/hermes/config.yaml` is repaired; run `hermes doctor` to
+confirm the policy is being applied).
 
 ## Security model and limitations (v1)
 

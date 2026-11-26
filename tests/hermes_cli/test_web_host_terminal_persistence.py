@@ -615,7 +615,7 @@ def test_cross_process_deletion_closes_attached_shell(host_app, fake_bridges, tm
 
 
 @pytest.mark.parametrize("failure", ["metadata", "replay"])
-def test_route_lost_initial_delivery_detaches_and_expires(host_app, fake_bridges, monkeypatch, failure):
+def test_route_lost_initial_delivery_retires_only_unpublished_shells(host_app, fake_bridges, monkeypatch, failure):
     from starlette.websockets import WebSocket
     from hermes_cli.pty_session import PtySession
     original_start = PtySession.start
@@ -635,8 +635,12 @@ def test_route_lost_initial_delivery_detaches_and_expires(host_app, fake_bridges
                 metadata(ws)
             with pytest.raises(WebSocketDisconnect) as error:
                 ws.receive_bytes()
-            assert error.value.code == 1001  # reconnect; the shell is retained
+            assert error.value.code == 1001
         registry = host_app.state.host_terminals
+        if failure == "metadata":
+            assert fake_bridges[0].closed.wait(3)
+            assert not registry._sessions
+            return
         session = next(iter(registry._sessions.values()))
         assert not session.attached and session.last_detached_at is not None
         assert client.portal is not None

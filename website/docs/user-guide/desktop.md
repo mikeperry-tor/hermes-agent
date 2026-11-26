@@ -192,7 +192,7 @@ window.
 
 ### Terminal in the Webapp
 
-The terminal rail opens the host's interactive shell, running as a child of the gateway, in your home
+By default, the terminal rail opens the host's interactive shell, running as a child of the gateway, in your home
 folder unless `terminal.cwd` names another. Dropping files onto it uploads them to the host (**16 MiB**
 each) and types their paths. Refreshing the page or losing the connection detaches the terminal
 without ending its shell; the saved terminal tab reattaches to that shell and its profile. Hiding a
@@ -210,6 +210,41 @@ remote SSH login environment, not a same-named profile on the Webapp host. Remov
 re-pointing the saved connection ends its terminals. The remote `serve --isolated` does not
 need Webapp enabled. For an HTTP gateway connection, the remote must itself provide the
 Webapp host-terminal service; a plain `serve` or gateway listener does not expose host shells.
+
+#### SSH executor terminals
+
+By default, Webapp terminal tabs open a shell on the serving gateway host. Set
+`webapp.terminal_environment: executor` in the gateway's launch-profile config
+and restart the Webapp to open terminal tabs on each selected profile's
+`terminal.backend: ssh` host instead. Non-SSH backends fail visibly rather than
+falling back to a gateway shell.
+
+- **Explicit OpenSSH config (`webapp.executor_ssh_config`):** Set to an absolute
+  OpenSSH `-F` config path on the serving host (with `UserKnownHostsFile`) to
+  enforce strict host-key checking and disable agent, X11, and port forwarding
+  for both the preparation probe and interactive shell. Keep the file, its
+  known-hosts file, and the endpoint settings administrator-owned.
+- **Prerequisites:** The serving host needs POSIX OpenSSH; the SSH target needs
+  Bash and Python 3. Preparation verifies Bash before starting the PTY.
+- **Working directory & tab ownership:** New shells start in the executor's
+  configured `terminal.cwd` or home directory unless a tab supplies or restores
+  a specific path; OSC 7 updates preserve spaces and shell metacharacters. Tabs
+  keep their chosen gateway, profile, and placement across retries (reload stale
+  pages after changing `webapp.terminal_environment`, or open a new tab to
+  change placement). Saved remote gateway connections and HTTP relays retain
+  their own routing and ownership.
+- **Cancellable startup & reattachment:** Slow SSH preparation runs outside the
+  shared PTY spawn lock. If a tab closes before the browser acknowledges the
+  new terminal ID, the gateway cancels startup and discards the shell. Once
+  acknowledged, normal page-reload reattachment works as before (older gateways
+  retain token-based close).
+- **Failure handling:** Each new shell reads a single managed terminal policy;
+  if the launch profile's config is invalid at startup, the Webapp still serves
+  but refuses new terminals until you repair the config and restart.
+- **Scope:** An authenticated Webapp operator still has administrative agent
+  authority; executor terminals change where the shell runs, not overall browser
+  authority or per-task isolation.
+
 
 The bundle's npm dependencies install into `.build/webapp-workspace` in the checkout, separately from
 the native Desktop, and reinstall only when the lockfile changes. With lazy installs disabled, a plain
