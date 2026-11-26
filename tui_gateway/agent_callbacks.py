@@ -151,9 +151,19 @@ def _agent_cbs(sid: str) -> dict:
     def _read_block(method: str, timeout: int):
         # read_terminal / read_preview (desktop GUI): server request like clarify; the preview
         # read gets longer since a URL tab extracts text from a live page.
-        return lambda start=None, count=None: _ask(
-            method, sid, {k: v for k, v in (("start", start), ("count", count)) if v is not None},
-            timeout=timeout)
+        def read(start=None, count=None):
+            params = {key: value for key, value in (("start", start), ("count", count)) if value is not None}
+            if method == "terminal.read":
+                from gateway.session_authorities import served_profile_name
+                with _sessions_lock:
+                    session = _sessions.get(sid)
+                    if session is None:
+                        return ""
+                    profile_home = session.get("profile_home") or _launch_home()
+                params["owner_profile"] = served_profile_name(profile_home)
+            return _ask(method, sid, params, timeout=timeout)
+
+        return read
 
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(sid, tc_id, name, args),

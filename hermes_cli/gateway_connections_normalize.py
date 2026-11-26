@@ -464,13 +464,17 @@ def _same_url(a: Any, b: Any) -> bool:
     return normalize_remote_base_url(a) == normalize_remote_base_url(b)
 
 
+_DIAL_FIELDS = ("kind", "url", "authMode", "org", "host", "user", "port", "keyPath", "remoteHermesPath",
+                "remoteProfile", "token", "headers")
+
+
+def dial_fingerprint(entry: dict) -> str:
+    """Compare saved dial fields without depending on a store revision or the entry's label."""
+    return json.dumps([entry.get(key) for key in _DIAL_FIELDS], sort_keys=True, default=str)
+
+
 def connection_dial_fields_changed(before: dict, after: dict) -> bool:
-    if before.get("kind") != after.get("kind"):
-        return True
-    for field in ("url", "authMode", "org", "host", "user", "port", "keyPath", "remoteHermesPath", "remoteProfile"):
-        if before.get(field) != after.get(field):
-            return True
-    return before.get("token") != after.get("token") or before.get("headers") != after.get("headers")
+    return any(before.get(key) != after.get(key) for key in _DIAL_FIELDS)
 
 
 def upsert_connection(registry: dict, entry: dict) -> dict:

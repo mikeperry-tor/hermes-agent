@@ -113,7 +113,9 @@ def test_shell_scopes_passthrough_after_eager_activation(
             (launch_name, b"launch-value:launch-only:missing"),
         ):
             with client.websocket_connect(url(f"&profile={profile}")) as ws:
-                assert metadata(ws)["shell"] == "sh"
+                placement = metadata(ws)
+                assert placement["shell"] == "sh"
+                assert placement["profile"] == (launch_name if profile == "current" else profile)
                 ws.send_bytes(command)
                 output = output_until(ws, b"SCOPE=")
                 assert b"SCOPE=" + expected in output
@@ -134,6 +136,8 @@ def test_real_shell_survives_disconnect_and_explicit_close(host_app, tmp_path):
         with client.websocket_connect(url("&cwd=" + str(tmp_path))) as ws:
             first = metadata(ws)
             token = first["terminalId"]
+            assert first["profile"] == "default"
+            assert first["environment"] == "gateway"
             bridge = host_app.state.host_terminals._sessions[token].bridge
             ws.send_bytes(b"stty -echo; continuity=retained; printf 'PID=%s\\n' $$\n")
             output_until(ws, b"PID=")
@@ -149,6 +153,8 @@ def test_real_shell_survives_disconnect_and_explicit_close(host_app, tmp_path):
             resumed = metadata(ws)
             assert resumed["reconnected"] is True
             assert resumed["terminalId"] == token
+            assert resumed["profile"] == first["profile"]
+            assert resumed["environment"] == first["environment"]
             assert b"CHILD=" + child_pid in output_until(ws, b"CHILD=" + child_pid)
             ws.send_bytes(b"foreground survived\n")
             assert b"INPUT='foreground survived\\n'" in output_until(ws, b"INPUT='foreground survived\\n'")

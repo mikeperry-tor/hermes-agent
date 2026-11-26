@@ -23,13 +23,14 @@ import hashlib
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
 from hermes_cli import gateway_connections as store
+from hermes_cli.gateway_connections_normalize import dial_fingerprint
 
 NATIVE_FLOW_ID = "native_pkce"
 CALLBACK_PATH = "/webapp/gateway-connections/oauth/callback"
@@ -309,6 +310,8 @@ class Grant:
     access_token: str
     base_url: str
     headers: dict
+    dial: str = field(repr=False)
+    principal: tuple[str, str] = field(repr=False)
 
 
 def _snapshot(connection_id: str) -> dict:
@@ -335,25 +338,28 @@ def ensure_access_token(connection_id: str, *, rejected_token: str = "") -> Gran
             raise NotSignedIn("Sign in to this gateway first.")
         forced = bool(rejected_token) and rejected_token == tokens.get("accessToken")
         if not forced and not token_needs_refresh(tokens):
-            return _grant(tokens, snap["headers"])
+            return _grant(tokens, snap)
         if not tokens.get("refreshToken"):
             store.write_tokens(connection_id, None)
             raise NotSignedIn("The sign-in expired; sign in again.")
-        return _refresh(connection_id, snap["headers"], tokens)
+        return _refresh(connection_id, snap, tokens)
 
 
-def _grant(tokens: dict, headers: dict) -> Grant:
-    return Grant(access_token=tokens["accessToken"], base_url=str(tokens["baseUrl"]).rstrip("/"), headers=dict(headers))
+def _grant(tokens: dict, snap: dict) -> Grant:
+    # Older gateways can omit an account id. In that case only the same token proves the same sign-in.
+    principal = (tokens.get("provider") or "", tokens.get("userId") or tokens["accessToken"])
+    return Grant(access_token=tokens["accessToken"], base_url=snap["url"], headers=dict(snap["headers"]),
+                 dial=dial_fingerprint(snap["entry"]), principal=principal)
 
 
-def _refresh(connection_id: str, headers: dict, tokens: dict) -> Grant:
+def _refresh(connection_id: str, snap: dict, tokens: dict) -> Grant:
     # The refresh token goes only to the gateway that issued it (the snapshot hands out a set
     # only while the entry still names that URL).
     base_url = str(tokens["baseUrl"]).rstrip("/")
     try:
         response = _post_json(_endpoint(base_url, "/auth/native/refresh"),
                               {"refresh_token": tokens["refreshToken"], "provider": tokens.get("provider") or ""},
-                              headers)
+                              snap["headers"])
     except httpx.HTTPError as exc:
         raise OAuthSignInError(f"Could not reach {base_url} to renew the sign-in: {exc}") from exc
     if response.status_code == 401:
@@ -369,13 +375,13 @@ def _refresh(connection_id: str, headers: dict, tokens: dict) -> Grant:
     if current["tokens"].get("accessToken") != tokens.get("accessToken"):
         # A sign-in (Desktop's or a browser's) replaced the tokens meanwhile: it wins, with the
         # address it was issued by.
-        return _grant(current["tokens"], current["headers"])
+        return _grant(current["tokens"], current)
     try:
         store.write_tokens(connection_id, rotated, issued_by=base_url)
     except (store.ConnectionStoreError, store.NoSuchConnection) as exc:
         # Re-pointed or removed while the remote answered: this rotation belongs to neither host.
         raise NotSignedIn("The connection changed while renewing its sign-in; sign in again.") from exc
-    return Grant(access_token=rotated["accessToken"], base_url=base_url, headers=dict(headers))
+    return _grant(rotated, snap)
 
 
 def _drop_if_unchanged(connection_id: str, tokens: dict) -> None:

@@ -86,6 +86,22 @@ afterEach(() => {
 })
 
 describe('persistent browser terminals', () => {
+  it('reports the executor and profile from live startup metadata', async () => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+    const api = install()
+    const unknown = await api.start({ restoreKey: 'missing-confirmation' })
+    expect(api.executorReadScope?.(unknown.id)).toBeNull()
+
+    Socket.reply = socket => socket.metadata({ environment: 'executor', profile: 'confirmed' })
+    const verified = await api.start({ restoreKey: 'verified' })
+    expect(api.executorReadScope?.(verified.id)).toEqual({ connectionId: 'local', profile: 'confirmed' })
+    Socket.instances[1].output(META + JSON.stringify({ environment: 'gateway', profile: 'other' }))
+    expect(api.executorReadScope?.(verified.id)?.profile).toBe('confirmed')
+
+    Socket.instances[1].close(1006)
+    expect(api.executorReadScope?.(verified.id)).toBeNull()
+  })
+
   it.each(['executor', null] as const)('skips independent cwd resolution for a local terminal in %s mode', async mode => {
     window.__HERMES_TERMINAL_ENVIRONMENT__ = mode
     const api = install()

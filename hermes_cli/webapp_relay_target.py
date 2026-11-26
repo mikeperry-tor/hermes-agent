@@ -21,12 +21,14 @@ import httpx
 from hermes_cli import gateway_connections as store
 from hermes_cli import gateway_connections_oauth as oauth
 from hermes_cli import gateway_connections_reach as reach
+from hermes_cli.gateway_connections_normalize import dial_fingerprint
 from hermes_cli.gateway_connections_ssh_transport import SshReachError
 
 #: The socket that opens only with a ticket of its own (``web_session_sockets.HOST_TERMINAL_SOCKET``).
 _OWN_TICKET_PATHS = {"/api/host-terminal": "host-terminal"}
 #: What resolving a saved connection can refuse with: a reason the browser is shown.
-_REACH_ERRORS = (store.ConnectionStoreError, oauth.NotSignedIn, oauth.OAuthSignInError, SshReachError)
+_REACH_ERRORS = (store.ConnectionStoreBusy, store.ConnectionStoreError, oauth.NotSignedIn, oauth.OAuthSignInError,
+                 SshReachError)
 _POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gateway-reach")
 _resolving: dict[tuple[str, str], Future] = {}
 _resolving_lock = threading.Lock()
@@ -37,11 +39,9 @@ class Unreachable(LookupError):
 
 
 @dataclass(frozen=True)
-class Target:
-    connection_id: str
-    label: str
-    base_url: str
-    headers: dict[str, str] = field(default_factory=dict)
+class Target(reach.ResolvedDial):
+    connection_id: str = field(kw_only=True)
+    label: str = field(kw_only=True)
 
     @property
     def bearer(self) -> str:
@@ -52,25 +52,31 @@ def _entry(connection_id: str) -> Optional[dict]:
     return next((c for c in store.read_registry()["connections"] if c["id"] == connection_id), None)
 
 
-def entry_url(connection_id: str) -> Optional[str]:
-    """What *connection_id* names now (its URL, or its SSH host), or None once it is removed."""
-    entry = _entry(connection_id)
-    return (entry.get("url") or entry.get("host") or entry["id"]) if entry else None
+def current_dial(connection_id: str) -> Optional[str]:
+    """Saved dial fields of this entry, or None once it is removed."""
+    try:
+        entry = _entry(connection_id)
+    except store.ConnectionStoreBusy as exc:
+        raise Unreachable("The saved gateways could not be read while connecting.") from exc
+    return dial_fingerprint(entry) if entry else None
 
 
 def _resolve(connection_id: str, rejected_token: str) -> Optional[Target]:
-    entry = _entry(connection_id)
-    if entry is None or entry["kind"] == "local":
-        return None
     try:
-        base_url, headers = reach.resolve_target(connection_id, rejected_token=rejected_token)
+        entry = _entry(connection_id)
+        if entry is None or entry["kind"] == "local":
+            return None
+        target = reach.resolve_dial_target(connection_id, rejected_token=rejected_token)
     except store.NoSuchConnection:
         return None
     except _REACH_ERRORS as exc:
         raise Unreachable(str(exc)) from exc
-    if not any(k in headers for k in ("Authorization", reach.SESSION_TOKEN_HEADER)):
+    if current_dial(connection_id) != target.dial:
+        raise Unreachable(f"{entry['label']} changed while connecting. Try again.")
+    if not any(k in target.headers for k in ("Authorization", reach.SESSION_TOKEN_HEADER)):
         raise Unreachable(f"{entry['label']} has no saved credential. Edit it in Settings → Gateways.")
-    return Target(connection_id=connection_id, label=entry["label"], base_url=base_url, headers=headers)
+    return Target(target.base_url, target.headers, target.dial, target.principal,
+                  connection_id=connection_id, label=entry["label"])
 
 
 def _submit(fn, *args) -> Future:
@@ -109,7 +115,7 @@ def _socket_credential(target: Target, path: str) -> tuple[str, str]:
             raise Unreachable(f"{target.label} did not issue a {own} ticket ({response.status_code}).")
         return "ticket", ticket
     try:
-        ticket = reach.mint_ws_ticket(target.connection_id, for_base_url=target.base_url)
+        ticket = reach.mint_ws_ticket(target.connection_id, for_base_url=target.base_url, for_dial=target)
     except _REACH_ERRORS as exc:
         raise Unreachable(str(exc)) from exc
     if ticket:

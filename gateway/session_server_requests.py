@@ -12,11 +12,13 @@ viewer's response frame.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 import uuid
 
 from tools.clarify_batch import settle_batch
+from tui_gateway.server_requests import TERMINAL_NOT_SHOWN_MESSAGE, answers_requests, is_terminal_read_decline
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +27,10 @@ _POLL_S = 0.25
 
 
 class _Pending:
-    __slots__ = ("event", "events", "locked", "method", "params", "qids", "replay", "result", "session_id", "value")
+    __slots__ = ("declined", "event", "events", "locked", "method", "params", "qids", "recipients", "replay",
+                 "result", "session_id", "value")
 
-    def __init__(self, session_id, qids=None, events=None, method=None, params=None, replay=True):
+    def __init__(self, session_id, qids=None, events=None, method=None, params=None, replay=True, recipients=None):
         self.event = threading.Event()
         self.session_id = session_id
         self.method = method
@@ -35,6 +38,8 @@ class _Pending:
         # for an automatic window request (a preview click), which a second delivery would run twice.
         self.params = params or {}
         self.replay = replay
+        self.recipients = recipients
+        self.declined = set()
         # The live session's own event stream the request went out on: one per authority (profile) and
         # session mount, so a viewer of another profile's same-named session can never settle it.
         self.events = events
@@ -78,7 +83,19 @@ def is_response_frame(frame) -> bool:
             and frame["id"].startswith("srq-") and ("result" in frame or "error" in frame))
 
 
-def resolve(frame, *, session_ok=lambda session_id, events: True, answered=None) -> bool:
+def _settle_terminal_declines(request_id, pending):
+    if not pending.declined:
+        return False
+    attached = set(pending.events.fanout.transports())
+    if (pending.recipients & attached) - pending.declined:
+        return False
+    pending.value = json.dumps({"success": False, "error": TERMINAL_NOT_SHOWN_MESSAGE})
+    _open.pop(request_id)
+    pending.event.set()
+    return True
+
+
+def resolve(frame, *, session_ok=lambda session_id, events: True, answered=None, transport=None) -> bool:
     """Settle the open request *frame* answers; False when nothing (here) waits for that id.
     ``session_ok(session_id, events)`` lets the caller refuse an answer from a connection not entitled
     to that session: the caller's own authority must own ``events``, the stream the request was sent on
@@ -91,6 +108,11 @@ def resolve(frame, *, session_ok=lambda session_id, events: True, answered=None)
         pending = _open.get(frame["id"])
         if pending is None or not session_ok(pending.session_id, pending.events):
             return False
+        if pending.recipients is not None and is_terminal_read_decline(frame):
+            if transport in pending.recipients:
+                pending.declined.add(transport)
+                _settle_terminal_declines(frame["id"], pending)
+            return True
         _open.pop(frame["id"], None)
         locked = dict(pending.locked) if pending.qids is not None else None
     result = frame.get("result") if "error" not in frame else None
@@ -110,11 +132,13 @@ def resolve(frame, *, session_ok=lambda session_id, events: True, answered=None)
 
 
 def ask_viewer(events, session_id, method, params, *, cancelled=lambda: False, timeout=REQUEST_TIMEOUT_S,
-               replay=True) -> str:
+               replay=True, terminal_viewers=None) -> str:
     """Send one one-string server→client request (``sudo``, ``secret``: ``ValueResult``) to the
     session's attached viewers and wait for its ``value``; "" on skip, interrupt, timeout or no viewer.
-    ``replay=False``: a reconnecting viewer is not handed it again (``open_requests``)."""
-    pending = _ask(events, session_id, method, params, cancelled=cancelled, timeout=timeout, replay=replay)
+    ``replay=False``: a reconnecting viewer is not handed it again (``open_requests``).
+    ``terminal_viewers`` supplies the transports allowed to answer a live terminal read."""
+    pending = _ask(events, session_id, method, params, cancelled=cancelled, timeout=timeout, replay=replay,
+                   terminal_viewers=terminal_viewers)
     return pending.value if pending is not None else ""
 
 
@@ -180,14 +204,22 @@ def lock_answer(request_id, question_id, answer, *, session_ok=lambda session_id
     return remaining
 
 
-def _ask(events, session_id, method, params, *, cancelled, timeout, qids=None, replay=True):
-    if not events.fanout.transports():
-        return None
+def _ask(events, session_id, method, params, *, cancelled, timeout, qids=None, replay=True, terminal_viewers=None):
     request_id = f"srq-{uuid.uuid4().hex[:12]}"
-    pending = _Pending(session_id, qids, events, method, {"session_id": session_id, **params}, replay)
-    with _lock:
-        _open[request_id] = pending
-    events.fanout.write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": pending.params})
+    # A viewer attaching during a terminal read must not receive a frame missing from the decline count.
+    with (events.lock if terminal_viewers is not None else contextlib.nullcontext()):
+        transports = events.fanout.transports()
+        if not transports:
+            return None
+        recipients = None
+        if terminal_viewers is not None:
+            allowed = terminal_viewers()
+            recipients = {peer for peer in transports if peer in allowed and answers_requests(peer)}
+        pending = _Pending(session_id, qids, events, method, {"session_id": session_id, **params}, replay,
+                           recipients=recipients)
+        with _lock:
+            _open[request_id] = pending
+        events.fanout.write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": pending.params})
     from gateway import session_prompt_hooks
     hooked = session_prompt_hooks.request_opened(events, session_id, request_id, method, pending.params, replay)
     waited = 0.0
@@ -197,6 +229,10 @@ def _ask(events, session_id, method, params, *, cancelled, timeout, qids=None, r
         if cancelled():
             reason = "interrupted"
             break
+        if terminal_viewers is not None:
+            with _lock:
+                if _open.get(request_id) is pending and _settle_terminal_declines(request_id, pending):
+                    break
         if timeout is not None and waited >= timeout:
             break
     with _lock:

@@ -13,15 +13,19 @@ being sent to this gateway's sign-in.
 Sockets. A relayed socket opens only with this gateway's one-use ``relay`` ticket (``?relay_ticket=``,
 minted by ``POST /api/webapp/socket-ticket?socket=relay``) for the same identity, and is tracked with
 the browser's other sockets, so signing out here closes it. The socket's credential at the other
-gateway is minted here per dial (its session token, or a one-use ticket). Frames pass through as they
-are; each side's close reaches the other, and removing the connection closes it.
+gateway is minted here per dial (its session token, or a one-use ticket). Terminal placement metadata
+and terminal read requests carry an opaque tag for the actual dial. Each side's close reaches the
+other, and removing the connection closes it.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import http.cookiejar
+import json
 import logging
+import secrets
 import threading
 import urllib.parse
 import weakref
@@ -234,6 +238,28 @@ async def relay_http(request: Request, connection_id: str, path: str):
 
 _live_lock = threading.Lock()
 _live: dict[int, tuple[weakref.ref, asyncio.AbstractEventLoop, str]] = {}
+_terminal_read_key = secrets.token_bytes(32)
+
+
+def _terminal_read_frame(path: str, message: str, scope: str) -> str:
+    from hermes_cli.web_host_terminal import META_PREFIX
+
+    terminal = path == "api/host-terminal" and message.startswith(META_PREFIX)
+    if not terminal and (path != "api/ws" or '"terminal.read"' not in message):
+        return message
+    try:
+        frame = json.loads(message.removeprefix(META_PREFIX) if terminal else message)
+    except ValueError:
+        return message
+    if not isinstance(frame, dict):
+        return message
+    if terminal and frame.get("terminalId"):
+        frame["relay_read_scope"] = scope
+        return META_PREFIX + json.dumps(frame)
+    if frame.get("method") == "terminal.read" and isinstance(frame.get("params"), dict):
+        frame["params"]["relay_read_scope"] = scope
+        return json.dumps(frame)
+    return message
 
 
 def close_gateway_sockets(gateway_id: str) -> int:
@@ -301,12 +327,19 @@ async def relay_ws(ws: WebSocket, connection_id: str, path: str) -> None:
 
     admitted = _admit_browser(ws)
     try:
+        dial = reach.current_dial(connection_id) if admitted is not None else None
         if admitted is not None and path == "api/host-terminal":
             if await serve_ssh_terminal(ws, connection_id, admitted):
                 return
         row = await _resolve(ws.app.state, connection_id) if admitted is not None else None
         target = _target(ws.scope, connection_id, drop_query=_CREDENTIAL_QUERY) if row else None
+        if row is not None and row.dial != dial:
+            await ws.close(code=4404, reason="Gateway changed")
+            return
         credential = await reach.socket_credential(row, f"/{path}") if target else None
+        if credential is not None and reach.current_dial(connection_id) != dial:
+            await ws.close(code=4404, reason="Gateway changed")
+            return
     except (reach.Unreachable, httpx.HTTPError, ValueError) as exc:
         _log.info("Gateway relay socket to %s refused before dialing: %s", connection_id, exc)
         await ws.close(code=4403)
@@ -315,7 +348,6 @@ async def relay_ws(ws: WebSocket, connection_id: str, path: str) -> None:
         await ws.close(code=4401)
         return
     track(ws, admitted)
-    named = reach.entry_url(connection_id)
     parts = urllib.parse.urlsplit(row.base_url)
     joiner = "&" if "?" in target else "?"
     url = (f"{'wss' if parts.scheme == 'https' else 'ws'}://{parts.netloc}{parts.path}{target}"
@@ -330,25 +362,29 @@ async def relay_ws(ws: WebSocket, connection_id: str, path: str) -> None:
         _log.info("Gateway relay socket to %s%s refused: %s", row.base_url, path, type(exc).__name__)
         await ws.close(code=4403)
         return
-    await ws.accept(subprotocol=upstream.subprotocol)
-    with _live_lock:
-        _live[id(ws)] = (weakref.ref(ws), asyncio.get_running_loop(), connection_id)
-    # Remove forgets the entry, then closes its live sockets; one removed during the dial missed this one.
-    if reach.entry_url(connection_id) != named:
+    try:
+        await ws.accept(subprotocol=upstream.subprotocol)
+        with _live_lock:
+            _live[id(ws)] = (weakref.ref(ws), asyncio.get_running_loop(), connection_id)
+        # An edit during the dial missed this socket when it closed the live sockets.
+        try:
+            current_dial = reach.current_dial(connection_id)
+        except reach.Unreachable as exc:
+            await _close(ws, 4403, str(exc))
+            return
+        if current_dial != dial:
+            await _close(ws, 4404, "Gateway removed" if current_dial is None else "Gateway changed")
+            return
+        scope = hmac.digest(_terminal_read_key, json.dumps([row.dial, row.principal]).encode(), "sha256").hex()
+        await _pump(ws, upstream, path, scope)
+    finally:
         with _live_lock:
             _live.pop(id(ws), None)
         with contextlib.suppress(OSError):
             await upstream.close()
-        await _close(ws, 4404, "Gateway removed")
-        return
-    try:
-        await _pump(ws, upstream)
-    finally:
-        with _live_lock:
-            _live.pop(id(ws), None)
 
 
-async def _pump(ws: WebSocket, upstream) -> None:
+async def _pump(ws: WebSocket, upstream, path: str, scope: str) -> None:
     from websockets.exceptions import ConnectionClosed
 
     async def browser_to_gateway() -> None:
@@ -369,7 +405,7 @@ async def _pump(ws: WebSocket, upstream) -> None:
                 if isinstance(message, bytes):
                     await ws.send_bytes(message)
                 else:
-                    await ws.send_text(message)
+                    await ws.send_text(_terminal_read_frame(path, message, scope))
         except ConnectionClosed:
             pass
         await _close(ws, _sendable(upstream.close_code), upstream.close_reason or "")
@@ -381,6 +417,4 @@ async def _pump(ws: WebSocket, upstream) -> None:
         for task in tasks:
             if not task.done():
                 task.cancel()
-        with contextlib.suppress(OSError):
-            await upstream.close()
         await asyncio.gather(*tasks, return_exceptions=True)

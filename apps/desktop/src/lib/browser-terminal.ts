@@ -1,6 +1,6 @@
 import { isGatewayReauthRequired, isStableOpen, LOCAL_CONNECTION_ID, reconnectBackoffDelayMs } from '@hermes/shared'
 
-import type { HermesTerminalExit, HermesTerminalSession, HermesTerminalState } from '@/global'
+import type { HermesTerminalExit, HermesTerminalReadScope, HermesTerminalSession, HermesTerminalState } from '@/global'
 
 import { readJson, writeJson } from './storage'
 
@@ -36,6 +36,7 @@ interface TerminalState {
   connectionId: string
   terminalId?: string
   environment?: TerminalEnvironment
+  executorScope?: HermesTerminalReadScope
   cwd: string
   shell: string
   cols: number
@@ -155,8 +156,29 @@ interface TerminalMetadata {
   terminalId?: string
   truncated?: boolean
   environment?: unknown
+  profile?: unknown
+  relay_read_scope?: unknown
   preparing?: boolean
   ackStartup?: boolean
+}
+
+function confirmRelayedEnvironment(state: TerminalState, meta: TerminalMetadata): void {
+  if (state.connectionId === LOCAL_CONNECTION_ID) {return}
+  if (state.environment && meta.environment !== state.environment) {
+    throw new Error('The receiving gateway did not confirm this terminal’s environment')
+  }
+  if (isTerminalEnvironment(meta.environment)) {state.environment = meta.environment}
+}
+
+function resolveExecutorScope(state: TerminalState, meta: TerminalMetadata): TerminalState['executorScope'] {
+  const relayReadScope = typeof meta.relay_read_scope === 'string' && meta.relay_read_scope || undefined
+  if (meta.environment !== 'executor' || typeof meta.profile !== 'string' || !meta.profile) {
+    return undefined
+  }
+  if (state.connectionId !== LOCAL_CONNECTION_ID && !relayReadScope) {
+    return undefined
+  }
+  return { connectionId: state.connectionId, profile: meta.profile, relayReadScope }
 }
 
 function applyTerminalMetadata(state: TerminalState, meta: TerminalMetadata, context: DialContext, resuming: boolean): boolean {
@@ -166,18 +188,15 @@ function applyTerminalMetadata(state: TerminalState, meta: TerminalMetadata, con
   if (resuming && meta.terminalId !== state.terminalId) {
     throw new Error('Host terminal did not resume the requested shell')
   }
-  if (state.connectionId !== LOCAL_CONNECTION_ID) {
-    if (state.environment && meta.environment !== state.environment) {
-      throw new Error('The receiving gateway did not confirm this terminal’s environment')
-    }
-    if (isTerminalEnvironment(meta.environment)) {state.environment = meta.environment}
-  }
+  confirmRelayedEnvironment(state, meta)
 
   state.shell = meta.shell
   if (typeof meta.cwd === 'string') {state.cwd = meta.cwd}
+  state.executorScope = undefined
   if (typeof meta.terminalId !== 'string' || !meta.terminalId) {return false}
 
   state.terminalId = meta.terminalId
+  state.executorScope = resolveExecutorScope(state, meta)
   if (state.restoreKey) {
     writeJson(context.storageKey(state.restoreKey), {
       terminalId: state.terminalId,
@@ -404,6 +423,7 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
 
   const stopSocket = (state: TerminalState) => {
     ++state.generation
+    state.executorScope = undefined
     window.clearTimeout(state.retryTimer)
     settleOpen(state)
     state.cancelDial?.()
@@ -545,6 +565,16 @@ export function createBrowserTerminal(options: BrowserTerminalOptions): Terminal
     cwd: async () => null,
     detach,
     dispose,
+    executorReadScope: id => {
+      const state = terminals.get(id)
+
+      if (!state?.executorScope || !state.terminalId || state.stopped || state.closing ||
+          state.status !== 'open' || state.socket?.readyState !== WebSocket.OPEN) {
+        return null
+      }
+
+      return state.executorScope
+    },
     closeSaved: async restoreKey => {
       const state = [...terminals.values()].find(state => state.restoreKey === restoreKey)
 

@@ -649,6 +649,7 @@ declare global {
         /** Browser cleanup releases the viewer without terminating its shell. */
         detach?: (id: string) => Promise<boolean>
         closeSaved?: (restoreKey: string) => Promise<boolean>
+        executorReadScope?: (id: string) => HermesTerminalReadScope | null
         onState?: (id: string, callback: (state: HermesTerminalState) => void) => () => void
         onData: (id: string, callback: (payload: string, options?: { replay: boolean }) => void) => () => void
         onExit: (id: string, callback: (payload: HermesTerminalExit) => void) => () => void
@@ -861,6 +862,12 @@ export interface DesktopMarketplaceThemeResult {
 }
 
 export type HermesTerminalState = 'open' | 'reconnecting' | 'disconnected'
+
+export interface HermesTerminalReadScope {
+  connectionId: string
+  profile: string
+  relayReadScope?: string
+}
 
 export interface HermesTerminalSession {
   /** Gateway the shell runs on (`local` = This device). */

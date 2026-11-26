@@ -131,6 +131,7 @@ _clients: Callable[[str], list] = lambda sid: []
 NOT_SHOWN_CODE = 4404
 NOT_SHOWN_MESSAGE = ("No Hermes Desktop window is showing this chat, so its preview, terminal and tour are out "
                      "of reach. Ask the user to open this chat in the Desktop app, then retry.")
+TERMINAL_NOT_SHOWN_MESSAGE = "No window has a readable terminal for this chat. Open the chat and select its terminal."
 
 # Client transports that sent ``client.capabilities {server_requests: true}`` (identity set: StdioTransport
 # has __slots__ and cannot be weak-referenced; ws.py forgets a peer on disconnect).
@@ -272,6 +273,12 @@ def _is_not_shown(frame: dict) -> bool:
     return isinstance(error, dict) and error.get("code") == NOT_SHOWN_CODE
 
 
+def is_terminal_read_decline(frame: dict) -> bool:
+    error = frame.get("error")
+    # A TUI or older viewer can answer requests without implementing the terminal reader.
+    return isinstance(error, dict) and error.get("code") in (NOT_SHOWN_CODE, -32601)
+
+
 def _decline(rid: str, transport: Any) -> bool:
     """One client's "no window here shows this session". Settles only once every answering client
     attached to the session declined: a bystander window must not beat the owner (#113348), and with
@@ -291,7 +298,8 @@ def _decline(rid: str, transport: Any) -> bool:
         if not clients or not clients <= req.declined:
             return True
         _open.pop(rid, None)
-        req.result = {"value": json.dumps({"success": False, "error": NOT_SHOWN_MESSAGE})}
+        message = TERMINAL_NOT_SHOWN_MESSAGE if req.method == "terminal.read" else NOT_SHOWN_MESSAGE
+        req.result = {"value": json.dumps({"success": False, "error": message})}
         req.answered = True
     if req.on_result is not None:
         req.on_result(req.result)
@@ -311,7 +319,9 @@ def resolve_response(frame: dict, transport: Any = None) -> bool:
     if pinned is not None and pinned.transport is not None and pinned.transport is not transport:
         logger.debug("server request %s: response from a client it was not sent to dropped", rid)
         return False
-    if _is_not_shown(frame) and (pinned is None or pinned.transport is None):
+    if (pinned is None or pinned.transport is None) and (
+        _is_not_shown(frame) or (pinned is not None and pinned.method == "terminal.read" and is_terminal_read_decline(frame))
+    ):
         return _decline(rid, transport)
     with _lock:
         req = _open.get(rid)

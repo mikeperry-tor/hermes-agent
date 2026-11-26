@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { registerPreviewNav } from '@/app/chat/right-rail/preview-nav'
 import { registerPreviewPageReader } from '@/app/chat/right-rail/preview-reader'
+import { registerTerminalReader, setActiveTerminalId } from '@/app/right-sidebar/terminal/buffer'
 import { group } from '@/components/pane-shell/tree/model'
 import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/store'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -9,7 +10,7 @@ import { runTour } from '@/lib/tour'
 import { $previewTabs, closeRightRail, openPreview, setPreviewTabPinned } from '@/store/preview'
 import { clearAllPrompts, sessionApprovalRequests } from '@/store/prompts'
 import { hasOpenServerRequest, resetServerRequestsForTests } from '@/store/server-requests'
-import { setActiveSessionId, setSelectedStoredSessionId, setSessions } from '@/store/session'
+import { forgetSessionOwnerHintsForSession, setActiveSessionId, setSelectedStoredSessionId, setSessionOwnerHint, setSessions } from '@/store/session'
 import { $sessionStates, $sessionTiles, dropSessionState, publishSessionState } from '@/store/session-states'
 import { $toursEnabled } from '@/store/tours'
 import type { SessionInfo } from '@/types/hermes'
@@ -48,19 +49,121 @@ const deps = {
   upsertToolCall: () => undefined
 } as ServerRequestContext['deps']
 
-function deliver(method: string, params: Record<string, unknown>, activeSessionId: null | string, replayed?: boolean) {
+function deliver(method: string, params: Record<string, unknown>, activeSessionId: null | string,
+  replayed?: boolean, connectionId?: string) {
   const respond = vi.fn()
   const fail = vi.fn()
   const decline = vi.fn()
 
   const handled = handleServerRequest(
-    { decline, fail, id: 'srq-1', method, params, profile: 'default', replayed, respond },
+    { connectionId, decline, fail, id: 'srq-1', method, params, profile: 'default', replayed, respond },
     deps,
     activeSessionId
   )
 
   return { decline, fail, handled, respond }
 }
+
+it('reads the selected Code buffer for its verified chat and refuses other terminal tabs', () => {
+  const host = document.documentElement.dataset
+  const previous = host.hermesDesktopHost
+  host.hermesDesktopHost = 'browser'
+  setActiveSessionId('session-code')
+  setSessionOwnerHint('session-code', { connectionId: 'local', profile: 'default' })
+  const code = vi.fn(() => ({
+    text: 'CODE_MARKER', start: 0, end: 1, total_lines: 1, viewport_rows: 24, cursor_row: 1
+  }))
+  const agent = vi.fn(() => { throw new Error('Agent buffer must never be serialized') })
+  let connectionId = 'local'
+  const unregisterCode = registerTerminalReader('code', code, () => ({ connectionId, profile: 'default' }))
+  const unregisterAgent = registerTerminalReader('agent', agent)
+  const read = (params = {}) =>
+    deliver('terminal.read', { owner_profile: 'default', session_id: 'session-code', ...params }, 'session-code', undefined, 'local')
+
+  try {
+    setActiveTerminalId('code')
+    expect(read().respond.mock.calls[0]?.[0]?.value).toContain('CODE_MARKER')
+    expect(read({ start: 0, count: 1 }).respond.mock.calls[0]?.[0]?.value).toContain('CODE_MARKER')
+    expect(code).toHaveBeenCalledWith({ start: 0, count: 1 })
+
+    expect(read({ owner_profile: undefined }).decline).toHaveBeenCalledOnce()
+    expect(read({ owner_profile: 'other' }).decline).toHaveBeenCalledOnce()
+
+    connectionId = 'saved-gateway'
+    const wrongGateway = read()
+    expect(wrongGateway.decline).toHaveBeenCalledOnce()
+    expect(wrongGateway.respond).not.toHaveBeenCalled()
+    expect(code).toHaveBeenCalledTimes(2)
+
+    setActiveTerminalId('agent')
+    const wrongTerminal = read({ start: 0, count: 100 })
+    expect(wrongTerminal.decline).toHaveBeenCalledOnce()
+    expect(wrongTerminal.respond).not.toHaveBeenCalled()
+    expect(agent).not.toHaveBeenCalled()
+  } finally {
+    unregisterCode()
+    unregisterAgent()
+    setActiveTerminalId(null)
+    setActiveSessionId(null)
+    forgetSessionOwnerHintsForSession('session-code')
+    if (previous === undefined) {
+      delete host.hermesDesktopHost
+    } else {
+      host.hermesDesktopHost = previous
+    }
+  }
+})
+
+it('reads the focused saved-gateway tile and refuses the background primary chat', () => {
+  const host = document.documentElement.dataset
+  const previous = host.hermesDesktopHost
+  host.hermesDesktopHost = 'browser'
+  setActiveSessionId('primary')
+  setSelectedStoredSessionId('stored-primary')
+  const owner = { connectionId: 'saved-gateway', profile: 'work', targetProfile: 'research' }
+  $sessionTiles.set([
+    { dir: 'right', ownerRoute: { connectionId: 'other', profile: 'research' }, runtimeId: 'background', storedSessionId: 'tile' },
+    { dir: 'right', ownerRoute: owner, runtimeId: 'tile', storedSessionId: 'stored-tile' }
+  ])
+  $layoutTree.set(group(['session-tile:stored-tile'], { active: 'session-tile:stored-tile', id: 'tile-group' }))
+  noteActiveTreeGroup('tile-group')
+  setActiveTerminalId('code')
+  const code = vi.fn(() => ({ text: 'SAVED_CODE_MARKER', start: 0, end: 1, total_lines: 1,
+    viewport_rows: 24, cursor_row: 1 }))
+  const unregister = registerTerminalReader('code', code, () => ({
+    connectionId: 'saved-gateway', profile: 'research', relayReadScope: 'original-dial'
+  }))
+  const read = (id: string, profile = 'research', replayed = false, connectionId = 'saved-gateway', dial = 'original-dial') =>
+    deliver('terminal.read', { owner_profile: profile, relay_read_scope: dial, session_id: id }, 'primary', replayed, connectionId)
+
+  try {
+    deps.sessionStateByRuntimeIdRef.current.set('tile', createClientSessionState('stored-tile'))
+    deps.sessionStateByRuntimeIdRef.current.set('other-runtime', createClientSessionState('stored-tile'))
+    expect(read('tile').respond.mock.calls[0]?.[0]?.value).toContain('SAVED_CODE_MARKER')
+    expect(read('primary').decline).toHaveBeenCalledOnce()
+    expect(read('other-runtime').decline).toHaveBeenCalledOnce()
+    expect(read('tile', 'work').decline).toHaveBeenCalledOnce()
+    expect(read('tile', 'research', true).decline).toHaveBeenCalledOnce()
+    expect(read('tile', 'research', false, 'local').decline).toHaveBeenCalledOnce()
+    expect(read('tile', 'research', false, 'saved-gateway', 'new-dial').decline).toHaveBeenCalledOnce()
+    expect(code).toHaveBeenCalledOnce()
+  } finally {
+    deps.sessionStateByRuntimeIdRef.current.delete('tile')
+    deps.sessionStateByRuntimeIdRef.current.delete('other-runtime')
+    unregister()
+    setActiveTerminalId(null)
+    noteActiveTreeGroup(null)
+    $layoutTree.set(null)
+    $sessionTiles.set([])
+    setSelectedStoredSessionId(null)
+    setActiveSessionId(null)
+    if (previous === undefined) {
+      delete host.hermesDesktopHost
+    } else {
+      host.hermesDesktopHost = previous
+    }
+  }
+})
 
 describe('connection request routing', () => {
   it('does not route connection operations through the server-request rail', () => {

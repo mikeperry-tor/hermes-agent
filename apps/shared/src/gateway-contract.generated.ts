@@ -5820,6 +5820,13 @@ export interface VaultCodeRequestParams {
   site?: string | null
   hint?: string | null
 }
+export interface TerminalReadRequestParams {
+  session_id: string
+  start?: number | null
+  count?: number | null
+  owner_profile?: string | null
+  relay_read_scope?: string | null
+}
 export interface ReadRangeRequestParams {
   session_id: string
   start?: number | null
@@ -7384,7 +7391,7 @@ export interface ServerRequestMap {
   /** Masked sudo password for the terminal tool. */
   sudo: { params: SudoRequestParams; result: ValueResult }
   /** Read the visible in-app terminal buffer (JSON text answer). */
-  'terminal.read': { params: ReadRangeRequestParams; result: ValueResult }
+  'terminal.read': { params: TerminalReadRequestParams; result: ValueResult }
   /** Apply set_theme values in the window showing the session (JSON text answer). */
   'theme.apply': { params: ThemeApplyRequestParams; result: ValueResult }
   /** Show an accent or layout picker card in the chat and wait for the pick. */
