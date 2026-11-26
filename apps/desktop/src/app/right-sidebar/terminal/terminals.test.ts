@@ -1,25 +1,102 @@
 import { atom } from 'nanostores'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { DesktopConnectionKind } from '@/global'
+
 const STORAGE_KEY = 'hermes.desktop.terminals.v1'
 
 async function loadTerminalStore() {
+  const $connection = atom<{ connectionId: string } | undefined>(undefined)
   const $currentCwd = atom('/workspace')
 
   vi.doMock('@/store/session', () => ({
-    $currentCwd
+    $connection, $currentCwd
   }))
 
-  return { ...(await import('./terminals')), $currentCwd }
+  return { ...(await import('./terminals')), $connection, $currentCwd, ...(await import('@/store/connection-registry-state')) }
 }
 
 describe('terminal store persistence', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    delete window.__HERMES_TERMINAL_ENVIRONMENT__
+    delete document.documentElement.dataset.hermesDesktopHost
     vi.resetModules()
   })
 
-  it('preserves cwd whitespace across persistence and relaunch', async () => {
+  it.each(['executor', 'gateway', null] as const)('leaves the implicit local cwd unset in %s mode', async mode => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = mode
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const { $connectionsRegistry, $terminals, createTerminal } = await loadTerminalStore()
+    $connectionsRegistry.set({
+      version: 2, primary: 'local', secureTokenStorage: true,
+      connections: [{ id: 'saved', kind: 'ssh', label: 'Saved', tokenPreview: null, tokenSet: false }]
+    })
+    const implicit = createTerminal()
+    const explicit = createTerminal('/requested path ')
+    const remote = createTerminal(undefined, { connectionId: 'saved', profile: 'default' })
+    expect($terminals.get().find(tab => tab.id === implicit)?.cwd).toBe('')
+    expect($terminals.get().find(tab => tab.id === explicit)?.cwd).toBe('/requested path ')
+    expect($terminals.get().find(tab => tab.id === remote)?.cwd).toBe('/workspace')
+  })
+
+  it.each(['remote', 'cloud', 'ssh'] satisfies DesktopConnectionKind[])(
+    'uses the receiving terminal defaults for a saved %s browser route when appropriate', async kind => {
+      document.documentElement.dataset.hermesDesktopHost = 'browser'
+      const { $connection, $connectionsRegistry, $terminals, createTerminal } = await loadTerminalStore()
+      const owner = { connectionId: 'saved', profile: 'default' }
+      $connection.set(owner)
+      $connectionsRegistry.set({
+        version: 2, primary: 'local', secureTokenStorage: true,
+        connections: [{ id: 'saved', kind, label: 'Saved', tokenPreview: null, tokenSet: false }]
+      })
+      createTerminal()
+      createTerminal(undefined, owner)
+      createTerminal('/explicit path ', owner)
+      const implicit = kind === 'ssh' ? '/workspace' : ''
+      expect($terminals.get()[0]).toMatchObject(owner)
+      expect($terminals.get().map(tab => tab.cwd)).toEqual([implicit, implicit, '/explicit path '])
+    }
+  )
+
+  it.each(['executor', 'gateway'] as const)('drops local tabs from the other mode but retains gateways: %s', async mode => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = mode
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      terminalEnvironment: mode === 'executor' ? 'gateway' : 'executor', activeTerminalId: 'local-shell',
+      terminals: [
+        {id: 'local-shell', cwd: '/wrong-environment', restoreCwd: '/wrong-cwd', title: 'old', persistent: true},
+        {id: 'gateway-shell', connectionId: 'nas', cwd: '/remote', title: 'remote', persistent: true}
+      ]
+    }))
+    const {$terminals} = await loadTerminalStore()
+    expect($terminals.get().map(tab => tab.id)).toEqual(['gateway-shell'])
+  })
+
+  it('retains native default gateway tabs when no optional mode was saved', async () => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = 'gateway'
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({terminals: [
+      {id: 'native-shell', cwd: '/workspace', title: 'sh', persistent: true}
+    ]}))
+    const {$terminals} = await loadTerminalStore()
+    expect($terminals.get().map(tab => tab.id)).toEqual(['native-shell'])
+  })
+
+  it('preserves saved placement during a temporary terminal configuration refusal', async () => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = null
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({terminalEnvironment: 'executor', terminals: [
+      {id: 'executor-shell', cwd: '/workspace', title: 'sh', persistent: true}
+    ]}))
+    const unavailable = await loadTerminalStore()
+    expect(unavailable.$terminals.get().map(tab => tab.id)).toEqual(['executor-shell'])
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY)!).terminalEnvironment).toBe('executor')
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = 'executor'
+    vi.resetModules()
+    const repaired = await loadTerminalStore()
+    expect(repaired.$terminals.get().map(tab => tab.id)).toEqual(['executor-shell'])
+  })
+
+  it.each(['gateway', 'executor'] as const)('preserves cwd whitespace across persistence and relaunch: %s', async mode => {
+    window.__HERMES_TERMINAL_ENVIRONMENT__ = mode
     const first = await loadTerminalStore()
     const id = first.createTerminal('/workspace')
     first.updateTerminalRestoreCwd(id, '/workspace/trailing space ')

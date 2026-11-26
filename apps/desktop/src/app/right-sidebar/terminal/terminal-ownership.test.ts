@@ -60,6 +60,64 @@ beforeEach(() => {
 })
 
 describe('a terminal tab owns the gateway it was opened on', () => {
+  it.each([true, false])('routes a fresh tab on a selected HTTP gateway (browser=%s)', async browser => {
+    if (browser) {
+      document.documentElement.dataset.hermesDesktopHost = 'browser'
+    }
+    const stores = await loadStores()
+    stores.$connectionsRegistry.set({
+      version: 2, primary: 'local', secureTokenStorage: true,
+      connections: [
+        { id: 'local', kind: 'local', label: 'This device', tokenPreview: null, tokenSet: false },
+        { id: 'saved', kind: 'remote', label: 'Saved', tokenPreview: null, tokenSet: false }
+      ]
+    })
+    const { $activeGatewayProfile } = await import('@/store/profile')
+    $activeGatewayProfile.set('work')
+    stores.$connection.set({ connectionId: 'saved', profile: 'work' } as never)
+    stores.$currentCwd.set('/chat-directory')
+
+    const id = stores.createTerminal()
+    const entry = stores.$terminals.get().find(term => term.id === id)
+    expect(entry).toMatchObject(browser
+      ? { connectionId: 'saved', cwd: '', profile: 'work' }
+      : { connectionId: 'local', cwd: '/chat-directory' })
+  })
+
+  it.each([true, false])('pins a local browser profile before startup (registry=%s)', async hasRegistry => {
+    document.documentElement.dataset.hermesDesktopHost = 'browser'
+    const stores = await loadStores()
+    if (hasRegistry) {
+      stores.$connectionsRegistry.set(registryWith())
+    }
+    stores.$connection.set({ connectionId: 'local', profile: 'work' } as never)
+    stores.$currentCwd.set('/remembered-chat-directory')
+    const id = stores.createTerminal()
+    expect(stores.$terminals.get().find(term => term.id === id)).toMatchObject({
+      connectionId: 'local', profile: 'work', cwd: ''
+    })
+    const explicit = stores.createTerminal('/explicit directory ')
+    expect(stores.$terminals.get().find(term => term.id === explicit)?.cwd).toBe('/explicit directory ')
+    const start = vi.fn().mockRejectedValueOnce(new Error('executor offline')).mockResolvedValue(session('local'))
+    const { controller, write } = controllerFor(stores, id, start)
+
+    controller.start()
+    await waitFor(() => expect(write).toHaveBeenCalled())
+    stores.$connection.set({ connectionId: 'other', profile: 'personal' } as never)
+    controller.input('\r')
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2))
+    controller.release()
+
+    expect(start.mock.calls.map(([options]) => [options.connectionId, options.profile])).toEqual([
+      ['local', 'work'], ['local', 'work']
+    ])
+    if (hasRegistry) {
+      expect(stores.shellGatewayFor('local', 'personal', stores.$connectionsRegistry.get())).toEqual({
+        connectionId: 'local', profile: 'current'
+      })
+    }
+  })
+
   it('a failed first start retries on the same gateway after a Sessions pick', async () => {
     const stores = await loadStores()
     stores.$connectionsRegistry.set(registryWith({ host: 'nas.example', id: 'nas' }))

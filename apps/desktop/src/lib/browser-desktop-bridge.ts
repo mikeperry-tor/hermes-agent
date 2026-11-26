@@ -215,7 +215,12 @@ export function installBrowserDesktopBridge(): boolean {
       // The host terminal of the gateway the terminal started on, relayed when it is not the serving one.
       websocketUrl: async (profile, connectionId) => {
         if (!relays || connectionId === LOCAL_CONNECTION_ID) {
-          return ticketedWebsocketUrl(bootstrap, '/api/host-terminal', profile)
+          const url = new URL(await ticketedWebsocketUrl(bootstrap, '/api/host-terminal', profile))
+          const mode = window.__HERMES_TERMINAL_ENVIRONMENT__
+          if (mode !== undefined) {
+            url.searchParams.set('environment', mode ?? 'unavailable')
+          }
+          return url.toString()
         }
 
         // A tab restored before this page read its saved connections.
@@ -225,8 +230,14 @@ export function installBrowserDesktopBridge(): boolean {
 
         return relays.socketUrl(connectionId, '/api/host-terminal', profile)
       },
-      defaultCwd: async (profile, connectionId) =>
-        (await activeApi<{ cwd?: string }>({ connectionId, path: '/api/fs/default-cwd', profile })).cwd || '',
+      defaultCwd: async (profile, connectionId) => {
+        // A gateway host terminal owns its default, independently of the file backend.
+        // Saved SSH shells keep their existing default-directory lookup.
+        if (relays?.gateway(connectionId)?.kind !== 'ssh') {
+          return ''
+        }
+        return (await activeApi<{ cwd?: string }>({ connectionId, path: '/api/fs/default-cwd', profile })).cwd || ''
+      },
       // The chat's sign-in view for a launch-link tab. Behind the sign-in gate the next ticket
       // request already takes the tab to the login page.
       onSignedOut: () => {
