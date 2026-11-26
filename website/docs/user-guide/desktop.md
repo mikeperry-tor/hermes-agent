@@ -585,6 +585,10 @@ The desktop app and the Hermes backend it talks to update on separate clocks —
 
 After any backend update, the app also re-checks its own version and warns with a one-click **Update desktop app** action if the GUI is still behind — so updating a remote backend can never silently leave you on a stale desktop build.
 
+The remote project picker's **New folder** action requires a gateway with
+workspace folder creation support. If the picker can list folders but the
+create request reports "Not Found", update the connected gateway.
+
 The [manual update process](https://hermes-agent.nousresearch.com/docs/getting-started/updating) also works with the GUI.
 
 ## Uninstalling
