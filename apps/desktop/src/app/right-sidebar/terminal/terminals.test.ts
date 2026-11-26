@@ -19,6 +19,15 @@ describe('terminal store persistence', () => {
     vi.resetModules()
   })
 
+  it('preserves cwd whitespace across persistence and relaunch', async () => {
+    const first = await loadTerminalStore()
+    const id = first.createTerminal('/workspace')
+    first.updateTerminalRestoreCwd(id, '/workspace/trailing space ')
+    vi.resetModules()
+    const {$terminals} = await loadTerminalStore()
+    expect($terminals.get().find(tab => tab.id === id)?.restoreCwd).toBe('/workspace/trailing space ')
+  })
+
   it('restores user tabs, active tab, and history on module load', async () => {
     window.localStorage.setItem(
       STORAGE_KEY,

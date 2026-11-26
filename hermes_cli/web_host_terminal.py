@@ -69,7 +69,7 @@ def shell_spec() -> tuple[list[str], str]:
 def safe_cwd(requested: Optional[str]) -> str:
     fallback = Path.home()
     try:
-        candidate = Path((requested or "").strip() or fallback).expanduser().resolve()
+        candidate = Path(requested or fallback).expanduser().resolve()
         if candidate.is_dir():
             return str(candidate)
         if candidate.is_file():

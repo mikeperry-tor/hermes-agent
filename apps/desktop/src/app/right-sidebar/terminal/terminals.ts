@@ -393,12 +393,12 @@ export function selectTerminal(id: string): void {
   }
 }
 
-// Compare-ready form of a directory path: trimmed, trailing separators dropped
+// Compare directories with platform-appropriate trailing separators dropped
 // (keeping a bare root intact) so `/repo/` and `/repo` are the same place.
 const normalizePath = (value: string) => {
-  const trimmed = value.trim()
+  const windows = /^[A-Za-z]:[\\/]|^\\\\/.test(value)
 
-  return trimmed.length > 1 ? trimmed.replace(/[\\/]+$/, '') || trimmed : trimmed
+  return value.length > 1 ? value.replace(windows ? /[\\/]+$/ : /\/+$/, '') || value : value
 }
 
 /** The directory a tab points at right now — the live shell cwd once observed
@@ -590,9 +590,9 @@ export function updateTerminalReviveBuffer(id: string, reviveBuffer: string): vo
  *  restart the PTY there instead of the original launch dir. User tabs only;
  *  no-ops when the value is empty or unchanged to avoid redundant persistence. */
 export function updateTerminalRestoreCwd(id: string, restoreCwd: string): void {
-  const next = restoreCwd.trim()
+  const next = restoreCwd
 
-  if (!next) {
+  if (!next.trim()) {
     return
   }
 
