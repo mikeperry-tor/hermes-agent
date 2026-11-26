@@ -32,7 +32,11 @@ def _has_tty() -> bool:
 
 def worktree_state(info: dict) -> Optional[str]:
     """``"dirty"``, ``"unpushed"`` or None (clean and pushed / gone)."""
+    from hermes_cli.main_resume_args import uses_managed_executor
     from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+
+    if uses_managed_executor():
+        return None
     path, repo_root = info.get("path", ""), info.get("repo_root", "")
     if not path or not os.path.isdir(path):
         return None
@@ -83,8 +87,10 @@ def ask_exit_choice(info: Optional[dict]) -> str:
 def apply_exit_choice(info: dict, echo) -> bool:
     """Carry out an Archive/Discard answer once -> True when the tree was handled (removed or a
     message printed). Keep (or no answer) -> False: the caller's default keep path runs."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+
     choice = info.pop("exit_choice", None)
-    if choice not in (ARCHIVE, DISCARD):
+    if choice not in (ARCHIVE, DISCARD) or uses_managed_executor():
         return False
     path, repo_root, branch = info["path"], info["repo_root"], info.get("branch")
     if choice == ARCHIVE:

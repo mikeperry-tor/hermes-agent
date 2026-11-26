@@ -303,7 +303,9 @@ async function enrichPreviewTarget(target: PreviewTarget | null, scope?: Desktop
       byteSize: result.byteSize,
       language: result.language || target.language,
       large: (result.byteSize ?? 0) > 512 * 1024,
-      mimeType: result.mimeType
+      mimeType: result.mimeType,
+      path: result.path || target.path,
+      url: result.path ? pathToFileUrl(result.path) : target.url
     }
   } catch {
     return target
@@ -315,6 +317,10 @@ export async function normalizeOrLocalPreviewTarget(
   cwd?: string | null,
   scope?: DesktopFsSessionScope
 ): Promise<PreviewTarget | null> {
+  if (isDesktopFsRemoteMode() && scope?.sessionId) {
+    return enrichPreviewTarget(localPreviewTarget(rawTarget), scope)
+  }
+
   try {
     const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
 

@@ -254,15 +254,15 @@ describe('a session owned by another profile than the window', () => {
     expect([profileOf(read), sessionOf(read)]).toEqual(['ops', OPS])
   })
 
-  it('names no session when its owner is unknown, as a sessionless read does', async () => {
-    await readDesktopFileText(NOTE, { sessionId: 'unknown-session' })
-    await writeDesktopFileText(NOTE, 'edited', { sessionId: 'unknown-session' })
-    await resolveMediaPlaybackSrc(CLIP, OWNER, 'unknown-session')
+  it('keeps the requested session on file reads and saves when its owner is unknown', async () => {
+    await expect(readDesktopFileText(NOTE, { sessionId: 'unknown-session' })).rejects.toThrow('404')
+    await expect(writeDesktopFileText(NOTE, 'edited', { sessionId: 'unknown-session' })).rejects.toThrow('404')
+    await expect(resolveMediaPlaybackSrc(CLIP, OWNER, 'unknown-session')).rejects.toThrow('404')
 
     expect(requests.map(request => [request.url.pathname, profileOf(request), sessionOf(request)])).toEqual([
-      ['/api/fs/read-text', 'default', null],
-      ['/api/fs/write-text', 'default', null],
-      ['/api/files/ticket', 'default', null]
+      ['/api/fs/read-text', 'default', 'unknown-session'],
+      ['/api/fs/write-text', 'default', 'unknown-session'],
+      ['/api/files/ticket', 'default', 'unknown-session']
     ])
   })
 })

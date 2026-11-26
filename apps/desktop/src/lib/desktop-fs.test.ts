@@ -9,6 +9,7 @@ import {
   desktopFileDiff,
   DesktopFileMissingError,
   desktopFsCacheKey,
+  desktopFsPickerKey,
   desktopGitRoot,
   readDesktopDir,
   readDesktopFileDataUrl,
@@ -46,7 +47,7 @@ const api = vi.fn(async ({ path }: { path: string }) => {
     return { cwd: '/backend/project', branch: 'main' }
   }
 
-  if (path === '/api/files/mkdir') {
+  if (path === '/api/fs/mkdir') {
     return { ok: true, path: '/home/user/new folder' }
   }
 
@@ -149,14 +150,30 @@ describe('desktop filesystem facade', () => {
   it('creates remote folders through the backend mkdir route for the active profile', async () => {
     $connection.set({ mode: 'remote', profile: 'team-remote' } as never)
 
+    await readDesktopDir('/home/user')
     await expect(createRemoteDir('/home/user/new folder')).resolves.toBe('/home/user/new folder')
 
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fhome%2Fuser', profile: 'team-remote' })
     expect(api).toHaveBeenCalledWith({
       body: { path: '/home/user/new folder' },
       method: 'POST',
-      path: '/api/files/mkdir',
+      path: '/api/fs/mkdir',
       profile: 'team-remote'
     })
+  })
+
+  it('invalidates the folder picker when the REST target changes before the connection descriptor', () => {
+    $connection.set({ mode: 'remote', profile: 'team-remote', connectionId: 'old' } as never)
+    setApiRequestConnection('old')
+    const opened = desktopFsPickerKey()
+
+    setApiRequestConnection('new')
+
+    expect(desktopFsPickerKey()).not.toBe(opened)
+    setApiRequestConnection(null)
+    const untagged = desktopFsPickerKey()
+    setApiRequestConnection('local')
+    expect(desktopFsPickerKey()).not.toBe(untagged)
   })
 
   it('does not retry the same unreadable path through the local facade', async () => {

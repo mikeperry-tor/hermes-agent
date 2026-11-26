@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 
+import { sessionFileOwnerScope } from '@/api/client'
 import { useSessionView } from '@/app/chat/session-view'
 import { useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
@@ -9,7 +10,7 @@ import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { downloadGatewayMediaFile } from '@/lib/media'
 import { previewName } from '@/lib/preview-targets'
 import { notifyError } from '@/store/notifications'
-import { $previewTabSources, closePreviewForSource, openPreview } from '@/store/preview'
+import { $previewTabs, closeRightRailTab, openPreview, previewTabForSource } from '@/store/preview'
 
 /** What the Electron main process said about this target's LOCAL filesystem
  * state (#101683). `null` keeps the stock card — remote-backend targets keep
@@ -55,19 +56,26 @@ export function PreviewAttachment({ target }: { target: string }) {
   const storedId = useStore(view.$storedId)
   const runtimeId = useStore(view.$runtimeId)
   const sessionId = storedId || runtimeId || ''
-  const openSources = useStore($previewTabSources)
+  useStore($previewTabs)
   const [opening, setOpening] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [downloaded, setDownloaded] = useState(false)
   const [localTarget, setLocalTarget] = useState<LocalTargetState>(null)
   const cwdRef = useRef(cwd)
+  const sessionRef = useRef(sessionId)
   const mountedRef = useRef(false)
   const requestTokenRef = useRef(0)
   const targetRef = useRef(target)
   const name = previewName(target)
-  const isActive = openSources.includes(target)
+  const openTab = previewTabForSource(target, {
+    sessionId: storedId,
+    runtimeId,
+    profile: sessionFileOwnerScope(sessionId)?.profile
+  })
+  const isActive = Boolean(openTab)
 
   cwdRef.current = cwd
+  sessionRef.current = sessionId
   targetRef.current = target
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
@@ -84,7 +92,7 @@ export function PreviewAttachment({ target }: { target: string }) {
   useEffect(() => {
     requestTokenRef.current += 1
     setOpening(false)
-  }, [cwd, target])
+  }, [cwd, sessionId, target])
 
   // Classify the target against the local filesystem so the card offers the
   // native action instead of a Download this machine already has (#101683).
@@ -140,8 +148,8 @@ export function PreviewAttachment({ target }: { target: string }) {
       return
     }
 
-    if (isActive) {
-      closePreviewForSource(target)
+    if (openTab) {
+      closeRightRailTab(openTab.id)
 
       return
     }
@@ -157,6 +165,7 @@ export function PreviewAttachment({ target }: { target: string }) {
     const requestToken = ++requestTokenRef.current
     const requestTarget = target
     const requestCwd = cwd
+    const owner = sessionId ? sessionFileOwnerScope(sessionId) : null
 
     setOpening(true)
 
@@ -167,7 +176,8 @@ export function PreviewAttachment({ target }: { target: string }) {
         !mountedRef.current ||
         requestTokenRef.current !== requestToken ||
         targetRef.current !== requestTarget ||
-        cwdRef.current !== requestCwd
+        cwdRef.current !== requestCwd ||
+        sessionRef.current !== sessionId
       ) {
         return
       }
@@ -176,13 +186,14 @@ export function PreviewAttachment({ target }: { target: string }) {
         throw new Error(`Could not open preview target: ${requestTarget}`)
       }
 
-      openPreview(preview)
+      openPreview(preview, storedId, runtimeId, owner?.profile)
     } catch (error) {
       if (
         !mountedRef.current ||
         requestTokenRef.current !== requestToken ||
         targetRef.current !== requestTarget ||
-        cwdRef.current !== requestCwd
+        cwdRef.current !== requestCwd ||
+        sessionRef.current !== sessionId
       ) {
         return
       }
@@ -206,7 +217,8 @@ export function PreviewAttachment({ target }: { target: string }) {
       // Works in both modes: the Electron main process fetches the bytes
       // through the session's backend connection (local gateway or remote)
       // and prompts for a save location.
-      const result = await downloadGatewayMediaFile(target, sessionId ? { sessionId } : undefined)
+      const owner = sessionId ? sessionFileOwnerScope(sessionId) : null
+      const result = await downloadGatewayMediaFile(target, { owner: owner ?? undefined, sessionId })
 
       if (mountedRef.current && result.saved) {
         setDownloaded(true)

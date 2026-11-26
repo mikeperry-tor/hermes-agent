@@ -218,3 +218,21 @@ def test_a_moved_session_gets_its_clean_tree_back_on_resume(repo):
     cli_mod._cleanup_worktree(cli_mod._active_worktree)  # quit: the tree is clean, so it goes
     assert not wt.exists()
     assert recreate_tui_worktree(str(wt), "local-s") == str(wt) and wt.is_dir()
+
+
+def test_managed_ssh_worktrees_refuse_cli_requests_before_finding_local_git(monkeypatch):
+    from hermes_cli import main_resume_args, session_worktree, worktree_exit
+
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: True)
+    monkeypatch.setattr(cli_mod, "_git_repo_root", lambda: pytest.fail("probed Git on Hermes"))
+    for command in ("/worktree list", "/worktree new test", "/worktree prune", "/worktree"):
+        assert "unavailable for an SSH executor workspace" in _run(_Stub(), command)
+
+    monkeypatch.setitem(cli_mod.CLI_CONFIG, "worktree", True)
+    with pytest.raises(ValueError, match="unavailable"):
+        cli_mod._start_worktree_setup(False, False, False, False)
+    assert session_worktree.create() is None
+    assert session_worktree.restore("legacy-tree") is None
+    info = {"path": "/unknown/saved-tree", "exit_choice": worktree_exit.DISCARD}
+    cli_mod._cleanup_worktree(info)
+    assert not worktree_exit.apply_exit_choice(info, print)

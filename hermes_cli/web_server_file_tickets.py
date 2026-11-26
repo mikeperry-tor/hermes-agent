@@ -61,6 +61,7 @@ class FileAuthority:
     #: The SSH workspace reader the file is read through (``target`` is then a path on that
     #: machine), or None for a file on this host.
     workspace: Any = None
+    managed: bool = False
 
     def check_live(self) -> None:
         """``FileNotFoundError`` once a named profile home this file belongs to is missing or deleted."""

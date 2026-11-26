@@ -29,7 +29,8 @@ vi.mock('@/i18n', () => ({
           reorder: (label: string) => `Reorder ${label}`,
           toggle: (label: string, open: boolean) => `${open ? 'Show' : 'Hide'} ${label} sessions`,
           showAllCount: (count: number) => `Show all ${count} sessions`,
-          autoDiscovered: 'Auto-discovered'
+          autoDiscovered: 'Auto-discovered',
+          folderUnavailable: 'Folder unavailable'
         },
         showMoreIn: (count: number, label: string) => `Show ${count} more in ${label}`
       }
@@ -68,6 +69,17 @@ describe('ProjectOverviewRow', () => {
     workspaceOpen.value = false
     projectsStore.fetchProjectSessions.mockReset()
     projectsStore.projectProfile.mockReset().mockReturnValue('default')
+  })
+
+  it('shows an unavailable folder while letting the operator open its history', () => {
+    const onEnter = vi.fn()
+    render(<ProjectOverviewRow onEnter={onEnter} onNewSession={vi.fn()}
+      project={{ ...project, workspace_available: false }} />)
+
+    fireEvent.click(screen.getByLabelText('Enter Test D (Folder unavailable)'))
+
+    expect(onEnter).toHaveBeenCalledWith(project.id)
+    expect(screen.queryByRole('button', { name: 'New session in Test D' })).toBeNull()
   })
 
   it('does not render the disclosure toggle when there is nothing to preview', () => {

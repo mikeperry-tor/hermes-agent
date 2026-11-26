@@ -423,3 +423,91 @@ def test_save_refuses_a_file_outside_the_sessions_workspace(client, sandboxes, p
     assert response.status_code in (400, 403, 404), response.text
     assert (sandboxes["outside"] / "secret.txt").read_text(encoding="utf-8") == "outside note"
     assert (sandboxes["own"] / "escape.txt").is_symlink()
+
+
+def test_managed_relative_files_follow_the_owning_chat_and_pinned_ticket(client, monkeypatch):
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_cli.web_routers import files, session_files
+
+    monkeypatch.setattr(web_server.app.state, "ui_surface", "webapp", raising=False)
+    alpha, beta = "/mnt/projects/alpha", "/mnt/projects/beta"
+    roots = ("/workspace", alpha, beta)
+    cwd = {"alpha": alpha, "beta": beta}
+    contents = {f"{alpha}/note.txt": b"Alpha bytes", f"{beta}/note.txt": b"Beta bytes"}
+    state = {"offline": False}
+
+    class Executor:
+        def inspect_projects(self, paths, allowed):
+            assert allowed == roots
+            return {path: {"cwd": path} for path in paths}
+
+        def normalize(self, path):
+            return path
+
+        def inspect_file(self, path):
+            if path.endswith("/escape.txt"):
+                return "/outside/secret.txt", 5
+            return path, len(contents[path])
+
+        def read_bytes(self, path, **_):
+            return contents[path], len(contents[path]), path
+
+        def stream_file(self, path):
+            yield contents[path]
+
+        def write_managed_text(self, path, text, **kwargs):
+            assert kwargs["roots"] == roots
+            contents[path] = text.encode()
+            return path, len(contents[path])
+
+    async def own_session(session_id, profile=None):
+        if session_id not in cwd:
+            raise HTTPException(status_code=404)
+        return {"id": session_id, "cwd": "/ignored-hermes-directory"}
+
+    state["backend"] = Executor()
+
+    def connect(*_):
+        if state["offline"]:
+            raise SshWorkspaceFsError("ECONN")
+        return state["backend"]
+
+    def unexpected_host_path(*_):
+        pytest.fail("a model-supplied executor path reached the host resolver")
+
+    monkeypatch.setattr("hermes_cli.web_routers.sessions.get_session_detail", own_session)
+    monkeypatch.setattr(files, "_is_host_file", unexpected_host_path)
+    monkeypatch.setattr("hermes_cli.ssh_project_probe.managed_project_access", lambda terminal: (roots, terminal))
+    monkeypatch.setattr(session_files, "managed_project_connection", connect)
+    monkeypatch.setattr(session_files, "_stored_terminal", lambda session, _: {
+        "TERMINAL_ENV": "ssh", "TERMINAL_CWD": cwd[session["id"]],
+    })
+
+    first = {"session_id": "alpha", "path": "./note.txt"}
+    second = {"session_id": "beta", "path": "note.txt"}
+    read = client.get("/api/fs/read-text", params=first)
+    assert (read.status_code, read.json()["text"], read.json()["path"]) == (200, "Alpha bytes", f"{alpha}/note.txt")
+    other = client.get("/api/fs/read-text", params=second)
+    assert (other.status_code, other.json()["text"]) == (200, "Beta bytes")
+    assert client.get("/api/fs/download", params=second).content == b"Beta bytes"
+    assert client.head("/api/fs/download", params=second).headers["content-length"] == "10"
+    assert client.get("/api/fs/read-text", params={**first, "path": "./escape.txt"}).status_code == 403
+
+    minted = client.post("/api/files/ticket", json={"route": "download", **first})
+    assert minted.status_code == 200, minted.text
+    ticket = {**first, "ticket": minted.json()["ticket"]}
+    with TestClient(web_server.app) as recipient:
+        assert recipient.get("/api/fs/download", params=ticket).content == b"Alpha bytes"
+        cwd["alpha"] = beta
+        assert recipient.get("/api/fs/download", params=ticket).status_code == 403
+        cwd["alpha"] = alpha
+        state["backend"] = Executor()
+        assert recipient.get("/api/fs/download", params=ticket).status_code == 403
+    cwd["alpha"] = beta
+    saved = client.post("/api/fs/write-text", json={**first, "path": read.json()["path"], "content": "Edited"})
+    assert saved.status_code == 200, saved.text
+    assert contents == {f"{alpha}/note.txt": b"Edited", f"{beta}/note.txt": b"Beta bytes"}
+
+    state["offline"] = True
+    assert client.get("/api/fs/read-text", params=second).status_code == 503
+    assert client.get("/api/fs/read-text", params={**second, "session_id": "foreign"}).status_code == 404

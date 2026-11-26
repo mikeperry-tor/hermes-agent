@@ -502,15 +502,13 @@ def _resolve_chat_argv(
     under the dashboard's own profile, so a scoped chat attaches to its profile's gateway);
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
     dir, the same propagation ``hermes -p <name>`` performs. ``workspace_cwd``
-    (an already-validated host directory, ``chat_workspaces.resolve_chat_cwd``)
-    is the workspace the user picked for a FRESH chat: it becomes ``HERMES_CWD``
-    (where a self-spawned gateway starts) and ``HERMES_TUI_CWD`` (what the TUI
-    passes as the explicit ``cwd`` of ``session.create`` when attached to the
-    in-memory gateway, whose own cwd is the dashboard's launch dir).
+    is the validated folder for a fresh chat. The TUI sends ``HERMES_TUI_CWD``
+    as its explicit selection. Only host folders also become ``HERMES_CWD``.
     """
     from hermes_cli.web_server_profiles import _config_profile_scope, _resolve_profile_dir
     from hermes_cli.web_server_sessions import _open_session_db_for_profile, _session_latest_descendant
     from hermes_cli.main import PROJECT_ROOT
+    from hermes_cli.main_resume_args import uses_managed_executor
     from hermes_cli.main_tui_launch import _apply_tui_python_env, _make_tui_argv
 
     profile_dir: Optional[Path] = None
@@ -541,8 +539,12 @@ def _resolve_chat_argv(
             apply_terminal_config_to_env(env=env)
     except Exception:
         _log.warning("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
+    managed_executor = uses_managed_executor()
     if workspace_cwd:
-        env["HERMES_CWD"] = workspace_cwd
+        if managed_executor:
+            env["HERMES_TUI_CWD_EXPLICIT"] = "1"
+        else:
+            env["HERMES_CWD"] = workspace_cwd
         env["HERMES_TUI_CWD"] = workspace_cwd
     _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
@@ -575,7 +577,9 @@ def _resolve_chat_argv(
     # Without the attach URL, gatewayClient bootstraps through the profile's own
     # gateway (ui-tui/scripts/gateway_bootstrap.py) under the HERMES_HOME set above;
     # it never spawns a standalone `tui_gateway.entry` writer.
-    if profile_dir is None and (gateway_ws_url := _build_gateway_ws_url()):
+    if managed_executor:
+        env.pop("HERMES_TUI_GATEWAY_URL", None)
+    if profile_dir is None and (gateway_ws_url := _chat_gateway_ws_url(managed_executor)):
         env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
 
     return list(argv), str(cwd) if cwd else None, env
@@ -625,6 +629,14 @@ def _server_internal_ws_url(path: str, **extra_qs) -> Optional[str]:
 def _build_gateway_ws_url() -> Optional[str]:
     """ws:// URL the PTY child attaches to for JSON-RPC gateway traffic."""
     return _server_internal_ws_url("/api/ws")
+
+
+def _chat_gateway_ws_url(managed_executor: bool) -> Optional[str]:
+    from hermes_cli.web_server import app
+
+    if managed_executor and getattr(app.state, "session_authority", None) is None:
+        return None
+    return _build_gateway_ws_url()
 
 
 def _build_sidecar_url(channel: str) -> Optional[str]:
