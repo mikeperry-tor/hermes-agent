@@ -218,6 +218,9 @@ def _format_ref_value(value: str) -> str:
 
 def _attachment_ref_path(session: dict, target: Path) -> str:
     """Workspace-relative path for an attachment, or the absolute path if outside."""
+    if session.get("executor_attachment_session"):
+        from agent.ssh_staged_references import attachment_reference
+        return attachment_reference(target)
     workspace = Path(_session_cwd(session)).resolve()
     try:
         return str(target.resolve().relative_to(workspace)).replace(os.sep, "/")
@@ -286,7 +289,8 @@ def _stage_session_file_attachment(
     path in the profile's ``uploads/``) is always copied. ``max_bytes`` caps the copy of a
     browser upload; a host file is copied whatever its size, inline bytes up to
     ``_ATTACHMENT_MAX_BYTES``."""
-    workspace = Path(_session_cwd(session)).resolve()
+    executor_session = session.get("executor_attachment_session")
+    workspace = None if executor_session else Path(_session_cwd(session)).resolve()
     resolved = None
     if raw_path:
         try:
@@ -302,7 +306,7 @@ def _stage_session_file_attachment(
                 found = _resolve_attachment_path(path_token)
                 resolved = Path(found).resolve() if found is not None else None
     if resolved is not None:
-        if _referenced_in_place(session, resolved, workspace, staged=staged):
+        if workspace is not None and _referenced_in_place(session, resolved, workspace, staged=staged):
             return resolved, False
         # Without a cap the copy below streams the file, so its size never reaches memory.
         payload = None if max_bytes is None else _read_attachment_bytes(resolved, max_bytes)
@@ -321,9 +325,16 @@ def _stage_session_file_attachment(
         except (ValueError, _binascii.Error) as exc:
             raise ValueError("invalid data_url payload") from exc
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
-    root = _session_home_dir(session, "attachments")
-    root.mkdir(parents=True, exist_ok=True)
     filename = _sanitize_attachment_name(filename)
+    if executor_session:
+        import secrets
+        from agent.ssh_staged_references import attachment_directory
+
+        root = attachment_directory(Path(session["profile_home"]), executor_session)
+        filename = f"{secrets.token_hex(16)}-{filename.replace(':', '_')}"
+    else:
+        root = _session_home_dir(session, "attachments")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = root / filename
     stem = Path(filename).stem or "attachment"
     suffix = Path(filename).suffix

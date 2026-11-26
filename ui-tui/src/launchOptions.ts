@@ -12,6 +12,8 @@ export function localCreationOptions(env = process.env): Record<string, unknown>
 
   if (env.HERMES_TUI_TOOLSETS) { options.toolsets = env.HERMES_TUI_TOOLSETS.split(',') }
 
+  if (env.HERMES_TUI_CWD && env.HERMES_TUI_CWD_EXPLICIT === '1') { options.cwd_explicit = true }
+
   // `hermes --tui -s a,b`: the owner renders these into the session's frozen prompt.
   const skills = [...new Set((env.HERMES_TUI_SKILLS ?? '').split(/[,\n]/).map(name => name.trim()).filter(Boolean))]
 

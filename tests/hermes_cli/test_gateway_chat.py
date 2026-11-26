@@ -351,3 +351,22 @@ async def test_oneshot_z_writes_no_session_lines_to_stderr_like_main(monkeypatch
     assert await gateway_chat.run_gateway_chat(argparse.Namespace(query="q", quiet=True)) == 0
     err = capsys.readouterr().err
     assert "Session: stored-z" in err and "session_id: stored-z" in err
+
+
+def test_transport_classic_scopes_only_managed_launch_and_resume(monkeypatch):
+    from hermes_cli import gateway_chat, main_resume_args
+
+    args = argparse.Namespace(in_dir="/mnt/projects/repo", query="x")
+    params = {"cwd", "cwd_explicit"}
+    snapshot = {"info": {"cwd": "/mnt/projects/repo/nested", "launch_request": {}}}
+
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: True)
+    assert gateway_chat._launch_workspace(args, args.in_dir, params) == {
+        "cwd": args.in_dir, "cwd_explicit": True,
+    }
+    gateway_chat.check_resume_policy(args, snapshot)
+
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: False)
+    assert gateway_chat._launch_workspace(args, args.in_dir, params) == {"cwd": args.in_dir}
+    with pytest.raises(gateway_chat.GatewayClientError):
+        gateway_chat.check_resume_policy(args, snapshot)

@@ -1,5 +1,6 @@
 """Finite background tasks launched by the gateway /bg command."""
 
+import asyncio
 from contextlib import suppress
 import logging
 import os
@@ -114,7 +115,11 @@ class GatewayBackgroundMixin:
                 agent.daybreak_surface = self._daybreak_surface(source) is True
                 agent.daybreak = self._load_daybreak(source) is True
                 try:
-                    return agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
+                    result = agent.run_conversation(user_message=enriched_prompt, task_id=task_id)
+                    from tools.terminal_tool import get_session_cwd
+
+                    result["_delivery_cwd"] = get_session_cwd(task_id)
+                    return result
                 finally:
                     self._cleanup_agent_resources(agent)
 
@@ -132,7 +137,17 @@ class GatewayBackgroundMixin:
             images, media_files, text_content = [], [], ""
             if response:
                 media_files, response = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                from gateway.platforms.base import _managed_media_delivery
+                if _managed_media_delivery():
+                    from gateway.run import _collect_auto_append_media_tags
+                    tags, _ = _collect_auto_append_media_tags(result.get("messages", []))
+                    from gateway.media_repair import tool_produced_media_paths
+                    approved = tool_produced_media_paths(tags, result.get("messages") or [])
+                    media_files = await asyncio.to_thread(
+                        BasePlatformAdapter.filter_media_delivery_paths, media_files, approved=approved,
+                        cwd=result.get("_delivery_cwd"))
+                else:
+                    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 from gateway.platforms.docker_media_paths import hand_back_unreadable_media
                 await hand_back_unreadable_media([p for p, _ in media_files])
                 images, text_content = adapter.extract_images(response)

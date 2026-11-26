@@ -64,6 +64,10 @@ def _register_project_mutator(suffix: str, fn_name: str, takes_path: bool, kwarg
     def _(rid, params, pdb, conn) -> dict:
         proj = _require_project(pdb, conn, params)
         args = (str(params.get("path") or ""),) if takes_path else ()
+        if fn_name in {"add_folder", "set_primary"}:
+            from tui_gateway.managed_project_queries import validated_project_folders
+
+            args, _ = validated_project_folders(args, None)
         getattr(pdb, fn_name)(conn, proj.id, *args, **kwargs_of(params))
         return _ok(rid, {"project": pdb.get_project(conn, proj.id).to_dict()})
 
@@ -90,9 +94,12 @@ def _(rid, params, pdb, conn) -> dict:
 
 @_projects_method("projects.create")
 def _(rid, params, pdb, conn) -> dict:
+    from tui_gateway.managed_project_queries import validated_project_folders
+
+    folders, primary = validated_project_folders(params.get("folders") or [], params.get("primary_path"))
     pid = pdb.create_project(
-        conn, name=str(params.get("name") or ""), folders=params.get("folders") or [],
-        **_pick(params, "slug", "primary_path", "description", "icon", "color", "board_slug"))
+        conn, name=str(params.get("name") or ""), folders=folders, primary_path=primary,
+        **_pick(params, "slug", "description", "icon", "color", "board_slug"))
     if params.get("use"):
         pdb.set_active(conn, pid)
     from hermes_cli.observability.shared_metrics_signals import record_feature_used
@@ -122,12 +129,17 @@ def _(rid, params, pdb, conn) -> dict:
 
 @_projects_method("projects.for_cwd")
 def _(rid, params, pdb, conn) -> dict:
-    cwd = _completion_cwd(
-        {"cwd": str(params.get("cwd") or "").strip()} if params.get("cwd") else {})
-    proj = pdb.project_for_path(conn, cwd)
-    return _ok(rid, {
-        "project": proj.to_dict() if proj else None, "cwd": cwd,
-        "branch": git_probe.branch(cwd)})
+    from tui_gateway.managed_project_queries import profile_project_access, profile_project_location
+
+    raw = str(params.get("cwd") or "").strip()
+    access = profile_project_access()
+    if access is None:
+        cwd = _completion_cwd({"cwd": raw} if raw else {})
+        location = {"cwd": cwd, "branch": git_probe.branch(cwd)}
+    else:
+        location = profile_project_location(access, raw)
+    proj = pdb.project_for_path(conn, location["cwd"])
+    return _ok(rid, {"project": proj.to_dict() if proj else None, **location})
 
 
 def _non_workspace_dirs() -> set[str]:
@@ -350,7 +362,7 @@ def _project_tree_row(entry) -> dict:
 
 
 def _project_tree_inputs(
-    persistence, session_limit: int, *, include_discovered: bool
+    persistence, session_limit: int, *, include_discovered: bool, access=None,
 ) -> tuple[list[dict], list[dict], list[dict], str | None]:
     """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
     ``include_discovered`` is the zero-session-repo overview tier; drill-in skips it (and
@@ -362,22 +374,26 @@ def _project_tree_inputs(
                      exclude_sources=tuple(_PROJECT_TREE_EXCLUDED_SOURCES), include_archived=False),
         SessionWindow(limit=session_limit, offset=0), compact_rows=True)
     sessions = [_project_tree_row(r) for r in rows]
-    # Parallel-warm the git cache so build_tree's resolver doesn't cold-probe each cwd in turn.
-    git_probe.warm_roots(s["cwd"] for s in sessions if s.get("cwd"))
+    if access is not None:
+        from tui_gateway.managed_project_queries import apply_saved_executor_cwds
+
+        apply_saved_executor_cwds(sessions, persistence.bindings)
     from hermes_cli import projects_db as pdb
-    policy = _repo_discovery_policy()
-    policy_key = _repo_discovery_policy_key(policy)
     with pdb.connect_closing() as conn:
-        if include_discovered:
-            pdb.reconcile_discovered_repos_policy(
-                conn, policy_key, preserve_unversioned=_repo_discovery_policy_is_default(policy))
         projects = [p.to_dict() for p in pdb.list_projects(conn)]
         active_id = pdb.get_active_id(conn)
-        # backfill stays off the hot tree path — grouping uses the live resolver.
         discovered = []
         if include_discovered:
-            discovered = _discover_repos_payload(
-                None, conn=conn, backfill=False, include_cached=policy["enabled"], persistence=persistence)
+            policy = _repo_discovery_policy()
+            if access is not None:
+                from tui_gateway.managed_project_queries import eligible_cached_repos
+
+                discovered = eligible_cached_repos(conn, policy, access)
+            else:
+                pdb.reconcile_discovered_repos_policy(
+                    conn, _repo_discovery_policy_key(policy), preserve_unversioned=_repo_discovery_policy_is_default(policy))
+                discovered = _discover_repos_payload(
+                    None, conn=conn, backfill=False, include_cached=policy["enabled"], persistence=persistence)
     return sessions, projects, discovered, active_id
 
 
@@ -398,13 +414,19 @@ def _build_project_tree(
 ) -> tuple[dict, str | None]:
     """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
     from tui_gateway import project_tree
+    from tui_gateway.managed_project_queries import build_managed_tree, profile_project_access
+
+    access = profile_project_access()
     _DIR_EXISTS_CACHE.clear()
     with contextlib.nullcontext(persistence) if persistence is not None else _persistence_for(db) as persistence:
         sessions, projects, discovered, active_id = _project_tree_inputs(
-            persistence, session_limit, include_discovered=include_discovered)
-    # build_tree also resolves declared project folders and discovered roots — warm them too.
+            persistence, session_limit, include_discovered=include_discovered, access=access)
+    if access is not None:
+        return build_managed_tree(sessions, projects, discovered, access, preview_limit, hydrate), active_id
+    # Warm each kind of anchor so build_tree's resolver reuses the Git cache.
     git_probe.warm_roots(
-        [str(f.get("path") or "") for p in projects for f in (p.get("folders") or [])]
+        [s["cwd"] for s in sessions if s.get("cwd")]
+        + [str(f.get("path") or "") for p in projects for f in (p.get("folders") or [])]
         + [str(r.get("root") or "") for r in discovered])
     tree = project_tree.build_tree(
         projects, sessions, discovered, git_probe.resolve, preview_limit=preview_limit,

@@ -80,11 +80,20 @@ def _settings(policy, config, live, picked):
 
 def _terminal(policy, terminal, picked):
     from gateway.session_policy import terminal_uses_host_cwd
+    from hermes_cli.ssh_project_probe import managed_project_access
     terminal, request = dict(terminal), json.loads(policy.request_json)
     # The session's own folder, where it now is, under build_policy's rule; a committed Move to project is
     # the user's pick on every backend (it rewrote the policy, never the launch request).
-    if request.get('cwd_explicit') is True or 'workspace' in picked or terminal_uses_host_cwd(terminal):
+    saved = json.loads(policy.terminal_json)
+    selection = saved.get('TERMINAL_SSH_PROJECT_SELECTED')
+    if saved.get('TERMINAL_ENV') == 'ssh' and managed_project_access(terminal) is not None:
+        # A prior receipt can store a client launch folder and a separate executor cwd.
+        terminal['TERMINAL_CWD'] = saved.get('TERMINAL_CWD')
+    elif request.get('cwd_explicit') is True or 'workspace' in picked or terminal_uses_host_cwd(terminal):
         terminal['TERMINAL_CWD'] = policy.cwd
+    if selection in ('0', '1'):
+        terminal['TERMINAL_CWD'] = saved.get('TERMINAL_CWD')
+        terminal['TERMINAL_SSH_PROJECT_SELECTED'] = selection
     return terminal
 
 
@@ -276,6 +285,10 @@ def drop_session_terminal(authority, ref):
     from gateway.session_policy import unbind_turn_workspace
     with owner_scope(authority):
         keys = {_qualify_task_key(key) for key in (f'session:{route}', *ids)}
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if uses_managed_executor():
+            from tools.code_kernel_remote import shutdown_remote_kernels_for_owner
+            shutdown_remote_kernels_for_owner(route)
         for key in (route, *ids):
             # The turn's workspace binding goes with them: it wins over the new binding's cwd too.
             unbind_turn_workspace(key)

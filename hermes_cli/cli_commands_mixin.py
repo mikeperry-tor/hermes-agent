@@ -496,11 +496,10 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin, CLIHandoffMixin):
                 mode = _DIFF_MODES[low]
             else:
                 paths.append(arg)
-        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
         if mode == "session":
-            return self._print_session_diff(cwd, stat_only)
-        from tools.working_diff import collect_working_diff
-        result = collect_working_diff(cwd, mode=mode, paths=paths or None)
+            return self._print_session_diff(os.getenv("TERMINAL_CWD", os.getcwd()), stat_only)
+        from hermes_cli.gateway_chat_commands import classic_working_diff
+        result = classic_working_diff(self, mode, paths or None)
         if not result.get("success"):
             return print(f"  {result.get('error') or _t('shared.could_not_generate_diff')}")
         stat, diff = result.get("stat", ""), result.get("diff", "")
@@ -820,10 +819,11 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin, CLIHandoffMixin):
 
     # ---- /worktree ------------------------------------------------------------------------
     def _handle_worktree_command(self, cmd_original: str) -> None:
-        """Handle /worktree [new [name]|list|prune [--dry-run]] — isolated git worktrees.
-        ``new`` moves this session into the tree (as ``hermes -w``: kept on exit only with
-        unpushed commits); ``prune`` never deletes tracked changes, unique commits, or in-use trees."""
+        """Manage a local Git worktree."""
         import cli as _cli
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if uses_managed_executor():
+            return print("Worktree commands are unavailable for an SSH executor workspace.")
         parts = cmd_original.split(None, 2)
         sub = parts[1].lower() if len(parts) > 1 else ""
         rest = parts[2].strip() if len(parts) > 2 else ""
@@ -1164,12 +1164,13 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin, CLIHandoffMixin):
         self._queue_prompt_turn(build_plan_prompt(task), "/plan", _t("plan.planning", task=_ellipsize(task, 80)) if task else _t("plan.from_conversation"))
 
     def _handle_init_command(self, cmd: str):
-        """Handle /init — generate or update AGENTS.md from a project scan performed by the
-        live agent with its own read-only tools."""
+        """Prompt the agent to generate or update AGENTS.md from a project scan."""
         from hermes_cli.init_command import build_init_prompt_for_cwd
-        # session_key="" targets the single-session CLI's "default" cwd record, which tracks
-        # `cd` and workspace switches, so /init follows the directory the user works in.
-        msg = build_init_prompt_for_cwd(extra=_command_arg(cmd), session_key="")  # optional user emphasis
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+        try:
+            msg = build_init_prompt_for_cwd(extra=_command_arg(cmd), session_key="")
+        except SshWorkspaceFsError as exc:
+            return print(str(exc))
         self._queue_prompt_turn(msg, "/init", _t("init.updating" if "UPDATE the existing AGENTS.md" in msg else "init.generating"))
 
     # ---- side-session handlers: /bg, /btw -------------------------------------------------

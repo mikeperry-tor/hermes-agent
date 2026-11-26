@@ -278,3 +278,17 @@ def test_in_dir_leaves_unset_terminal_cwd_unset(main_mod, monkeypatch, tmp_path)
     main_mod._apply_in_dir(_args(in_dir=str(target)))
 
     assert "TERMINAL_CWD" not in os.environ
+
+
+def test_managed_in_passes_executor_path_to_classic_and_thin_chat(monkeypatch):
+    from hermes_cli import gateway_chat, gateway_session_store, main_resume_args
+
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: True)
+    args = _args(in_dir="/workspace/only on executor")
+    try:
+        main_resume_args.apply_in_dir(args)
+        assert args.no_restore_cwd
+        assert gateway_session_store._launch_workspace() == {"cwd": args.in_dir, "cwd_explicit": True}
+        assert gateway_chat._caller_cwd(args) == args.in_dir
+    finally:
+        main_resume_args.apply_in_dir(_args())

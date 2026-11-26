@@ -461,7 +461,12 @@ def _launch_tui(
     # A local interactive session starts where the user launched (or in the --worktree), the
     # classic CLI's rule; terminal.cwd stays the default for gateway, cron and remote backends.
     # HERMES_TUI_CWD is what the TUI sends on session.create, which beats the configured cwd (#84015).
-    if str(env.get("TERMINAL_ENV") or "local") == "local":
+    from hermes_cli.main_resume_args import requested_executor_project
+    env.pop("HERMES_TUI_CWD_EXPLICIT", None)
+    if project := requested_executor_project():
+        env["HERMES_TUI_CWD"] = project
+        env["HERMES_TUI_CWD_EXPLICIT"] = "1"
+    elif str(env.get("TERMINAL_ENV") or "local") == "local":
         env["TERMINAL_CWD"] = env["HERMES_TUI_CWD"] = env["HERMES_CWD"]
     else:
         env.pop("HERMES_TUI_CWD", None)

@@ -97,7 +97,7 @@ def _plugin_reference_items(pfx: str, qval: str) -> list[dict] | None:
         return None
 
 
-def _fuzzy_basename_items(root: str, path_part: str, prefix_tag: str) -> list[dict]:
+def _fuzzy_basename_items(root: str, path_part: str, prefix_tag: str, list_directory=None) -> list[dict]:
     """Cmd-P style fuzzy basename search for a bare `@name`; path-ish queries take the listing path."""
     ranked: list[tuple[tuple[int, int], str, str, bool]] = []
     walked_dirs: set[str] = set()
@@ -113,18 +113,29 @@ def _fuzzy_basename_items(root: str, path_part: str, prefix_tag: str) -> list[di
 
     # Seed with root's immediate children: `_list_repo_files` is capped at _FUZZY_CACHE_MAX_FILES
     # and the non-git fallback walk can burn the whole budget on one deep subtree.
-    with contextlib.suppress(OSError):
-        for entry in os.listdir(root):
-            if entry not in _FUZZY_FALLBACK_EXCLUDES:
-                _consider(entry, entry, os.path.isdir(os.path.join(root, entry)))
-    for rel in _list_repo_files(root):
-        _consider(rel, os.path.basename(rel), False)
-        # Rank each ancestor dir too — a folder with no name-matching file inside is otherwise invisible.
-        parent = os.path.dirname(rel)
-        while parent and parent not in walked_dirs:
-            walked_dirs.add(parent)
-            _consider(parent, os.path.basename(parent), True)
-            parent = os.path.dirname(parent)
+    if list_directory is not None:
+        import posixpath
+        from tui_gateway.methods_complete_helpers import _FUZZY_CACHE_MAX_FILES
+
+        for rel, is_dir in list_directory(root, include_hidden=want_hidden):
+            if rel not in _FUZZY_FALLBACK_EXCLUDES:
+                _consider(rel, posixpath.basename(rel), is_dir)
+        for rel, is_dir in list_directory(root, recursive=True, limit=_FUZZY_CACHE_MAX_FILES):
+            if not any(part in _FUZZY_FALLBACK_EXCLUDES for part in rel.split("/")):
+                _consider(rel, posixpath.basename(rel), is_dir)
+    else:
+        with contextlib.suppress(OSError):
+            for entry in os.listdir(root):
+                if entry not in _FUZZY_FALLBACK_EXCLUDES:
+                    _consider(entry, entry, os.path.isdir(os.path.join(root, entry)))
+        for rel in _list_repo_files(root):
+            _consider(rel, os.path.basename(rel), False)
+            # Rank each ancestor dir too — a folder with no name-matching file inside is otherwise invisible.
+            parent = os.path.dirname(rel)
+            while parent and parent not in walked_dirs:
+                walked_dirs.add(parent)
+                _consider(parent, os.path.basename(parent), True)
+                parent = os.path.dirname(parent)
 
     # Same rank tier: folders first, so `@Desktop` leads with the folder.
     ranked.sort(key=lambda r: (r[0], not r[3], len(r[1]), r[1]))
@@ -183,7 +194,7 @@ def _backend_dir_entries(search_dir: str, session_key: str | None) -> list[tuple
 
 
 def _dir_listing_items(root: str, word: str, path_part: str, prefix_tag: str, is_context: bool,
-                       session_key: str | None = None, local: bool | None = None) -> list[dict]:
+                       session_key: str | None = None, local: bool | None = None, list_directory=None) -> list[dict]:
     """Prefix-match entries of the directory ``path_part`` points at (max 30)."""
     import posixpath
     local = _effective_terminal_backend() == "local" if local is None else local
@@ -199,7 +210,9 @@ def _dir_listing_items(root: str, word: str, path_part: str, prefix_tag: str, is
         search_dir = pth.join(root, search_dir)
     search_dir = pth.normpath(search_dir)
     items: list[dict] = []
-    if local:
+    if list_directory is not None:
+        entries = list_directory(search_dir, match, include_hidden=bool(prefix_tag or not is_context))
+    elif local:
         if not os.path.isdir(search_dir):
             return items
         entries = [(entry, os.path.isdir(os.path.join(search_dir, entry))) for entry in sorted(os.listdir(search_dir))]
@@ -234,6 +247,10 @@ def _(rid, params: dict) -> dict:
     if not word:
         return _ok(rid, {"items": []})
     session = _sessions.get(params.get("session_id", ""))
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        directory = session.get("cwd") if session and session.get("explicit_cwd") else None
+        return _ok(rid, {"items": managed_completion_items(word, directory=directory)})
     local = _effective_terminal_backend() == "local"
     # A non-local backend's cwd lives inside the target; the host cannot validate it, so take the composer's
     # session cwd (Desktop sends it) or the session's terminal cwd as-is (".": the backend's own cwd). The TUI
@@ -246,7 +263,23 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"items": _path_completion_items(word, root, session_key, local)})
 
 
-def _path_completion_items(word: str, root: str, session_key: str | None, local: bool) -> list[dict]:
+def managed_completion_items(word: str, terminal_policy=None, *, directory=None) -> list[dict]:
+    from functools import partial
+    from agent.ssh_context_references import completion_entries, reference_workspace
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    try:
+        workspace = reference_workspace(terminal_policy, directory=directory)
+    except SshWorkspaceFsError:
+        return []
+    if workspace is None:
+        return []
+    return _path_completion_items(word, workspace.cwd, None, False,
+                                  list_directory=partial(completion_entries, workspace))
+
+
+def _path_completion_items(word: str, root: str, session_key: str | None, local: bool, *,
+                           list_directory=None) -> list[dict]:
     """``complete.path``'s items for ``word`` resolved against ``root``; the shared gateway serves the
     same listing against a local session's own folder (``gateway/session_complete_path.py``)."""
     is_context = word.startswith("@")
@@ -271,10 +304,10 @@ def _path_completion_items(word: str, root: str, session_key: str | None, local:
         and local and not _abs_completion_prefix_exists(path_part)):
         path_part = path_part.lstrip("/")
     bare_word = is_context and path_part and "/" not in path_part
-    if local and bare_word and len(path_part.strip()) >= 2 and prefix_tag != "folder":
-        items = _fuzzy_basename_items(root, path_part, prefix_tag)
+    if (local or list_directory is not None) and bare_word and len(path_part.strip()) >= 2 and prefix_tag != "folder":
+        items = _fuzzy_basename_items(root, path_part, prefix_tag, list_directory)
     else:
-        items = _dir_listing_items(root, word, path_part, prefix_tag, is_context, session_key, local)
+        items = _dir_listing_items(root, word, path_part, prefix_tag, is_context, session_key, local, list_directory)
     # Bare-word `@name` may be an agent mention: profiles rank ABOVE file hits.
     if bare_word and not prefix_tag:
         with contextlib.suppress(Exception):

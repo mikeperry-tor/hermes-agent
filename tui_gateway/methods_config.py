@@ -86,10 +86,16 @@ def _reconcile_repo_discovery(pdb, conn, policy, policy_key):
 def _(rid, params: dict) -> dict:
     """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived. A profile whose
     session store was never initialized still answers from its scan cache (``db`` is None then)."""
+    from tui_gateway.managed_project_queries import discovered_repo_results, profile_project_access
+
     with _profile_db(params) as db:
         from hermes_cli import projects_db as pdb
         policy = _repo_discovery_policy()
         with pdb.connect_closing() as conn:
+            if (access := profile_project_access()) is not None:
+                with _persistence_for(db) as persistence:
+                    repos = discovered_repo_results(conn, persistence, policy, access, scan=params.get("scan") is True)
+                return _ok(rid, {"repos": repos, "discovery_policy": policy})
             _reconcile_repo_discovery(pdb, conn, policy, _repo_discovery_policy_key(policy))
             # `scan=true` (remote-gateway desktop): its native scan only sees its own filesystem,
             # so the host scans the policy roots so zero-session repos surface.
@@ -104,7 +110,13 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Persist repo roots found by the client's (desktop-side) scan; return the merged list."""
     from hermes_cli import projects_db as pdb
+    from tui_gateway.managed_project_queries import discovered_repo_results, profile_project_access
+
     policy = _repo_discovery_policy()
+    if (access := profile_project_access()) is not None:
+        with _profile_db(params) as db, _persistence_for(db) as persistence, pdb.connect_closing() as conn:
+            repos = discovered_repo_results(conn, persistence, policy, access)
+        return _ok(rid, {"repos": repos, "accepted": False, "discovery_policy": policy})
     policy_key = _repo_discovery_policy_key(policy)
     incoming = params.get("discovery_policy")
     if isinstance(incoming, dict):
@@ -189,6 +201,10 @@ def _cfg_get_provider(params):
 
 
 def _cfg_get_project(params):
+    from tui_gateway.managed_project_queries import profile_project_access, profile_project_location
+
+    if (access := profile_project_access()) is not None:
+        return profile_project_location(access, str(params.get("cwd") or "").strip())
     raw = str(params.get("cwd", "") or (_load_cfg().get("terminal") or {}).get("cwd", "") or "").strip()
     # A picked path is explicit (the profile's terminal.cwd must not replace it); the profile picks the backend,
     # so a remote project dir is kept instead of being dropped to the launch cwd by the host isdir check.

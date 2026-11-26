@@ -268,16 +268,19 @@ def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
             # prompt build inside would key its workspace pin on the backend's cwd.
             tokens = _set_session_context(session["session_key"], cwd=_session_cwd(session))
             try:
-                from agent.context_breakdown import (
-                    compute_context_details,
-                    compute_session_context_breakdown,
-                    render_context_breakdown_lines)
-                payload = compute_session_context_breakdown(agent, live_messages)
-                details = None
-                if (arg or "").strip().lower() in {"all", "full", "details"}:
-                    with contextlib.suppress(Exception):
-                        details = compute_context_details(agent)
-                breakdown_lines = render_context_breakdown_lines(payload, details=details, grid=False)
+                from tui_gateway.methods_tools import _session_home_scope
+
+                with _session_home_scope(session):
+                    from agent.context_breakdown import (
+                        compute_context_details,
+                        compute_session_context_breakdown,
+                        render_context_breakdown_lines)
+                    payload = compute_session_context_breakdown(agent, live_messages)
+                    details = None
+                    if (arg or "").strip().lower() in {"all", "full", "details"}:
+                        with contextlib.suppress(Exception):
+                            details = compute_context_details(agent)
+                    breakdown_lines = render_context_breakdown_lines(payload, details=details, grid=False)
             finally:
                 _clear_session_context(tokens)
         except Exception:

@@ -38,19 +38,33 @@ async def prepare_workspace(authority, live, payload, prepared):
     """Move to project: execution cwd and TERMINAL_CWD move together (restore_policy's invariant)."""
     import os
     from gateway.session_policy import restore_policy
+    from hermes_cli.ssh_project_probe import inspect_managed_project
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
     from hermes_constants import translate_cwd_for_wsl_backend
     from tui_gateway import git_probe
     old = restore_policy(prepared['snapshot']['receipt']['policy'])
+    terminal = json.loads(old.terminal_json)
 
     def probe():
-        # Off-loop: a stat and up to three `git` spawns.
+        try:
+            project = inspect_managed_project(terminal, payload['cwd'], profile_key=str(authority.profile_id),
+                                              git_timeout=git_probe._GIT_TIMEOUT)
+        except SshWorkspaceFsError as exc:
+            raise AuthorityRefusal('invalid_params', field='cwd', detail=str(exc)) from exc
+        if project is not None:
+            facts, _ = project
+            # CLI history scopes by the checkout. The sidebar probes the common repo separately.
+            return facts['cwd'], facts.get('branch', ''), facts.get('worktree_root', ''), True
+        if terminal.get('TERMINAL_SSH_PROJECT_SELECTED') in ('0', '1'):
+            raise AuthorityRefusal('invalid_params', field='cwd', detail='The managed SSH workspace is unavailable.')
         cwd = os.path.abspath(os.path.expanduser(translate_cwd_for_wsl_backend(payload['cwd'])))
         if not os.path.isdir(cwd):
             raise AuthorityRefusal('invalid_params')
-        return cwd, git_probe.branch(cwd), git_probe.common_repo_root(cwd)
-    cwd, branch, root = await asyncio.to_thread(probe)
-    terminal = json.loads(old.terminal_json)
+        return cwd, git_probe.branch(cwd), git_probe.common_repo_root(cwd), False
+    cwd, branch, root, managed = await asyncio.to_thread(probe)
     terminal['TERMINAL_CWD'] = cwd
+    if managed:
+        terminal['TERMINAL_SSH_PROJECT_SELECTED'] = '1'
     policy = replace(old, cwd=cwd, terminal_json=json.dumps(terminal))
     return _rebind(authority, prepared, old, policy, git={'branch': branch, 'root': root})
 

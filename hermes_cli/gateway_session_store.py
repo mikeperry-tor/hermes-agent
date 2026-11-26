@@ -207,13 +207,16 @@ class GatewaySessionStore:
     def _create_params(self, launch, title, record_cwd):
         from agent.session_source import CLI_FAMILY_SOURCES, create_surface, session_source_for
         params = _creation_policy(launch or {})
-        params["cwd"] = _launch_cwd()
+        params.update(_launch_workspace())
         # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
         params["source"] = create_surface(session_source_for("cli"))
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
-        local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
-        params["row_cwd"] = os.getcwd() if record_cwd and local and params["source"] in CLI_FAMILY_SOURCES else ""
+        from hermes_cli.main_resume_args import uses_managed_executor
+
+        if not uses_managed_executor():
+            local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
+            params["row_cwd"] = os.getcwd() if record_cwd and local and params["source"] in CLI_FAMILY_SOURCES else ""
         if title:
             params["title"] = title
         params.update(self.client_env())
@@ -644,6 +647,14 @@ def _creation_policy(launch):
     return policy
 
 
+def _launch_workspace():
+    from hermes_cli.main_resume_args import requested_executor_project
+
+    if cwd := requested_executor_project():
+        return {"cwd": cwd, "cwd_explicit": True}
+    return {"cwd": _launch_cwd()}
+
+
 def _launch_cwd():
     """``session.create``'s ``cwd``, a host folder the owner checks on its own host. TERMINAL_CWD is the
     folder this CLI has selected (``-w``, ``/worktree new`` and ``/resume`` all move it). A local backend
@@ -717,9 +728,12 @@ def create_titled_session(title):
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
     "could not be created" copy)."""
     params = _creation_policy({})
-    params["cwd"] = _launch_cwd()
+    params.update(_launch_workspace())
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)
-    params["row_cwd"] = ""
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if not uses_managed_executor():
+        params["row_cwd"] = ""
     try:
         store = session_store()
         params.update(store.client_env())

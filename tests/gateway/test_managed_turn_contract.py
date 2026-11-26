@@ -221,3 +221,25 @@ def test_shared_tool_events_bound_large_content_without_losing_error_or_path():
     assert complete['is_error'] is True
     assert 'error' in json.loads(complete['result'])
     assert len(json.dumps(complete)) < 100_000
+
+
+def test_worker_binds_owner_verified_workspace_without_probing_again(tmp_path, monkeypatch):
+    from agent.managed_worker import _worker_policy_scope, validate_bootstrap
+    from agent.runtime_cwd import scoped_session_cwd
+    from gateway import session_policy
+    from gateway.session_managed_worker import _bootstrap
+    from hermes_scope import LOCAL_OWNER, LOCAL_TENANT, Scope, push_state
+
+    _, args = assignment(tmp_path, monkeypatch)
+    terminal = {"TERMINAL_ENV": "ssh", "TERMINAL_CWD": "/mnt/projects/exact"}
+    wire = json.loads(json.dumps(_bootstrap(*args, workspace=(terminal["TERMINAL_CWD"], terminal))))
+    frame = validate_bootstrap(wire)
+    policy = session_policy.restore_policy(frame["policy"])
+
+    def unexpected_probe(*_args):
+        pytest.fail("worker must not start a second workspace probe")
+
+    monkeypatch.setattr(session_policy, "_runtime_workspace", unexpected_probe)
+    with push_state(scope=Scope(LOCAL_TENANT, frame["home"], LOCAL_OWNER)), \
+            _worker_policy_scope(frame, policy, session_policy.policy_scope):
+        assert scoped_session_cwd() == "/mnt/projects/exact"

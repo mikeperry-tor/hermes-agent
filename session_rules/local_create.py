@@ -65,7 +65,7 @@ def retry_matches(committed: dict, request: dict) -> bool:
     return sent == json.loads(stored)
 
 
-def client_request(request_json, derived=None):
+def client_request(request_json, derived=None, *, requested_provider=False):
     """A frozen create request as the client sent it: an owner-resolved ``-m`` route (``model_requested``)
     compares by the name the client typed, not by the model and the *derived* fields (a receipt from
     before ``route_derived``: the endpoint) its ``${VAR}`` refs expanded to at the time. ``desktop_local``
@@ -79,6 +79,10 @@ def client_request(request_json, derived=None):
         request.pop('model', None)
         for key in ('base_url',) if derived is None else derived:
             request.pop(key, None)
+        if 'provider_requested' in request:
+            provider = request.pop('provider_requested')
+            if requested_provider:
+                request['provider'] = provider
     return request
 
 
@@ -86,14 +90,18 @@ def same_create_request(saved_json, retry_json):
     """Whether a create retry carries the frozen request it resumes: one check for a retry that finds the
     session committed and one staged before it was. The saved receipt's provenance names the owner's
     fields; one from before a same-name alias got ``model_requested`` compares exactly, as it did."""
-    derived = json.loads(saved_json).get('route_derived')
-    if client_request(saved_json, derived) == client_request(retry_json, derived):
+    saved = json.loads(saved_json)
+    derived = saved.get('route_derived')
+    requested_provider = 'provider_requested' in saved
+    if (client_request(saved_json, derived, requested_provider=requested_provider)
+            == client_request(retry_json, derived, requested_provider=requested_provider)):
         return True
     retry = json.loads(retry_json)
     if retry.get('model_requested') == retry.get('model'):
         retry.pop('model_requested', None)
         retry.pop('route_derived', None)
-    return json.loads(saved_json) == retry
+        retry.pop('provider_requested', None)
+    return saved == retry
 
 
 def same_create_retry(saved_policy, retry_json, client_request):
@@ -102,3 +110,31 @@ def same_create_retry(saved_policy, retry_json, client_request):
     *saved_policy*. Used by a retry that finds the session committed, at commit, and by one overlapping
     the attempt that holds the session's key slot."""
     return same_create_request(saved_policy['request_json'], retry_json) and retry_matches(saved_policy, client_request)
+
+
+def matches_unresolved_retry(saved_policy: dict, request: dict, params: dict) -> bool:
+    """Check the raw request against the committed owner's route provenance."""
+    stored = json.loads(saved_policy['request_json'])
+    derived = stored.pop('route_derived', None)
+    stored.pop('desktop_local', None)
+    if 'model_requested' in stored:
+        if derived is None:
+            return False
+        stored['model'] = stored.pop('model_requested')
+        for key in derived:
+            stored.pop(key, None)
+        if 'provider_requested' in stored:
+            stored['provider'] = stored.pop('provider_requested')
+        elif 'provider' in stored:
+            # Older receipts can contain a normalized provider rather than the
+            # spelling originally sent by the caller.
+            return False
+    return (json.dumps(stored, sort_keys=True) == json.dumps(request, sort_keys=True)
+            and retry_matches(saved_policy, params))
+
+
+def same_create_credentials(saved_policy, staged_policy) -> bool:
+    """A racing create must carry the same client launch key as the winner."""
+    if 'model_requested' in json.loads(saved_policy['request_json']):
+        return True  # the owner's alias key is not part of the client request
+    return saved_policy.get('credential_ref') == staged_policy.get('credential_ref')
