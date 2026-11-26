@@ -53,7 +53,7 @@ export const compactPreview = (s: string, max: number) => {
 export const estimateTokensRough = (text: string) => (!text ? 0 : (text.length + 3) >> 2)
 
 export const edgePreview = (s: string, head = 16, tail = 28) => {
-  const one = s.replace(WS_RE, ' ').trim().replace(/\]\]/g, '] ]')
+  const one = s.replace(WS_RE, ' ').trim().replace(/\]{2,}/g, run => [...run].join(' '))
 
   return !one
     ? ''
