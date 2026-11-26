@@ -86,6 +86,17 @@ function ScreenNeedsHttps({ label }: { label: string }) {
   )
 }
 
+function desktopInstallStatus(status: DisplayStatus | null): DisplayStatus | null {
+  return status && !status.installed && !status.blocker ? status : null
+}
+
+function desktopStartBlocked(status: DisplayStatus): boolean {
+  // A terminal probe can be inconclusive without blocking a retry. A known
+  // missing dependency blocks startup, and gateway blockers keep their meaning.
+  return Boolean(status.blocker) &&
+    (status.missing.length > 0 || (status.installed && !status.placement?.startsWith('terminal:')))
+}
+
 export function BotScreenPane({ bot }: { bot: RosterRow }) {
   const t = useBots()
   const screen = useValue($screenState)
@@ -439,11 +450,12 @@ export function BotScreenPane({ bot }: { bot: RosterRow }) {
   }
 
   if (status && !status.supported) {
-    return <EmptyState description={t.screen.unsupportedBody} title={t.screen.unsupportedTitle} />
+    return <EmptyState description={status.blocker ?? t.screen.unsupportedBody} title={t.screen.unsupportedTitle} />
   }
 
-  if (status && !status.installed) {
-    return <ScreenNotInstalled bot={bot} onInstalled={next => setScreenStatus(bot, next)} status={status} />
+  const installStatus = desktopInstallStatus(status)
+  if (installStatus) {
+    return <ScreenNotInstalled bot={bot} onInstalled={next => setScreenStatus(bot, next)} status={installStatus} />
   }
 
   if (status && !status.running && status.image_switch) {
@@ -477,7 +489,7 @@ export function BotScreenPane({ bot }: { bot: RosterRow }) {
         <div className="flex flex-col items-center gap-2">
           <div className="text-sm font-medium">{t.screen.stoppedTitle}</div>
           <div className="text-xs text-muted-foreground">{status.blocker ?? t.screen.stoppedBody}</div>
-          <Button disabled={busy || Boolean(status.blocker)} onClick={() => void start()} size="sm">
+          <Button disabled={busy || desktopStartBlocked(status)} onClick={() => void start()} size="sm">
             {busy ? <GlyphSpinner /> : <Codicon name="play" />}
             {t.screen.start}
           </Button>

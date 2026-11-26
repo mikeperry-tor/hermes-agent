@@ -191,12 +191,15 @@ def _scoped_sid(session_id: str) -> str:
     sid = str(session_id or "")
     return sid if get_hermes_home_override() is None else f"{sid}@{hermes_home_key()}"
 
-def _get_backend(session_id: str = "") -> ComputerUseBackend:
+def _get_backend(session_id: str = "", *, requested_mode: Optional[str] = None) -> ComputerUseBackend:
     bare_sid, sid = str(session_id or ""), _scoped_sid(session_id)
     while True:
         with _backend_lock:
             # Mode resolved under the cache lock; YOLO mutation never holds the approval lock while releasing it.
             permission_mode = _cua_permission_mode(bare_sid)  # approval state is keyed by the Hermes session id
+            if requested_mode is not None and permission_mode != requested_mode:
+                from tools.computer_use.cua_backend_session import DesktopChanged
+                raise DesktopChanged("Computer-use permissions changed; retry with fresh screen state")
             if (cached := _backends.get(sid)) is None:
                 backend = _new_backend(permission_mode)
                 backend.start()  # under the cache lock: one backend per session; a concurrent toggle releases it
@@ -211,34 +214,41 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
         _stop_backend(cached, stale_lock, lambda e: None)
 
 @contextlib.contextmanager
-def _backend_for_call(session_id: str = "") -> Iterator[ComputerUseBackend]:
-    """Hold a live backend through dispatch, retrying admission but never an action.
+def _backend_for_call(session_id: str, requested_mode: str) -> Iterator[ComputerUseBackend]:
+    """Hold one backend through dispatch. A queued action cannot change screens.
 
     A display/mode change or release can retire a backend before lock lookup or
     while a caller waits. Revalidate AFTER acquiring its profile-scoped call
     lock; teardown needs that same lock. Never wait under the global cache lock.
     """
     from tools.computer_use.cua_backend import backend_display_stale, desktop_identity
+    from tools.computer_use.cua_backend_session import DesktopChanged
 
     sid = _scoped_sid(session_id)
-    while True:
-        backend = _get_backend(session_id=session_id)
-        with _backend_lock:
-            if _backends.get(sid) is not backend:
-                continue
-            call_lock = _backend_call_locks[sid]
-        with call_lock:
+    backend = _get_backend(session_id=session_id, requested_mode=requested_mode)
+    with _backend_lock:
+        if _backends.get(sid) is not backend:
+            raise DesktopChanged("The desktop driver changed; retry with fresh screen state")
+        call_lock = _backend_call_locks[sid]
+    with call_lock:
+        try:
             with _backend_lock:
                 if (_backends.get(sid) is not backend
                         or _backend_call_locks.get(sid) is not call_lock):
-                    continue
-                # A queued call can outlive a display/config change even when
-                # no other caller has replaced the cached backend yet.
-                if (_backend_permission_modes.get(sid) != _cua_permission_mode(str(session_id or ""))
-                        or backend_display_stale(_backend_displays.get(sid, ""), desktop_identity())):
-                    continue
+                    raise DesktopChanged("The desktop driver changed; retry with fresh screen state")
+                if backend_display_stale(_backend_displays.get(sid, ""), desktop_identity()):
+                    raise DesktopChanged("The desktop display changed; retry with fresh screen state")
+                if _backend_permission_modes[sid] != _cua_permission_mode(session_id):
+                    raise DesktopChanged("Computer-use permissions changed; retry with fresh screen state")
             yield backend
-            return
+        except DesktopChanged:
+            # Drop only this backend. The next action can acquire the new
+            # owner, while this action keeps its original refusal.
+            with _backend_lock:
+                detached = _detach_locked(sid)[0] if _backends.get(sid) is backend else None
+            if detached is not None:
+                _stop_backend(detached, call_lock, lambda e: None)
+            raise
 
 
 def release_computer_use_session(session_id: str) -> bool:
@@ -285,25 +295,45 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     # Bot Desktop lease: while a human drives the screen every action, capture included, is refused.
     from tools.bot_desktop import lease as _bd_lease
     from tools.bot_desktop.runtime import ensure_started_for_tool as _bd_ensure_started
+    from tools.computer_use.cua_backend_session import DesktopChanged, dispatch_fence
     def _refused(e: Exception) -> str:
         return json.dumps({"ok": False, "action": action, "code": "human_has_control", "error": str(e)})
     try:
         admitted = _bd_lease.assert_agent_may_act()
     except _bd_lease.HumanHasControl as e:
         return _refused(e)
+
+    def _fence(*, check_permissions: bool = True) -> None:
+        with _bd_lease.agent_admission() as current:
+            # Keep the lease stable while evaluating the mode. A hand-back
+            # cannot reauthorize an action admitted under an earlier epoch.
+            if current.epoch != admitted.epoch:
+                raise _bd_lease.HumanHasControl(
+                    "A human took over this desktop while the action ran; its result was discarded. "
+                    "Tell the user what you need and re-capture once they hand back.")
+            if check_permissions and _cua_permission_mode(session_id) != permission_mode:
+                raise DesktopChanged("Computer-use permissions changed; retry with fresh screen state")
+
     _bd_ensure_started()  # headless gateway: bring the profile's screen up before the backend probes DISPLAY
     if (err := _reject_unsafe(action, args)) is not None:
         return err
+    permission_mode = _cua_permission_mode(session_id)
     scopes = ([action] if action in _ACTIONS and _ACTIONS[action].destructive else []) + (
         ["bring_to_front"] if args.get("bring_to_front") or (action == "focus_app" and args.get("raise_window")) else [])
     for scope in scopes:
-        if (err := _request_approval(scope, args)) is not None:
+        if (err := _request_approval(scope, args, allow_mode_bypass=permission_mode == "unrestricted")) is not None:
             return err
     # Acquire separately so startup errors retain the install hint; the stack
     # releases the admitted call lock on every dispatch return or exception.
     call = contextlib.ExitStack()
     try:
-        backend = call.enter_context(_backend_for_call(session_id))
+        backend = call.enter_context(_backend_for_call(session_id, permission_mode))
+    except DesktopChanged as e:
+        try:
+            _fence(check_permissions=False)
+        except _bd_lease.HumanHasControl as lease_error:
+            return _refused(lease_error)
+        return json.dumps({"error": str(e)})
     except Exception as e:
         from plugins.computer_use import DEFAULT_BACKEND, configured_backend_name
         hint = ({"hint": "If the cua-driver binary is missing, run `hermes computer-use install`. If a Python "
@@ -312,24 +342,12 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
         return json.dumps({"error": f"computer_use backend unavailable: {e}", **hint})
     try:
         with call:
-            # Re-check under the dispatch lock: approval, backend start-up and lock waits above can take
-            # seconds, and a human may have taken over meanwhile. A result produced after such a flip is
-            # discarded too — it may picture what they typed.
+            _fence()
+            token = dispatch_fence.set(_fence)
             try:
-                _bd_lease.assert_agent_may_act()
-            except _bd_lease.HumanHasControl as e:
-                return _refused(e)
-
-            def _fence() -> None:
-                # Any lease transition since admission voids the frame — including a full take-over /
-                # hand-back cycle that already finished: it still belongs to the human's turn. Capture
-                # paths call this BEFORE the frame is persisted, spilled or sent to auxiliary vision.
-                if _bd_lease.get().epoch != admitted.epoch:
-                    raise _bd_lease.HumanHasControl(
-                        "A human took over this desktop while the action ran; its result was discarded. "
-                        "Tell the user what you need and re-capture once they hand back.")
-            _fence()  # input actions never receive fence=; refuse before the device op starts
-            result = _dispatch(backend, action, args, fence=_fence, session_id=session_id or None)
+                result = _dispatch(backend, action, args, fence=_fence, session_id=session_id or None)
+            finally:
+                dispatch_fence.reset(token)
             _fence()
             return result
     except _bd_lease.HumanHasControl as e:
@@ -338,7 +356,7 @@ def handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
 
-def _request_approval(action: str, args: dict[str, Any]) -> Optional[str]:
+def _request_approval(action: str, args: dict[str, Any], *, allow_mode_bypass: bool = True) -> Optional[str]:
     """None if approved, else a JSON error string. The decision (yolo bypass, session/permanent grants, CLI prompt,
     gateway pending, cron/unattended policy, fail-closed with nobody to ask) is ``tools.approval``'s shared gate,
     so a computer_use grant is one store entry like any terminal pattern. Scope key ``cua:<action>:<mode>``:
@@ -355,6 +373,7 @@ def _request_approval(action: str, args: dict[str, Any]) -> Optional[str]:
         advice="Find an alternative approach that avoids driving the desktop.",
         autoapprove_log_prefix="computer_use action in non-interactive non-gateway context",
         fail_closed_when_no_human=True,
+        allow_mode_bypass=allow_mode_bypass,
         no_human_block_message=(f"BLOCKED: computer_use `{action}` requires approval but no interactive user or "
                                 "gateway is present to approve it."),
     )

@@ -85,7 +85,8 @@ def test_mcp_and_cli_refetch_choose_the_same_view(monkeypatch, mode):
     monkeypatch.setattr(backend._session, "call_tool", lambda name, args: requests.append(dict(args)) or partial)
     monkeypatch.setattr("tools.computer_use.cua_backend_driver.resolve_cua_driver_cmd", lambda: "unused-driver")
 
-    def cli_json(cmd, env, name, timeout):
+    def cli_json(cmd, env, name, timeout, check_desktop):
+        check_desktop()
         assert cmd[:3] == ["unused-driver", "call", "get_window_state"]
         args = json.loads(cmd[3])
         shot = Path(args.pop("screenshot_out_file"))

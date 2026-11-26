@@ -203,14 +203,18 @@ def _user_for(env: Any) -> Optional[str]:
 def missing_binaries(env: Any) -> list[str]:
     script = "for b in " + " ".join(_REQUIRED) + '; do command -v "$b" >/dev/null 2>&1 || echo "$b"; done'
     proc = streams.run_in(env, ["bash", "-c", script], user=_user_for(env), timeout=20)
+    if proc.returncode:
+        raise RuntimeError("Could not inspect desktop dependencies in the terminal sandbox")
     return [b for b in proc.stdout.decode("utf-8", "replace").split() if b]
 
 
-def _published(env: Any, rdir: str) -> dict[str, str]:
-    proc = streams.run_in(env, ["bash", "-c", f"kill -0 $(cat {shlex.quote(rdir)}/launcher.pid 2>/dev/null) 2>/dev/null "
-                                             f"&& test -S {shlex.quote(rdir)}/rfb.sock && cat {shlex.quote(rdir)}/env"],
-                          user=_user_for(env), timeout=15)
-    if proc.returncode != 0:
+def _published(env: Any, rdir: str, *, strict: bool = False) -> dict[str, str]:
+    cmd = (f'dir={shlex.quote(rdir)}; pid=$(cat "$dir/launcher.pid" 2>/dev/null) || exit 3; '
+           'kill -0 "$pid" 2>/dev/null && test -S "$dir/rfb.sock" || exit 3; cat "$dir/env"')
+    proc = streams.run_in(env, ["bash", "-c", cmd], user=_user_for(env), timeout=15)
+    if proc.returncode:
+        if strict and proc.returncode != 3:
+            raise RuntimeError("Could not inspect the desktop display in the terminal sandbox")
         return {}
     return parse_published(proc.stdout.decode("utf-8", "replace"))
 
@@ -252,8 +256,8 @@ def parse_published(text: str) -> dict[str, str]:
     return out if "DISPLAY" in out else {}
 
 
-def published_env(env: Any, profile: str) -> dict[str, str]:
-    return _published(env, _remote_dir(env, profile))
+def published_env(env: Any, profile: str, *, strict: bool = False) -> dict[str, str]:
+    return _published(env, _remote_dir(env, profile), strict=strict)
 
 
 def start(env: Any, profile: str, *, geometry: str, wait_seconds: float = 20.0,

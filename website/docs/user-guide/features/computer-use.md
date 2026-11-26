@@ -53,6 +53,13 @@ backends `computer_use` refuses unless `bot_desktop.placement: gateway` opts
 into driving the host. Details: [Bot Screen → Where the screen
 runs](./bot-screen.md#where-the-screen-runs).
 
+An open driver refuses actions if desktop placement changes or its screen is
+replaced, and gateway CLI retries recheck placement before each attempt. Before
+dispatching an action, the driver verifies ownership, permission mode, and the
+human-control lease — releasing the lease before driver I/O so a human can take
+over mid-call, and cancelling timed-out requests before they reach the driver.
+If the permission mode changes during approval, re-approve under the new mode.
+
 ## Enabling
 
 **The driver ships with Hermes.** `cua-driver` is pinned in `pm/lock.json`
@@ -131,6 +138,12 @@ Browser work — including pages in a signed-in profile — goes through the
 `browser` toolset (`browser_exec`), not `computer_use`. The former
 `computer_use.grant_existing_profile` opt-in was removed along with the typed
 browser route; a leftover key in config.yaml is ignored.
+
+Sandbox-hosted desktops currently support only `standard` permission mode.
+`bounded` and `unrestricted` modes require a gateway-local private daemon and
+are rejected before starting one when the desktop runs in a terminal sandbox.
+Use `standard` approvals with a terminal sandbox, or set
+`bot_desktop.placement: gateway` if you want a gateway-local desktop.
 
 ### Bounded mode for repeatable automation
 

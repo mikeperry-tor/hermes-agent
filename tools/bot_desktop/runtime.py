@@ -389,7 +389,7 @@ def ensure_started_for_tool() -> None:
         logger.info("Bot Desktop auto-start skipped: %s", exc)
 
 
-def tool_placement() -> str:
+def tool_placement(*, expected_sandbox: Optional[bool] = None) -> str:
     """Where the browser / cua-driver a tool is about to spawn MUST run: ``placement.GATEWAY`` or
     ``placement.TERMINAL``. Policy first, liveness second: a ``terminal`` placement whose screen is down gets
     it started here (raising with the blocker when it cannot come up) and a ``refused`` placement raises its
@@ -398,6 +398,8 @@ def tool_placement() -> str:
     where = placement.resolve()
     if where.where == placement.REFUSED:
         raise RuntimeError(where.reason)
+    if expected_sandbox is not None and (where.where == placement.TERMINAL) != expected_sandbox:
+        raise RuntimeError("The desktop placement changed; start a new computer-use session")
     if where.where == placement.GATEWAY:
         return placement.GATEWAY
     if not sandbox_screen_running() or not published_env().get("DISPLAY"):
@@ -579,7 +581,7 @@ def sandbox_screen_running() -> bool:
     return False
 
 
-def _owned_sandbox_env():
+def _owned_sandbox_env(*, reattach: bool = True):
     """The environment hosting the screen the marker records, re-attaching after a restart when the recorded
     sandbox is still alive; None when there is no marker or its sandbox is gone. Never builds a sandbox for
     a screen that is not there."""
@@ -590,7 +592,7 @@ def _owned_sandbox_env():
     env = _sandbox_env(create=False)
     if env is not None:
         return env
-    if sandbox_host.marker_sandbox_alive(marker):
+    if reattach and sandbox_host.marker_sandbox_alive(marker):
         return _sandbox_env(create=True)
     return None
 
@@ -648,16 +650,35 @@ def status(profile: Optional[str] = None) -> DesktopStatus:
 
 
 def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
-    """Status of a sandbox-placed screen. Package presence is only known once the sandbox exists; before
-    that the pane shows "installed" with the image hint carried in ``install_command`` so Start can explain."""
+    """Inspect sandbox dependencies, retaining native owner reattachment.
+    Unavailable dependencies remain unknown; never install host dependencies here."""
     from tools.bot_desktop import sandbox_host
-    env = _owned_sandbox_env() or _sandbox_env(create=False)
-    missing = sandbox_host.missing_binaries(env) if env is not None else []
-    published = sandbox_host.published_env(env, profile or _profile_name()) if env is not None else {}
+    probe_error = None
+    display_error = None
+    missing = []
+    published = {}
+    inspection_failed = "Could not inspect desktop dependencies; check the terminal sandbox connection and retry."
+    try:
+        env = _owned_sandbox_env() or _sandbox_env(create=False)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        env = None
+        probe_error = inspection_failed
+    if env is None:
+        probe_error = probe_error or "Start the desktop to inspect its terminal sandbox dependencies."
+    else:
+        try:
+            missing = sandbox_host.missing_binaries(env)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            probe_error = inspection_failed
+        # A package probe cannot tell us whether the published screen is live.
+        try:
+            published = sandbox_host.published_env(env, profile or _profile_name(), strict=True)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            display_error = "Could not inspect the desktop display; check the terminal sandbox connection and retry."
     running = bool(published.get("DISPLAY"))
     # No install_command: the pane's Install button runs apt on the HOST, which is the wrong machine here.
     # A sandbox missing the stack is a blocker (shown in place of Start) naming the image that has it.
-    blocker = None
+    blocker = probe_error or display_error
     image_switch = None
     if missing:
         advice = sandbox_host.plugin_image_advice(where.backend) or (
@@ -679,7 +700,7 @@ def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
     return DesktopStatus(
         profile=profile or _profile_name(),
         supported=True,
-        installed=True,
+        installed=probe_error is None and not missing,
         missing=missing,
         running=running,
         pid=None,
@@ -875,6 +896,25 @@ def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
     (sd / "env").write_text("".join(f"{k}={v}\n" for k, v in published.items()), encoding="utf-8")
     touch_activity()
     return status()
+
+
+def tool_sandbox(*, reattach: bool = True):
+    """Read and act through the same verified environment that owns this profile's display."""
+    from tools.bot_desktop import sandbox_host
+
+    env = _owned_sandbox_env(reattach=reattach) or _sandbox_env(create=reattach)
+    if env is None:
+        raise RuntimeError("The recorded terminal desktop is unavailable; restore its terminal settings")
+    published = sandbox_host.published_env(env, _profile_name(), strict=True)
+    if not published.get("DISPLAY"):
+        raise RuntimeError("The terminal desktop screen is stopped; start it again")
+    return env, published
+
+
+def owns_tool_sandbox(env) -> bool:
+    """Revalidate a queued tool or companion operation without warming a new environment."""
+    return (env is not None and placement.resolve().where == placement.TERMINAL
+            and (_owned_sandbox_env(reattach=False) or _sandbox_env(create=False)) is env)
 
 
 def _sandbox_published_env() -> dict[str, str]:
