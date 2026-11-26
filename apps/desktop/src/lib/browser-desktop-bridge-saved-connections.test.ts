@@ -245,7 +245,7 @@ describe('a Webapp on a machine with saved gateway connections', () => {
   })
 
   it('follows the window onto a saved gateway for its host terminal and files', async () => {
-    servingGateway()
+    const requests = servingGateway()
     const desktop = install()
     await desktop.connections!.list()
     $connection.set({ ...(await desktop.getConnectionFor!({ connectionId: 'mini' })) })
@@ -274,6 +274,16 @@ describe('a Webapp on a machine with saved gateway connections', () => {
     expect(dialed[0]?.pathname).toBe('/hermes/api/relay/mini/api/host-terminal')
     expect(dialed[0]?.searchParams.has('ticket')).toBe(false)
     expect(dialed[0]?.searchParams.get('relay_ticket')).toBe('hub-relay')
+    expect(dialed[0]?.searchParams.has('cwd')).toBe(false)
+
+    $connection.set({ ...(await desktop.getConnectionFor!({ connectionId: 'local' })) })
+    await desktop.terminal.start({
+      restoreKey: 'explicit', connectionId: 'mini', profile: 'research', cwd: '/workspace/with space '
+    }).catch(() => undefined)
+    expect(dialed[1]?.pathname).toBe('/hermes/api/relay/mini/api/host-terminal')
+    expect(dialed[1]?.searchParams.get('profile')).toBe('research')
+    expect(dialed[1]?.searchParams.get('cwd')).toBe('/workspace/with space ')
+    expect(requests.some(request => request.path.endsWith('/api/fs/default-cwd'))).toBe(false)
 
     const stream = new URL(await desktop.getGatewayFileStreamUrl!({ connectionId: 'mini', path: '/tmp/a.png' }))
     expect(stream.pathname.startsWith('/hermes/api/relay/mini/')).toBe(true)
@@ -318,6 +328,7 @@ describe('a Webapp on a machine with saved gateway connections', () => {
     )
 
     const started = await desktop.terminal.start({ restoreKey: 'tab-1' })
+    expect(started.connectionId).toBe('mini')
     // A new chat on this gateway's own sidebar "+" moves the window; the shell stays on Mini.
     $connection.set({ ...onMini, connectionId: 'local' })
     await desktop.terminal.dispose(started.id)

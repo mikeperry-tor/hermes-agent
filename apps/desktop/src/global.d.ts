@@ -34,6 +34,7 @@ export type DesktopMachineProfile = MachineProfile
 
 declare global {
   interface Window {
+    __HERMES_TERMINAL_ENVIRONMENT__?: 'executor' | 'gateway' | null
     hermesDesktop: {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to dial/reuse that profile's
@@ -862,7 +863,7 @@ export interface DesktopMarketplaceThemeResult {
 export type HermesTerminalState = 'open' | 'reconnecting' | 'disconnected'
 
 export interface HermesTerminalSession {
-  /** Gateway the shell runs on (`local` = This device); Electron only. */
+  /** Gateway the shell runs on (`local` = This device). */
   connectionId?: null | string
   cwd: string
   id: string

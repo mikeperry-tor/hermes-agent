@@ -2,22 +2,21 @@ import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import { computed } from 'nanostores'
 
 import type { DesktopConnectionsRegistry, DesktopRegistryConnection } from '@/global'
-import { $activeConnectionId, $connectionsRegistry } from '@/store/connections'
+import { isBrowserHostedDesktop } from '@/lib/platform'
+import { $connectionsRegistry } from '@/store/connections'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $connection } from '@/store/session'
 
-import { bindTerminalDefaultGateway, forgetRemovedTerminalGateways, type TerminalEntry } from './terminals'
+import { bindTerminalDefaultGateway, browserTerminalGateway, forgetRemovedTerminalGateways, type TerminalEntry } from './terminals'
 
-/** The gateway a terminal tab was opened on. Only This device and SSH gateways
- *  carry a shell; the SSH tunnel is keyed by (connection, profile). */
+/** The gateway a terminal tab was opened on, and any profile selected for its shell. */
 export interface TerminalGateway {
   connectionId: string
   profile?: string
 }
 
-/** Where a shell for `connectionId` runs: an SSH gateway runs it on its own
- *  host; This device, URL/token and cloud gateways (no shell transport) run it
- *  here and say so. Undefined while the registry is unknown (or on a host with
- *  none, like the Webapp), so main keeps routing by the window. */
+/** Resolve an explicitly selected host. In Webapp, This device selects the
+ *  profile serving the page, independent of the active remote connection. */
 export function shellGatewayFor(
   connectionId: null | string | undefined,
   profile: null | string | undefined,
@@ -29,6 +28,10 @@ export function shellGatewayFor(
     return undefined
   }
 
+  if (isBrowserHostedDesktop() && source.kind === 'local') {
+    return { connectionId: LOCAL_CONNECTION_ID, profile: 'current' }
+  }
+
   return source.kind === 'ssh'
     ? { connectionId: source.id, profile: normalizeProfileKey(profile) }
     : { connectionId: LOCAL_CONNECTION_ID }
@@ -36,15 +39,14 @@ export function shellGatewayFor(
 
 /** A new terminal opens on the gateway picked in Sessions. */
 const $defaultTerminalGateway = computed(
-  [$activeConnectionId, $activeGatewayProfile, $connectionsRegistry],
-  shellGatewayFor
+  [$connection, $activeGatewayProfile, $connectionsRegistry],
+  (connection, profile, registry) => browserTerminalGateway() ?? shellGatewayFor(connection?.connectionId, profile, registry)
 )
 
 export const defaultTerminalGateway = () => $defaultTerminalGateway.get()
 
-/** The tab's shell rides an SSH gateway's tunnel (only SSH gateways keep a
- *  connection id other than This device on a tab). */
-export const runsOverSsh = (gateway: TerminalGateway | undefined): boolean =>
+/** A tab on a remote gateway can retry startup on that gateway. */
+export const runsOnRemoteGateway = (gateway: TerminalGateway | undefined): boolean =>
   Boolean(gateway && gateway.connectionId !== LOCAL_CONNECTION_ID)
 
 // New tabs record this gateway, and entering a session re-selects a tab in its
