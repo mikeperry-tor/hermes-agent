@@ -8,6 +8,9 @@ so ``_open_external_editor`` chains a done-callback that calls
 """
 
 import queue
+from unittest.mock import Mock
+
+import pytest
 
 from cli import HermesCLI
 
@@ -53,13 +56,18 @@ def test_running_interrupt_mode_uses_interrupt_queue():
     assert c._pending_input.empty()
 
 
-def test_slash_command_dispatched_not_queued():
-    c = _make()
-    seen = {}
-    c.process_command = lambda command: seen.setdefault("cmd", command) or True
-    buf = _FakeBuf("/status")
+@pytest.mark.parametrize("command", ["!pwd", "/status", "/executor-pwd"])
+def test_editor_command_goes_to_repl_worker(command):
+    c = _make(agent_running=True, busy="interrupt")
+    c._app = Mock()
+    c.handle_bang_shell = Mock()
+    c.process_command = Mock()
+    buf = _FakeBuf(command)
 
     c._submit_editor_buffer(buf)
 
-    assert seen.get("cmd") == "/status"
-    assert c._pending_input.empty()
+    assert c._pending_input.get_nowait() == command
+    assert c._interrupt_queue.empty()
+    assert buf.reset_called
+    c.handle_bang_shell.assert_not_called()
+    c.process_command.assert_not_called()

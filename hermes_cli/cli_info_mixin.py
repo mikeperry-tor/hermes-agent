@@ -533,7 +533,9 @@ class CLIInfoMixin:
         from hermes_cli.bang_shell import (
             DEFAULT_TIMEOUT, USAGE_HINT, bang_shell_enabled, check_bang_approval, is_bang_command,
             parse_bang_command, resolve_bang_cwd, run_bang_command)
-        from hermes_cli.managed_operator_shell import OperatorShellUnavailable, classic_shell_cwd, placement, run_executor
+        from hermes_cli.managed_operator_shell import (
+            OperatorShellUnavailable, classic_shell_cwd, placement, run_classic_executor,
+        )
 
         if not is_bang_command(text):
             return False
@@ -562,13 +564,13 @@ class CLIInfoMixin:
 
         try:
             selected = placement()
-            cwd = classic_shell_cwd(self, selected) if selected is not None else None
             if selected is None:
                 exit_code = run_bang_command(command, cwd=resolve_bang_cwd(session_id), writer=emit)
             elif selected.mode == "gateway":
+                cwd = classic_shell_cwd(self, selected)
                 exit_code = run_bang_command(command, cwd=cwd, writer=emit, strict_cwd=True)
             else:
-                result = run_executor(selected, command, cwd, timeout=DEFAULT_TIMEOUT, emit=emit)
+                result = run_classic_executor(self, selected, command, timeout=DEFAULT_TIMEOUT, emit=emit)
                 for line in result.stderr.splitlines():
                     emit(line)
                 exit_code = result.returncode

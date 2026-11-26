@@ -162,14 +162,14 @@ def test_classic_interactive_shell_checks_its_owner_before_running(monkeypatch, 
     selected = shell.Placement(mode, {})
     owner_cwd = "/executor workspace ${literal}"
     call = Mock(return_value={"environment": mode, "cwd": owner_cwd})
-    run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+    run = AsyncMock(return_value=subprocess.CompletedProcess([], 0, "", ""))
     run_local = Mock(return_value=0)
     monkeypatch.setattr(bang_shell, "bang_shell_enabled", lambda: True)
     monkeypatch.setattr(bang_shell, "check_bang_approval", lambda _: {"approved": True})
     monkeypatch.setattr(bang_shell, "run_bang_command", run_local)
     monkeypatch.setattr(gateway_side, "connection_for", lambda _: SimpleNamespace(call=call))
     monkeypatch.setattr(shell, "placement", lambda: selected)
-    monkeypatch.setattr(shell, "run_executor", run)
+    monkeypatch.setattr(shell, "run_executor_async", run)
 
     def invoke():
         if action == "bang":
@@ -178,14 +178,17 @@ def test_classic_interactive_shell_checks_its_owner_before_running(monkeypatch, 
 
     assert invoke()
     params = {"executor": True} if mode == "gateway" and action == "quick" else {}
-    call.assert_called_once_with("shell.cwd", session_id="stored-id", **params)
+    call.assert_called_once_with("shell.cwd", session_id="stored-id", abandon=call.call_args.kwargs["abandon"],
+                                 **params)
     if mode == "gateway" and action == "bang":
         assert run_local.call_args.args == ("pwd",)
         assert run_local.call_args.kwargs["cwd"] == owner_cwd
         assert run_local.call_args.kwargs["strict_cwd"] is True
+        assert call.call_args.kwargs["abandon"] is None
         run.assert_not_called()
     else:
         assert run.call_args.args == (selected, "pwd", owner_cwd)
+        assert callable(call.call_args.kwargs["abandon"])
         run_local.assert_not_called()
 
     run.reset_mock()
@@ -202,3 +205,25 @@ def test_classic_interactive_shell_checks_its_owner_before_running(monkeypatch, 
     assert invoke()
     run.assert_not_called()
     run_local.assert_not_called()
+
+
+def test_classic_ssh_cancel_during_owner_lookup_starts_no_shell(monkeypatch):
+    from hermes_cli import gateway_side
+
+    cli = SimpleNamespace(session_id="stored-id")
+
+    def lookup(method, *, abandon, **params):
+        assert not abandon()
+        cli._operator_shell_interrupt()
+        assert abandon()
+        return {"environment": "executor", "cwd": None}
+
+    run = AsyncMock()
+    monkeypatch.setattr(gateway_side, "connection_for", lambda _: SimpleNamespace(call=lookup))
+    monkeypatch.setattr(shell, "run_executor_async", run)
+
+    with pytest.raises(KeyboardInterrupt):
+        shell.run_classic_executor(cli, shell.Placement("executor", {}), "pwd", timeout=30)
+
+    run.assert_not_called()
+    assert cli._operator_shell_interrupt is None

@@ -5,9 +5,11 @@ GatewayConnection kept its finished loop thread, so after a gateway restart ever
 gateway. Each prompt then failed with copy that read as a model failure ("Run /model to switch").
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import types
 from contextlib import asynccontextmanager
+from unittest.mock import Mock
 
 import pytest
 from websockets.protocol import State
@@ -15,7 +17,7 @@ from websockets.protocol import State
 from hermes_cli.cli_chat_error_copy import chat_error_response
 from hermes_cli.gateway_agent import GatewayAgent
 from hermes_cli.gateway_client import GatewayClientError
-from hermes_cli.gateway_connection import GatewayConnection, lost_before
+from hermes_cli.gateway_connection import CallStopped, GatewayConnection, lost_before
 
 SID = "local-abc"
 
@@ -114,6 +116,69 @@ def test_the_next_call_after_a_restart_reconnects_and_resubscribes(gateway, conn
     assert conn.state(SID).subscription_id == "sub-2"
     lost = conn.events.get_nowait()
     assert isinstance(lost, GatewayClientError) and lost_before(lost, conn.epoch)
+
+
+def test_abandoning_a_call_during_redial_leaves_reconnect_available(gateway, conn):
+    gateway.hang_up(conn)
+    gateway.dialing.clear()
+    gateway.hold = threading.Event()
+    stop = threading.Event()
+    with ThreadPoolExecutor() as callers:
+        try:
+            pending = callers.submit(conn.call, "shell.cwd", session_id=SID, abandon=stop.is_set)
+            assert gateway.dialing.wait(2)
+            stop.set()
+            with pytest.raises(CallStopped):
+                pending.result(timeout=2)
+        finally:
+            gateway.hold.set()
+
+    assert conn.call("status") == {"status": "ok", "life": 2}
+    assert [method for method, _ in gateway.lives[1].calls] == ["session.resume", "status"]
+
+
+@pytest.mark.parametrize("retiring", [False, True])
+def test_disconnect_at_start_deadline_does_not_open_a_new_connection(monkeypatch, retiring):
+    from hermes_cli import gateway_connection
+
+    connection = GatewayConnection()
+    clock = 0.0
+    alive = True
+
+    def finish(timeout):
+        nonlocal clock, alive
+        clock += timeout
+        alive = False
+        connection.closed = True
+
+    connection._ready.set()
+    connection.closed = retiring
+    connection._thread = types.SimpleNamespace(join=finish, is_alive=lambda: alive)
+    start_thread = Mock(side_effect=AssertionError("redial after deadline"))
+    monkeypatch.setattr(gateway_connection, "time", types.SimpleNamespace(monotonic=lambda: clock))
+    monkeypatch.setattr("agent.memory_provider.spawn_context_thread", start_thread)
+
+    with pytest.raises(GatewayClientError, match="Gateway connection timed out"):
+        connection.start(timeout=1)
+
+    start_thread.assert_not_called()
+
+
+def test_redial_checks_deadline_before_replacing_a_dead_thread(monkeypatch):
+    from hermes_cli import gateway_connection
+
+    connection = GatewayConnection()
+    connection.closed = True
+    connection._thread = types.SimpleNamespace(is_alive=lambda: False)
+    elapsed = iter([0.0, 1.0])
+    start_thread = Mock(side_effect=AssertionError("redial after deadline"))
+    monkeypatch.setattr(gateway_connection, "time", types.SimpleNamespace(monotonic=lambda: next(elapsed)))
+    monkeypatch.setattr("agent.memory_provider.spawn_context_thread", start_thread)
+
+    with pytest.raises(GatewayClientError, match="Gateway connection timed out"):
+        connection.start(timeout=1)
+
+    start_thread.assert_not_called()
 
 
 def test_close_ends_the_viewer_for_good(gateway, conn):
