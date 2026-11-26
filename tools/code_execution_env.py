@@ -314,3 +314,48 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
         if candidate and os.path.isdir(candidate):
             return candidate
     return staging_dir
+
+
+def managed_python_terminal(config: dict) -> dict | None:
+    """Check the effective Python backend against the administrator's SSH settings."""
+    from hermes_cli.ssh_project_probe import managed_project_access
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    fields = ("ssh_host", "ssh_user", "ssh_port", "ssh_key", "ssh_config")
+    terminal = {"TERMINAL_" + name.upper(): str(config[name]) for name in fields if name in config}
+    terminal.update(TERMINAL_ENV=config["env_type"], TERMINAL_CWD=config.get("cwd", ""))
+    access = managed_project_access(terminal)
+    if access is None:
+        return None
+    _, pinned = access
+    if pinned != terminal:
+        raise SshWorkspaceFsError("ECONN", "Python requires the pinned SSH executor endpoint.")
+    return pinned
+
+
+def managed_python_directory(terminal: dict) -> str:
+    """Verify the selected directory on SSH without probing the Hermes filesystem."""
+    from hermes_cli.ssh_project_probe import inspect_managed_project
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_constants import get_hermes_home
+
+    selected = terminal.get("TERMINAL_CWD")
+    if selected in ("", ".", "auto", "cwd", "~"):
+        selected = None
+    project = inspect_managed_project(terminal, selected, profile_key=str(get_hermes_home()))
+    if project is None or any(project[1].get(key) != terminal[key]
+                              for key in terminal if key.startswith("TERMINAL_SSH_")):
+        raise SshWorkspaceFsError("ECONN", "The pinned SSH executor endpoint changed. Retry the Python call.")
+    cwd = project[0]["cwd"]
+    if selected is not None and cwd != selected:
+        raise SshWorkspaceFsError("EINVAL", "The selected SSH project changed. Select the project again.")
+    return cwd
+
+
+def require_managed_python_executor(env, env_type: str, terminal: dict) -> None:
+    """Reject a previously cached environment tied to a different backend or endpoint."""
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from tools.environments.ssh import SSHEnvironment
+
+    if env_type != "ssh" or not isinstance(env, SSHEnvironment) or not env.matches_terminal_endpoint(terminal):
+        raise SshWorkspaceFsError("ECONN", "Python requires the pinned SSH executor endpoint.")
