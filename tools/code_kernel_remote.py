@@ -116,6 +116,7 @@ class RemoteKernel:
     pid: str
     rpc_token: str
     owner: str
+    project_cwd: str | None = None
     last_used: float = field(default_factory=time.monotonic)
     execution_count: int = 0
     cell_seq: int = 0
@@ -232,8 +233,8 @@ def _evict_over_cap_unlocked(keep: tuple) -> list[RemoteKernel]:
 atexit.register(shutdown_all_remote_kernels)
 
 
-def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
-                         sandbox_tools: frozenset, *, idle_exit: int) -> Optional[RemoteKernel]:
+def _spawn_remote_kernel(env, env_type: str, owner: str, sandbox_tools: frozenset, *, idle_exit: int,
+                         project_cwd: str | None = None) -> Optional[RemoteKernel]:
     """Start a detached kernel runner on the remote. None on failure (dir removed)."""
     from tools.code_execution_tool import (
         MAX_STDOUT_BYTES, _env_temp_dir,
@@ -260,11 +261,12 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         # lifetime. runner.log is pre-created 600 so the launch redirect never
         # lands at the remote's default umask. The inner `&` stays inside the
         # subshell where `$!` resolves to the runner pid.
+        q_env, q_log = f"{q_dir}/kernel.env", f"{q_dir}/runner.log"
         launch_cmd = _ship_env_file_and_launch(
             env, kernel_dir, "kernel.env",
-            "rm -f ./kernel.env && touch runner.log && chmod 600 runner.log && "
-            '{ nohup python3 kernel_runner.py > runner.log 2>&1 & echo "PID:$!"; }',
-            rpc_dir=f"{kernel_dir}/rpc", rpc_token=rpc_token,
+            f"rm -f -- {q_env} && touch -- {q_log} && chmod 600 -- {q_log} && "
+            f'{{ nohup python3 {q_dir}/kernel_runner.py > {q_log} 2>&1 & echo "PID:$!"; }}',
+            rpc_dir=f"{kernel_dir}/rpc", rpc_token=rpc_token, project_cwd=project_cwd,
             HERMES_KERNEL_DIR=kernel_dir, PYTHONPATH=kernel_dir)
         started = _sh(env, launch_cmd, timeout=20)
         pid = next((line.strip()[4:].strip() for line in started.splitlines()
@@ -273,7 +275,7 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
             logger.warning("remote kernel spawn returned no PID: %r", started)
         else:
             candidate = RemoteKernel(env=env, env_type=env_type, kernel_dir=kernel_dir,
-                                     pid=pid, rpc_token=rpc_token, owner=owner)
+                                     pid=pid, rpc_token=rpc_token, owner=owner, project_cwd=project_cwd)
             if candidate.is_alive():
                 kernel = candidate
             else:
@@ -294,19 +296,34 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
     return kernel
 
 
-def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
-                           sandbox_tools: frozenset, *, reset: bool,
-                           idle_exit: int) -> tuple[Optional[RemoteKernel], bool, bool, bool]:
+def _acquire_remote_kernel(env, key: tuple, sandbox_tools: frozenset, *, reset: bool,
+                           idle_exit: int, project_cwd: str | None, terminal_endpoint: dict | None,
+                           ) -> tuple[Optional[RemoteKernel], bool, bool, bool]:
     """Find/respawn the owner's kernel: (kernel|None, reused, state_reset, state_lost); reaps
     idle-expired entries on the way in."""
+    from tools.environments.ssh import SSHEnvironment
     from tools.environments.sandbox_scope import hosted_scope
     owner_scope = hosted_scope()
-    key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
+    owner, _, env_type, _, _ = key
     state_lost = state_reset = False
     with _REGISTRY.lock:
         expired = _reap_unlocked(idle_exit)
+        moved = [
+            _REMOTE_KERNELS.pop(old_key)
+            for old_key, previous in list(_REMOTE_KERNELS.items())
+            if old_key[:-1] == key[:-1] and (
+                previous.project_cwd != project_cwd
+                or (terminal_endpoint is not None and (
+                    not isinstance(previous.env, SSHEnvironment)
+                    or not previous.env.matches_terminal_endpoint(terminal_endpoint)
+                ))
+            )
+        ]
         kernel = _REMOTE_KERNELS.get(key)
-    for doomed in expired:
+        if kernel is not None and terminal_endpoint is not None:
+            kernel.env = env
+    state_reset = bool(moved)
+    for doomed in expired + moved:
         doomed.kill()
     if kernel is not None and reset:
         _REGISTRY.discard(key, kernel)
@@ -319,7 +336,8 @@ def _acquire_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         kernel, state_lost = None, True
     reused = kernel is not None
     if kernel is None:
-        kernel = _spawn_remote_kernel(env, env_type, owner, task_env_id, sandbox_tools, idle_exit=idle_exit)
+        kernel = _spawn_remote_kernel(env, env_type, owner, sandbox_tools,
+                                      idle_exit=idle_exit, project_cwd=project_cwd)
         if kernel is not None:
             from agent.delegation_context import is_delegated_child_context
             kernel.pinned = is_delegated_child_context()
@@ -366,17 +384,21 @@ def execute_in_remote_kernel(
     code: str, *, env, env_type: str, task_env_id: str, sandbox_tools: frozenset,
     timeout: int, max_tool_calls: int, reset: bool, idle_exit: int = 1800,
     session_id: str | None = None, turn_id: str | None = None, conversation_id: str | None = None,
+    project_cwd: str | None = None,
+    environment_id: str | None = None,
+    terminal_endpoint: dict | None = None,
 ) -> Optional[dict[str, Any]]:
     """Run one cell in the owner's remote kernel. Returns the raw cell result dict (caller
     post-processes output), or ``None`` when no kernel could be spawned (caller falls open to
     per-call). ``state_lost``/``state_reset``/``reused`` ride in the ``kernel`` sub-dict."""
     from tools.code_kernel import _resolve_owner
     owner = _resolve_owner(task_env_id)
+    key = _kernel_key(owner, env_type, environment_id or task_env_id, sandbox_tools)
     kernel, reused, state_reset, state_lost = _acquire_remote_kernel(
-        env, env_type, owner, task_env_id, sandbox_tools, reset=reset, idle_exit=idle_exit)
+        env, key, sandbox_tools, reset=reset, idle_exit=idle_exit, project_cwd=project_cwd,
+        terminal_endpoint=terminal_endpoint)
     if kernel is None:
         return None  # fail open to per-call
-    key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
     kernel.last_used = time.monotonic()
     with _REGISTRY.lock:
         kernel.attached += 1
@@ -422,11 +444,8 @@ def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task
     try:
         cell_status, cell_payload = _run_remote_cell(kernel, code, timeout)
     except Exception:
-        # The atomic ship is the only remote call here that can raise (the poll
-        # and result cleanup are best-effort), so the request never reached the runner and the
-        # caller's per-call fallback runs the code exactly once. Kill the
-        # kernel as the timeout path does: leaving it registered would let the
-        # next call reuse a kernel whose state silently missed this cell.
+        # SSH can lose the acknowledgement after the request has been published.
+        # Discard the kernel and report the error without submitting the cell again.
         _REGISTRY.discard(key, kernel)
         raise
     finally:

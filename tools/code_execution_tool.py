@@ -28,7 +28,10 @@ from tools.thread_context import propagate_context_to_thread
 from tools.registry import registry, tool_error
 
 from hermes_time import get_timezone_name
-from tools.code_execution_env import _resolve_child_cwd, _resolve_child_python
+from tools.code_execution_env import (
+    _resolve_child_cwd, _resolve_child_python, managed_python_directory,
+    managed_python_terminal, require_managed_python_executor,
+)
 from tools.code_execution_rpc import (
     _execute_checked, _private_dirs_cmd, _remote_write, _rpc_poll_loop, tool_errors_since,
 )
@@ -462,7 +465,8 @@ def _get_or_create_env(task_id: str):
 
 
 def _ship_env_file_and_launch(env, remote_dir: str, env_name: str, launch: str, *,
-                              rpc_dir: str, rpc_token: str, **extra_env: str) -> str:
+                              rpc_dir: str, rpc_token: str, project_cwd: str | None = None,
+                              **extra_env: str) -> str:
     """Ship the sandbox env (RPC dir + token, PYTHONDONTWRITEBYTECODE, the routed
     profile's TZ, plus *extra_env*) as KEY=value lines to ``remote_dir/env_name``
     and return the complete command that sources it inside a subshell and runs
@@ -485,6 +489,8 @@ def _ship_env_file_and_launch(env, remote_dir: str, env_name: str, launch: str, 
         env_map["TZ"] = tz
     lines = "".join(f"{k}={shlex.quote(v)}\n" for k, v in env_map.items())
     _remote_write(env, f"{remote_dir}/{env_name}", lines, check=True)
+    if project_cwd is not None:
+        launch = f"cd -- {shlex.quote(project_cwd)} && {launch}"
     return (f"( cd {shlex.quote(remote_dir)} && "
             f"set -a && . ./{env_name} && set +a && {launch} )")
 
@@ -606,7 +612,8 @@ def _sandbox_tools_for(enabled_tools: Optional[list[str]]) -> frozenset:
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          sandbox_tools: frozenset, *, timeout: int, max_tool_calls: int,
                          exec_start: float, session_id: Optional[str] = None,
-                         turn_id: Optional[str] = None, conversation_id: Optional[str] = None) -> str:
+                         turn_id: Optional[str] = None, conversation_id: Optional[str] = None,
+                         project_cwd: str | None = None, managed: bool = False) -> str:
     """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
     serve file-RPC from a polling thread, run, clean up."""
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
@@ -633,11 +640,12 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         # The token travels in a sourced env file, never in argv. No umask on
         # the launch command: the 700 dirs + explicit 0600 writes cover Hermes'
         # files, and user code keeps the remote's default file modes.
+        script_path = f"{quoted_sandbox_dir}/script.py" if project_cwd is not None else "script.py"
         launch_cmd = _ship_env_file_and_launch(
-            env, sandbox_dir, "sandbox.env", "exec python3 script.py",
-            rpc_dir=f"{sandbox_dir}/rpc", rpc_token=rpc_token)
+            env, sandbox_dir, "sandbox.env", f"exec python3 {script_path}",
+            rpc_dir=f"{sandbox_dir}/rpc", rpc_token=rpc_token, project_cwd=project_cwd)
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
-        script_result = env.execute(launch_cmd, timeout=timeout)
+        script_result = env.execute(launch_cmd, cwd="/" if managed or project_cwd is not None else None, timeout=timeout)
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
         # Backend exit codes: 124 = timeout wrapper, 130 = SIGINT.
@@ -671,7 +679,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
 
 def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[list[str]],
                     reset: bool = False, session_id: Optional[str] = None,
-                    turn_id: Optional[str] = None, conversation_id: Optional[str] = None) -> str:
+                    turn_id: Optional[str] = None, conversation_id: Optional[str] = None,
+                    managed_terminal: dict | None = None) -> str:
     """Run code on the remote terminal backend: the owner's persistent remote session kernel
     (tools/code_kernel_remote.py) first, else the per-call script ship — the fail-open route when
     a kernel cannot be spawned and the only route for hosts that cannot sustain a background process."""
@@ -680,10 +689,16 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[l
     _cfg = _load_config()
     timeout, max_tool_calls = _cfg.get("timeout", DEFAULT_TIMEOUT), _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
     sandbox_tools, effective_task_id = _sandbox_tools_for(enabled_tools), task_id or "default"
-    env, env_type = _get_or_create_env(effective_task_id)
-    with _call_in_flight(_resolve_container_task_id(effective_task_id)):
+    environment_id = _resolve_container_task_id(effective_task_id)
+    with _call_in_flight(environment_id):
         exec_start = time.monotonic()
         try:
+            project_cwd = None
+            if managed_terminal is not None and _get_execution_mode() == "project":
+                project_cwd = managed_python_directory(managed_terminal)
+            env, env_type = _get_or_create_env(effective_task_id)
+            if managed_terminal is not None:
+                require_managed_python_executor(env, env_type, managed_terminal)
             py_check = env.execute("command -v python3 >/dev/null 2>&1 && echo OK", cwd="/", timeout=15)
             if "OK" not in py_check.get("output", ""):
                 return _error_result(f"Python 3 is not available in the {env_type} terminal "
@@ -691,21 +706,17 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[l
             # Session-kernel path: one persistent kernel per owner on the
             # run-to-completion transport. Spawn failure falls OPEN to the per-call
             # path below so a degraded remote host never blocks execution.
-            try:
-                # --- Session-kernel path (hermes-agent#96873) ------------------- Same always-on model as
-                # local: one persistent kernel per owner, rebuilt on the run-to-completion transport (detached
-                # runner + file cell protocol).
-                from tools.code_kernel_remote import execute_in_remote_kernel
-                kernel_result = execute_in_remote_kernel(
-                    code, env=env, env_type=env_type, task_env_id=effective_task_id,
-                    sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
-                    max_tool_calls=max_tool_calls, reset=bool(reset),
-                    idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
-                    session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
-                )
-            except Exception:
-                logger.warning("remote session-kernel path failed; falling back to per-call", exc_info=True)
-                kernel_result = None
+            from tools.code_kernel_remote import execute_in_remote_kernel
+            kernel_result = execute_in_remote_kernel(
+                code, env=env, env_type=env_type, task_env_id=effective_task_id,
+                sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
+                max_tool_calls=max_tool_calls, reset=bool(reset),
+                idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
+                session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
+                project_cwd=project_cwd,
+                environment_id=environment_id if managed_terminal is not None else None,
+                terminal_endpoint=managed_terminal,
+            )
             if kernel_result is not None:
                 return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start, env=env)
             logger.info("remote session kernel unavailable on %s; using per-call path", env_type)
@@ -713,7 +724,8 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[l
             return _remote_failure(exc, exec_start, 0)
         return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
                                     timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start,
-                                    session_id=session_id, turn_id=turn_id, conversation_id=conversation_id)
+                                    session_id=session_id, turn_id=turn_id, conversation_id=conversation_id,
+                                    project_cwd=project_cwd, managed=managed_terminal is not None)
 
 
 # ---- Main entry point ----
@@ -769,8 +781,13 @@ def execute_code(
         if (_rejection := lifecycle_guard_rejection(code)) is not None:
             return tool_error(_rejection)
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    try:
+        managed_terminal = managed_python_terminal(_env_config)
+    except SshWorkspaceFsError as exc:
+        return tool_error(f"execute_code refused: {exc}")
     # Arbitrary Python never passes through terminal()/DANGEROUS_PATTERNS, so guard the whole
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
@@ -791,7 +808,7 @@ def execute_code(
     if env_type != "local" or hosted_scope() is not None:
         return record_execution_backend("code", "remote", _execute_remote(
             code, task_id, enabled_tools, reset=bool(reset), session_id=session_id, turn_id=turn_id,
-            conversation_id=conversation_id))
+            conversation_id=conversation_id, managed_terminal=managed_terminal))
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
