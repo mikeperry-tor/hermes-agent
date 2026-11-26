@@ -43446,6 +43446,93 @@
         "title": "SharedMetricsUpdateRunResult",
         "type": "object"
       },
+      "ShellCancelParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ShellCancelParams",
+        "type": "object"
+      },
+      "ShellCwdParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "executor": {
+            "default": false,
+            "title": "Executor",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ShellCwdParams",
+        "type": "object"
+      },
+      "ShellCwdResult": {
+        "additionalProperties": false,
+        "properties": {
+          "environment": {
+            "enum": [
+              "executor",
+              "gateway"
+            ],
+            "title": "Environment",
+            "type": "string"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cwd"
+          }
+        },
+        "required": [
+          "environment",
+          "cwd"
+        ],
+        "title": "ShellCwdResult",
+        "type": "object"
+      },
       "ShellExecParams": {
         "additionalProperties": false,
         "properties": {
@@ -46537,6 +46624,68 @@
           "chunk"
         ],
         "title": "TerminalOutputPayload",
+        "type": "object"
+      },
+      "TerminalReadRequestParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "start": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Start"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Count"
+          },
+          "owner_profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Owner Profile"
+          },
+          "relay_read_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Relay Read Scope"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "TerminalReadRequestParams",
         "type": "object"
       },
       "TerminalResizeParams": {
@@ -51646,8 +51795,44 @@
       }
     },
     {
+      "name": "shell.cancel",
+      "summary": "Cancel pending shell commands that this WebSocket submitted for the session.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ShellCancelParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/EmptyResult"
+        }
+      }
+    },
+    {
+      "name": "shell.cwd",
+      "summary": "Read the session owner's directory for a managed local operator shell.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/ShellCwdParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ShellCwdResult"
+        }
+      }
+    },
+    {
       "name": "shell.exec",
-      "summary": "Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one safe command for a local session, in its frozen launch cwd (``gateway/session_shell.py``).",
+      "summary": "Run one approved shell command for a local session with the owner's terminal placement.",
       "params": [
         {
           "name": "params",
@@ -51890,7 +52075,7 @@
         {
           "name": "params",
           "schema": {
-            "$ref": "#/components/schemas/ReadRangeRequestParams"
+            "$ref": "#/components/schemas/TerminalReadRequestParams"
           }
         }
       ],

@@ -214,6 +214,12 @@ class GatewayInboundHooksMixin:
             return refused
         proc = None
         try:
+            from hermes_cli.managed_operator_shell import OperatorShellUnavailable, placement
+            try:
+                if placement() is not None:
+                    return t("gateway.quick_command.error", error="Use a local operator chat to run a managed shortcut.")
+            except OperatorShellUnavailable as exc:
+                return t("gateway.quick_command.error", error=exc)
             from tools.environments.local import build_subprocess_env
             proc = await asyncio.create_subprocess_shell(
                 exec_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

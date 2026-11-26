@@ -8,10 +8,12 @@ known to emit plus ``extra="allow"`` so a new upstream key never trips the stric
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, StrictBool
 
 from .base import JsonValue, Params, Result, WireEnum
-from .common import UndoRollbackHint
+from .common import EmptyResult, UndoRollbackHint
 from .registry import canonical_method, method
 
 
@@ -178,8 +180,31 @@ class CanonicalShellExecParams(Params):
 
 
 canonical_method("shell.exec", params=CanonicalShellExecParams, result=ShellExecResult,
-                 doc="Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one safe command for a local session, in "
-                     "its frozen launch cwd (``gateway/session_shell.py``).")
+                 doc="Run one approved shell command for a local session with the owner's terminal placement.")
+
+
+class ShellCwdParams(Params):
+    session_id: str
+    profile: str | None = None
+    executor: StrictBool = False
+
+
+class ShellCwdResult(Result):
+    environment: Literal["executor", "gateway"]
+    cwd: str | None
+
+
+canonical_method("shell.cwd", params=ShellCwdParams, result=ShellCwdResult,
+                 doc="Read the session owner's directory for a managed local operator shell.")
+
+
+class ShellCancelParams(Params):
+    session_id: str
+    profile: str | None = None
+
+
+canonical_method("shell.cancel", params=ShellCancelParams, result=EmptyResult,
+                 doc="Cancel pending shell commands that this WebSocket submitted for the session.")
 
 
 class CliExecParams(Params):

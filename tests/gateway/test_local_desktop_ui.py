@@ -6,6 +6,7 @@ and process-registry sinks must reach the session's viewers, and be released wit
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -59,10 +60,12 @@ def window(monkeypatch):
 
     published, streamed, requests, silent = [], [], [], set()
     stream = SimpleNamespace(
+        lock=threading.RLock(),
         fanout=_Fanout(requests, silent),
         publish=lambda session_id, payload, *, event_type: streamed.append((session_id, event_type, payload)))
     from hermes_constants import get_hermes_home
-    authority = SimpleNamespace(sessions={"canon": SimpleNamespace(event_stream=stream)}, profile_id=str(get_hermes_home()))
+    authority = SimpleNamespace(sessions={"canon": SimpleNamespace(event_stream=stream, subscribers={})},
+                                profile_id=str(get_hermes_home()))
     turn = SimpleNamespace(
         _ctx=SimpleNamespace(session_id="phys", session_key="agent:main:local:dm:1"),
         _approval_owner=(authority, "canon", 1),
@@ -93,7 +96,7 @@ def test_gui_reads_are_server_requests_to_the_session_viewers(window):
     assert json.loads(window.agent.read_window_below_callback()) == {"app": "Finder"}
     assert json.loads(window.agent.drive_preview_callback({"action": "click"}))["success"] is True
     terminal = next(f for f in window.requests if f["method"] == "terminal.read")
-    assert terminal["params"] == {"session_id": "canon", "start": 0, "count": 2}
+    assert terminal["params"] == {"session_id": "canon", "start": 0, "count": 2, "owner_profile": "default"}
 
 
 def test_set_theme_applies_and_picks(window):

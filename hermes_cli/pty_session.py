@@ -243,6 +243,7 @@ class PtySession:
     async def attach(
         self, ws, *, force_redraw: bool = False,
         initial_text: Optional[str | Callable[[bool], str]] = None,
+        on_initial_text_sent: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Attach a browser terminal and replay buffered PTY output.
 
@@ -285,6 +286,8 @@ class PtySession:
                 if initial_text is not None:
                     text = initial_text(trimmed) if callable(initial_text) else initial_text
                     await asyncio.wait_for(ws.send_text(text), timeout=_VIEWER_SEND_TIMEOUT_SECONDS)
+                    if on_initial_text_sent is not None:
+                        on_initial_text_sent()
                 if self._ws is not ws:
                     return False
                 # Metadata-bearing host clients treat exactly the next binary

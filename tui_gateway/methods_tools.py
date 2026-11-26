@@ -483,6 +483,8 @@ def _dispatch_quick(rid, params, session, name, arg):
     if qc.get("type") == "exec":
         if refused := _tools_mod("hermes_cli.profiles_run_elsewhere").run_elsewhere_refusal():
             return _err(rid, 4018, refused)  # the backend a plugin runs elsewhere starts this profile's commands
+        if refusal := _tools_mod("hermes_cli.managed_operator_shell").managed_shell_refusal():
+            return _err(rid, *refusal)
         # Sanitized env: the TUI server process holds every API key in os.environ.
         env = _tools_mod("tools.environments.local").build_subprocess_env()
         r = subprocess.run(qc.get("command", ""), shell=True, env=env, **_capture_run_kwargs(30))
@@ -1954,6 +1956,8 @@ def _(rid, params: dict) -> dict:
     cmd = params.get("command", "")
     if not cmd:
         return _err(rid, 4004, "empty command")
+    if refusal := _tools_mod("hermes_cli.managed_operator_shell").managed_shell_refusal():
+        return _err(rid, *refusal)
     try:
         approval = _tools_mod("tools.approval_detection")
         is_hardline, hardline_desc = approval.detect_hardline_command(cmd)

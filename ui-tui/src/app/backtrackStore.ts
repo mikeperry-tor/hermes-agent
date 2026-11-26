@@ -10,6 +10,7 @@
 import { atom } from 'nanostores'
 
 import { t } from '../i18n/runtime.js'
+import { hasShellSubmission } from '../protocol/paste.js'
 
 import type { ComposerToken, RewindTarget } from './interfaces.js'
 
@@ -81,7 +82,7 @@ export function sendPendingRewind(submission: RewindSubmission, sid: null | stri
 
   const typed = submission.display
 
-  if (pending.sid !== sid || !typed.trim() || /^[/!]/.test(typed.trimStart())) {
+  if (pending.sid !== sid || !typed.trim() || typed.trimStart().startsWith('/') || hasShellSubmission(typed.trimStart(), submission.text)) {
     return false
   }
 

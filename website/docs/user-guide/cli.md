@@ -294,7 +294,7 @@ Start a line with `!` to run it as a shell command instead of sending it to the 
 
 - **Zero cost.** The model is never invoked — no API call, no tokens, no latency.
 - **Nothing enters the conversation.** The command and its output are not added to history, so your context stays clean and the prompt cache is untouched.
-- **Runs on your machine, in the session working directory.** With the default local terminal backend `!pwd` matches what the agent would see. A remote or sandboxed `terminal.backend` (`ssh`, `docker`, …) is **not** used for `!` commands — they always run on the host where Hermes itself runs, so `!hostname` names your machine while the agent's `terminal` tool names the backend. Ask the agent (or open a shell on the target) to run something *inside* the backend. Path completion in the composer, by contrast, does follow the configured backend and lists the target's filesystem.
+- **Uses the operator's shell placement.** The standalone classic CLI normally runs shell commands on its own host. The shared TUI permits them for local sessions with a local terminal backend. When the administrator configures a managed SSH executor and selects executor terminals, both interfaces run shell commands over SSH in the chat's executor directory. An administrator can select the gateway shell for operator commands while model tools continue using SSH.
 - **Approvals still apply.** A dangerous command (`rm -rf`, writes to `~/.hermes/config.yaml`, etc.) goes through the same approval prompt the agent's `terminal` tool uses. `!` is a cost/latency shortcut, not a security bypass.
 - **Non-zero exits are shown.** A failing command prints `! exited <code>` after its output.
 - `!` on its own prints a one-line usage reminder.
@@ -336,7 +336,7 @@ Commands are case-insensitive — `/HELP` works the same as `/help`. Installed s
 
 ## Quick Commands
 
-You can define custom commands that run shell commands instantly without invoking the LLM. These work in both the CLI and messaging platforms (Telegram, Discord, etc.).
+You can define custom commands that run shell commands without invoking the LLM. On a deployment with managed terminal placement, invoke `exec` shortcuts from a local operator chat. They use the SSH executor in either operator shell mode.
 
 ```yaml
 # ~/.hermes/config.yaml

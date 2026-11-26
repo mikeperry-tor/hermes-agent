@@ -40,6 +40,21 @@ async def probe():
             dangerous = await rpc(ws, 'shell.exec', session_id=sid, command='rm -rf /')
             receipt['dangerous'] = dangerous.get('error', dangerous.get('result'))
             receipt['sessionless'] = (await rpc(ws, 'shell.exec', command='pwd')).get('error', {}).get('code')
+            await ws.send(json.dumps({'jsonrpc': '2.0', 'id': 'long-command', 'method': 'shell.exec',
+                                      'params': {'session_id': sid, 'command': 'printf started > started; sleep 60'}}))
+            from tests.waiting import async_wait_until
+            await async_wait_until(lambda: (work / 'started').exists(), timeout=5)
+            async with socket('owner') as second:
+                assert (await rpc(second, 'shell.cancel', session_id=sid)).get('result') == {}
+            await ws.send(json.dumps({'jsonrpc': '2.0', 'id': 'cancel', 'method': 'shell.cancel',
+                                      'params': {'session_id': sid}}))
+            replies = {}
+            async with asyncio.timeout(5):
+                while replies.keys() != {'long-command', 'cancel'}:
+                    response = json.loads(await ws.recv())
+                    if response.get('id') in {'long-command', 'cancel'}:
+                        replies[response['id']] = response
+            receipt['cancellation'] = replies
     finally:
         await stop_gateway_api(api)
     (home / 'receipt.json').write_text(json.dumps(receipt))

@@ -1007,7 +1007,9 @@ class AuthorityConnection:
             settler.append(connection)
             return connection is not None
         # A person's answer is their input on this connection, for the profile that asked.
-        if not resolve(frame, session_ok=entitled, answered=lambda session_id: seen(settler[-1], session_id)):
+        if not resolve(frame, session_ok=entitled,
+                       answered=lambda session_id: seen(settler[-1], session_id),
+                       transport=self.transport):
             import logging
             what = 'a server request this connection may not settle' if asked else 'unknown server request'
             logging.getLogger(__name__).debug('dropping response for %s id=%r', what, frame.get('id'))

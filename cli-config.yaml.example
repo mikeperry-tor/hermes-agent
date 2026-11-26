@@ -4,6 +4,11 @@
 # This file configures CLI behavior; only documented secret environment
 # variables in .env take precedence over their corresponding settings.
 
+# Operator WebApp terminal placement. Restart the WebApp after changing it.
+# webapp:
+#   terminal_environment: gateway  # executor uses the selected profile's SSH backend
+#   executor_ssh_config: "/etc/hermes/executor-ssh.conf"  # optional, absolute path on the serving host
+
 # Schema version of this file. The installers copy it to seed config.yaml, and
 # `hermes update` uses it to know which one-time migrations the file already
 # has. Hermes manages it: do not copy it into another config.

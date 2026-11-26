@@ -167,8 +167,8 @@ def test_stop_typed_mid_turn_interrupts_the_turn_then_stops_processes(gateway, m
     cli = HermesCLI.__new__(HermesCLI)
     cli._agent_running, cli.agent = True, _Agent()
     buffer = SimpleNamespace(reset=lambda **_k: None)
-    event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer, invalidate=lambda: None))
-    assert cli._tui_enter_inline_command(event, "/stop", False) is True
+    app = SimpleNamespace(invalidate=lambda: None)
+    assert cli._tui_enter_inline_command(app, buffer, "/stop", False) is True
     assert stops == [None] and not stopped.is_set()  # interrupted; the UI thread did not wait on kill_all
     release.set()
     for worker in [t for t in threading.enumerate() if t.name == "cli-stop"]:

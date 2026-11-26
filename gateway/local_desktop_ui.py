@@ -209,14 +209,25 @@ def _setup_beat(turn, agent, payload):
 
 def _ask(turn, agent, method, params, timeout):
     """One ``ValueResult`` server request to the session's attached viewers; "" when none answered."""
-    from gateway.session_server_requests import ask_viewer
+    from gateway.session_server_requests import ask_viewer, may_settle
     authority, session_id, _generation = turn._approval_owner
     live = authority.sessions.get(session_id)
     if live is None:
         return ""
+    terminal_viewers = None
+    if method == "terminal.read":
+        from gateway.session_authorities import served_profile_name
+        registry = getattr(getattr(authority, "runner", None), "session_authorities", None)
+        profile = registry.profile_name(authority) if registry is not None else None
+        params = {**params, "owner_profile": profile or served_profile_name(authority.profile_id)}
+
+        def terminal_viewers():
+            return {authority.events.get(actor.transport_id) for actor in tuple(live.subscribers.values())
+                    if may_settle(authority, actor, session_id, live.event_stream)}
     # Automatic window requests (reads, a preview click, the tour) are not handed to a reconnecting
     # viewer again: a second delivery would repeat the action.
     value = ask_viewer(live.event_stream, session_id, method, dict(params), timeout=timeout, replay=False,
+                       terminal_viewers=terminal_viewers,
                        cancelled=lambda: bool(getattr(agent, "_interrupt_requested", False)))
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 

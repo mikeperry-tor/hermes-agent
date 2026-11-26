@@ -248,6 +248,12 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/managed_operator_shell.py",
+    "symbol": "executor_command",
+    "kind": "bare_which",
+    "reason": "managed operator shell looks up the system OpenSSH client in os.defpath on POSIX"
+  },
+  {
     "path": "hermes_cli/main_desktop.py",
     "symbol": "_desktop_linux_sandbox_fixup",
     "kind": "bare_which"

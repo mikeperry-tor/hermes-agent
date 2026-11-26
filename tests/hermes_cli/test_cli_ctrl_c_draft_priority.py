@@ -7,6 +7,7 @@ follow-up must not kill the in-flight turn; the next press on an empty prompt in
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.buffer import Buffer
@@ -51,3 +52,19 @@ def test_draft_is_cleared_before_a_running_turn_is_interrupted(monkeypatch, hand
 
     getattr(cli, handler)(event)
     assert interrupts == [cli.agent] and not cli._should_exit
+
+
+def test_ctrl_c_cancels_operator_shell_and_keeps_draft():
+    cli = _Cli()
+    cli._agent_running = False
+    cli._operator_shell_interrupt = Mock()
+    cli._tui_cancel_foreground_ui = Mock(return_value=True)
+    buffer = Buffer()
+    buffer.text = "half typed follow-up"
+    event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+
+    cli._tui_handle_ctrl_c(event)
+
+    cli._operator_shell_interrupt.assert_called_once_with()
+    cli._tui_cancel_foreground_ui.assert_not_called()
+    assert buffer.text == "half typed follow-up" and not cli._should_exit

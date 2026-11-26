@@ -11,6 +11,7 @@ import concurrent.futures
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import time
 from typing import Any, NamedTuple
@@ -535,8 +536,11 @@ class CLIInfoMixin:
         """
         from cli import _rich_text_from_ansi
         from hermes_cli.bang_shell import (
-            USAGE_HINT, bang_shell_enabled, check_bang_approval, is_bang_command,
+            DEFAULT_TIMEOUT, USAGE_HINT, bang_shell_enabled, check_bang_approval, is_bang_command,
             parse_bang_command, resolve_bang_cwd, run_bang_command)
+        from hermes_cli.managed_operator_shell import (
+            OperatorShellUnavailable, classic_shell_cwd, placement, run_classic_executor,
+        )
 
         if not is_bang_command(text):
             return False
@@ -558,10 +562,32 @@ class CLIInfoMixin:
             self._console_print(f"[bold red]{_escape(str(message))}[/]")
             return True
 
-        exit_code = run_bang_command(
-            command,
-            cwd=resolve_bang_cwd(getattr(self, "session_id", None)),
-            writer=lambda line: self._console_print(_rich_text_from_ansi(line)))
+        session_id = getattr(self, "session_id", None)
+
+        def emit(line):
+            self._console_print(_rich_text_from_ansi(line))
+
+        try:
+            selected = placement()
+            if selected is None:
+                exit_code = run_bang_command(command, cwd=resolve_bang_cwd(session_id), writer=emit)
+            elif selected.mode == "gateway":
+                cwd = classic_shell_cwd(self, selected)
+                exit_code = run_bang_command(command, cwd=cwd, writer=emit, strict_cwd=True)
+            else:
+                result = run_classic_executor(self, selected, command, timeout=DEFAULT_TIMEOUT, emit=emit)
+                for line in result.stderr.splitlines():
+                    emit(line)
+                exit_code = result.returncode
+        except OperatorShellUnavailable as exc:
+            emit(f"!: {exc}")
+            exit_code = 127
+        except KeyboardInterrupt:
+            emit("!: interrupted")
+            exit_code = 130
+        except subprocess.TimeoutExpired:
+            emit(f"!: command timed out after {DEFAULT_TIMEOUT}s")
+            exit_code = 124
         if exit_code:
             self._console_print(f"[dim]{t('cli.shell.exited', code=str(exit_code))}[/]")
         return True

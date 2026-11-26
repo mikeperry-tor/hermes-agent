@@ -1259,12 +1259,17 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
             # the env is sanitized because this process holds every API key.
             from tools.environments.local import build_subprocess_env
             from hermes_cli._subprocess_compat import windows_hide_flags
-            result = subprocess.run(
-                exec_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=30, env=build_subprocess_env(),
-                creationflags=windows_hide_flags(),  # no console flash on Windows (#56747),
-                check=False,
-            )
+            from hermes_cli.managed_operator_shell import placement, run_classic_executor
+            selected = placement()
+            if selected is not None:
+                result = run_classic_executor(self, selected, exec_cmd, timeout=30)
+            else:
+                result = subprocess.run(
+                    exec_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=30, env=build_subprocess_env(),
+                    creationflags=windows_hide_flags(),  # no console flash on Windows (#56747),
+                    check=False,
+                )
             # See #56747.
             output = result.stdout.strip() or result.stderr.strip()
             if output:

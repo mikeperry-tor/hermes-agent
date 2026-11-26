@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -19,17 +18,14 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from hermes_cli import gateway_connections as store
+from hermes_cli.gateway_connections_normalize import dial_fingerprint
 
 _log = logging.getLogger(__name__)
 POLL_INTERVAL_S = 1.5
-#: What decides where and how an entry dials (``connection_dial_fields_changed``).
-_DIAL_FIELDS = ("kind", "url", "authMode", "org", "host", "user", "port", "keyPath", "remoteHermesPath",
-                "remoteProfile", "token", "headers")
 
 
 def fingerprints(registry: dict) -> dict[str, str]:
-    return {c["id"]: json.dumps([c.get(k) for k in _DIAL_FIELDS], sort_keys=True, default=str)
-            for c in registry["connections"]}
+    return {entry["id"]: dial_fingerprint(entry) for entry in registry["connections"]}
 
 
 def _stamp(path: Path) -> Optional[tuple[int, int, int]]:

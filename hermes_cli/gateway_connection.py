@@ -34,7 +34,7 @@ _KEY_NOT_TAKEN = frozenset({"admission_conflict", "permission_denied"})
 
 
 class CallStopped(GatewayClientError):
-    """The caller stopped waiting (:meth:`GatewayConnection.call_until`); the request was sent."""
+    """The caller stopped waiting for a connection or a reply."""
 
 
 def _resume_plain(exc, session_id, typed):
@@ -209,23 +209,38 @@ class GatewayConnection:
         return state
 
     # -- lifecycle ---------------------------------------------------------------------------
-    def start(self, timeout=90):
+    def start(self, timeout=90, *, abandon=None):
         deadline = time.monotonic() + timeout
+
+        def check_abandoned():
+            if abandon is not None and abandon():
+                raise CallStopped("gateway connection")
+
+        def wait_for(wait, done):
+            while not done():
+                check_abandoned()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise GatewayClientError("Gateway connection timed out; no local fallback")
+                wait(remaining if abandon is None else min(remaining, 0.1))
+            check_abandoned()
+
         while True:
             with self._start_lock:
+                check_abandoned()
                 if self.final:
                     if self._error is not None:
                         raise self._error
                     return
                 thread = self._thread
-                if thread is not None and self.closed and thread.is_alive() and thread is not threading.current_thread():
-                    # ``_run`` reports ready before its thread returns: that life is over, so let it
-                    # end instead of reading it as a dial in progress (and re-raising its stale error).
-                    thread.join(max(deadline - time.monotonic(), 0))
-                if thread is None or not thread.is_alive():
+                retiring = (thread is not None and self.closed and thread.is_alive()
+                            and thread is not threading.current_thread())
+                if not retiring and (thread is None or not thread.is_alive()):
                     from agent.memory_provider import spawn_context_thread
 
                     if thread is not None:
+                        if time.monotonic() >= deadline:
+                            raise GatewayClientError("Gateway connection timed out; no local fallback")
                         # The gateway hung up, or the last redial failed: dial again (``connect_gateway``
                         # starts a gateway when none is running) and resubscribe this viewer's sessions.
                         self._error = None
@@ -233,15 +248,15 @@ class GatewayConnection:
                         self.closed = False
                     thread = self._thread = spawn_context_thread(self._run, name="hermes-gateway-loop")
                     thread.start()
-            # Every caller waits out a dial in progress, its own or another thread's.
-            if not self._ready.wait(max(deadline - time.monotonic(), 0)):
-                raise GatewayClientError("Gateway connection timed out; no local fallback")
-            if self._error is not None:
-                raise self._error
-            if self.client is not None or self.final:
-                return
-            # Hung up right after that dial: let its loop end, then dial again.
-            thread.join(max(deadline - time.monotonic(), 0))
+            if not retiring:
+                # Every caller waits out a dial in progress, its own or another thread's.
+                wait_for(self._ready.wait, self._ready.is_set)
+                if self._error is not None:
+                    raise self._error
+                if self.client is not None or self.final:
+                    return
+            # A completed dial can report readiness before its thread exits.
+            wait_for(thread.join, lambda: not thread.is_alive())
             if time.monotonic() >= deadline:
                 raise GatewayClientError("Gateway connection timed out; no local fallback")
 
@@ -406,11 +421,13 @@ class GatewayConnection:
         state.attached_gaps = gaps  # a gap during this resume (or a wait given up) still owes one
         return snapshot
 
-    def _send(self, method, budget, params):
+    def _send(self, method, budget, params, *, abandon=None):
         """``(future, epoch)`` of one request sent on the live socket (see :meth:`call_tagged`)."""
         if self._thread is not None and threading.current_thread() is self._thread:
             raise RuntimeError("GatewayConnection.call() on the gateway loop thread would deadlock")
-        self.start()
+        self.start(abandon=abandon)
+        if abandon is not None and abandon():
+            raise CallStopped(method)
         live, loop = self._live, self.loop
         if live is None or loop is None:
             raise GatewayClientError(NOT_SENT)
@@ -485,7 +502,7 @@ class GatewayConnection:
         budget = DEFAULT_RPC_TIMEOUT if timeout is None else timeout
         if abandon is not None and abandon():
             raise CallStopped(method)
-        future, epoch = self._send(method, budget, params)
+        future, epoch = self._send(method, budget, params, abandon=abandon)
         deadline = time.monotonic() + budget + 5
         try:
             while abandon is not None and not wait([future], 0.1).done and time.monotonic() < deadline:

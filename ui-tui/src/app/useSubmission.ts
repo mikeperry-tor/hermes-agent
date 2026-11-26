@@ -1,5 +1,5 @@
 import type { ShellExecResponse } from '@hermes/shared/gateway-types'
-import { hasInterpolation, INTERPOLATION_RE } from '@hermes/shared/interpolation'
+import { INTERPOLATION_RE } from '@hermes/shared/interpolation'
 import { looksLikeSlashCommand, parseSlashCommand } from '@hermes/shared/slash'
 import { completionToApplyOnSubmit } from '@hermes/shared/slash-input'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
@@ -10,6 +10,7 @@ import type { GatewayClient } from '../gatewayClient.js'
 import { queueItem, type QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
 import { asRpcResult } from '../lib/rpc.js'
+import { hasShellSubmission, hasVisibleInterpolation, PASTE_SNIPPET_RE, visibleInterpolations } from '../protocol/paste.js'
 import type { Msg } from '../types.js'
 
 import { cancelPendingRewind, sendPendingRewind } from './backtrackStore.js'
@@ -25,6 +26,7 @@ import { getUiState, patchUiState } from './uiStore.js'
 import { describeShellExecError } from './userMessages.js'
 
 const DOUBLE_ENTER_MS = 450
+const shellKey = ({ profile, profileHome, sid }: SubmissionDestination) => JSON.stringify([sid, profile, profileHome])
 
 const spliceMatches = (text: string, matches: RegExpMatchArray[], results: string[]) =>
   matches.reduceRight((acc, m, i) => acc.slice(0, m.index!) + results[i] + acc.slice(m.index! + m[0].length), text)
@@ -68,7 +70,7 @@ export const prepareSlashSubmission = (display: string, tokens: ComposerToken[])
   display
 })
 
-export const shouldInterpolateSubmission = (display: string) => hasInterpolation(display)
+export const shouldInterpolateSubmission = hasVisibleInterpolation
 
 /**
  * Where and how a busy-time input is admitted. Captured synchronously at the
@@ -94,6 +96,23 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   const lastEmptyAt = useRef(0)
   const typingIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const runningShells = useRef(new Map<string, { cancelled: boolean }>())
+
+  const cancelShell = useCallback(() => {
+    const destination = captureDestination()
+    const attempt = runningShells.current.get(shellKey(destination))
+
+    if (!gw.isCanonical || !destination.sid || !attempt) {
+      return false
+    }
+
+    if (!attempt.cancelled) {
+      attempt.cancelled = true
+      void gw.request('shell.cancel', { session_id: destination.sid }).catch(error => sys(describeShellExecError(error)))
+    }
+
+    return true
+  }, [gw, sys])
 
   useEffect(() => {
     if (typingIdleTimer.current) {
@@ -162,13 +181,26 @@ export function useSubmission(opts: UseSubmissionOptions) {
   const shellExec = useCallback(
     (cmd: string, destination = captureDestination(), item?: QueueItem) => {
       const focused = () => isCurrentDestination(destination)
-      appendMessage({ role: 'user', text: `!${cmd}` })
-      patchUiState({ busy: true, status: 'running…' })
+      const attempt = { cancelled: false }
+      const key = shellKey(destination)
+
+      if (destination.sid) {
+        runningShells.current.set(key, attempt)
+      }
+
+      if (focused()) {
+        appendMessage({ role: 'user', text: `!${cmd}` })
+        patchUiState({ busy: true, status: 'running…' })
+      }
 
       gw.request<ShellExecResponse>('shell.exec', { command: cmd, session_id: destination.sid })
         .then(raw => {
           const r = asRpcResult<ShellExecResponse>(raw)
-          item?.settle?.(Boolean(r))
+          item?.settle?.(Boolean(r) && !attempt.cancelled)
+
+          if (attempt.cancelled) {
+            return
+          }
 
           if (!focused()) {
             return
@@ -196,6 +228,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
           }
         })
         .finally(() => {
+          if (runningShells.current.get(key) === attempt) {
+            runningShells.current.delete(key)
+          }
+
           if (focused()) {
             patchUiState({ busy: false, status: 'ready' })
           }
@@ -208,25 +244,41 @@ export function useSubmission(opts: UseSubmissionOptions) {
   // placeholder such as `(error)` standing in for output the user expected (dokterdok N22). The
   // staged row settles as not accepted, so the input stays retained for Alt+K / an edit.
   const interpolate = useCallback(
-    (text: string, then: (result: string) => void, destination = captureDestination(), item?: QueueItem) => {
-      patchUiState({ status: 'interpolating…' })
-      const matches = [...text.matchAll(new RegExp(INTERPOLATION_RE.source, 'g'))]
+    (text: string, then: (result: string) => void, destination: SubmissionDestination, item: QueueItem | undefined,
+      matches: RegExpMatchArray[]) => {
+      if (isCurrentDestination(destination)) {
+        patchUiState({ status: 'interpolating…' })
+      }
 
-      Promise.all(
-        matches.map(m =>
-          gw
-            .request<ShellExecResponse>('shell.exec', { command: m[1]!, session_id: destination.sid })
-            .then(raw => {
-              const r = asRpcResult<ShellExecResponse>(raw)
+      const attempt = { cancelled: false }
+      const key = shellKey(destination)
 
-              if (!r) {
-                throw new Error(t('session.common.invalidResponse', 'shell.exec'))
-              }
+      if (destination.sid) {
+        runningShells.current.set(key, attempt)
+      }
 
-              return [r.stdout, r.stderr].filter(Boolean).join('\n').trim()
-            })
-        )
-      ).then(
+      const expand = async () => {
+        const results: string[] = []
+
+        for (const match of matches) {
+          const raw = await gw.request<ShellExecResponse>('shell.exec', { command: match[1]!, session_id: destination.sid })
+          const result = asRpcResult<ShellExecResponse>(raw)
+
+          if (attempt.cancelled) {
+            throw new Error('command_interrupted')
+          }
+
+          if (!result) {
+            throw new Error(t('session.common.invalidResponse', 'shell.exec'))
+          }
+
+          results.push([result.stdout, result.stderr].filter(Boolean).join('\n').trim())
+        }
+
+        return results
+      }
+
+      void expand().then(
         results => then(spliceMatches(text, matches, results)),
         (error: unknown) => {
           item?.settle?.(false)
@@ -236,7 +288,11 @@ export function useSubmission(opts: UseSubmissionOptions) {
             patchUiState({ busy: false, status: 'ready' })
           }
         }
-      )
+      ).finally(() => {
+        if (runningShells.current.get(key) === attempt) {
+          runningShells.current.delete(key)
+        }
+      })
     },
     [gw, sys]
   )
@@ -245,30 +301,49 @@ export function useSubmission(opts: UseSubmissionOptions) {
     (input: string | QueueItem) => {
       const item = typeof input === 'string' ? undefined : input
       const text = item?.preparedText ?? (typeof input === 'string' ? input : input.text)
+      const visible = item?.display ?? text
       const destination = item?.destination ?? captureDestination()
+      const shell = hasShellSubmission(visible, text)
 
       if (item?.preparedText !== undefined) {
         return send(text, true, item.display, value => value, { destination, queueItem: item, skipDetectDrop: true })
       }
 
-      if (text.startsWith('!')) {
-        return shellExec(text.slice(1).trim(), destination, item)
+      if (shell && runningShells.current.has(shellKey(destination))) {
+        return composerActions.prependQueue(item ?? queueItem(text, visible), destination)
       }
 
-      if (hasInterpolation(text)) {
-        patchUiState({ busy: true })
+      if (shell && visible.trim() !== text && visible.match(PASTE_SNIPPET_RE)) {
+        item?.settle?.(false)
+        if (isCurrentDestination(destination)) {
+          sys('Expand the paste before running a shell command.')
+          patchUiState({ busy: false, status: 'ready' })
+        }
+
+        return
+      }
+
+      if (visible.startsWith('!')) {
+        return shellExec(visible.slice(1).trim(), destination, item)
+      }
+
+      if (hasVisibleInterpolation(visible, text)) {
+        if (isCurrentDestination(destination)) {
+          patchUiState({ busy: true })
+        }
 
         return interpolate(
           text,
           result => send(result, true, undefined, value => value, { destination, queueItem: item }),
           destination,
-          item
+          item,
+          [...text.matchAll(INTERPOLATION_RE)]
         )
       }
 
       send(text, true, undefined, value => value, { destination, queueItem: item })
     },
-    [interpolate, send, shellExec]
+    [composerActions, interpolate, send, shellExec, sys]
   )
 
   // Honors `display.busy_input_mode` from config.yaml (CLI parity):
@@ -290,8 +365,14 @@ export function useSubmission(opts: UseSubmissionOptions) {
         if (opts.fallbackToFront) {
           composerActions.prependQueue(item, destination)
         } else {
-          composerActions.enqueue(item.text, item.display, destination)
+          composerActions.enqueue(item.text, item.display, destination, item.attachments)
         }
+      }
+
+      // Shell syntax is expanded by the local operator client once the turn
+      // settles. The owner prompt queue only receives the expanded prompt.
+      if (hasShellSubmission(item.display, item.text)) {
+        return enqueueText()
       }
 
       if (gw.isCanonical && mode !== 'queue') {
@@ -331,6 +412,114 @@ export function useSubmission(opts: UseSubmissionOptions) {
     [composerActions, gw, send]
   )
 
+  const submitDirectShell = useCallback(
+    (full: string, destination: SubmissionDestination, busy: boolean, journaled: <T>(write: () => T) => { value: T } | undefined) => {
+      if (busy || runningShells.current.has(shellKey(destination))) {
+        return void journaled(() => composerActions.enqueue(full, full, destination))
+      }
+
+      composerActions.clearIn()
+
+      return shellExec(full.slice(1).trim(), destination)
+    },
+    [composerActions, shellExec]
+  )
+
+  const submitEditedQueueItem = useCallback(
+    (
+      editIdx: number,
+      full: string,
+      live: { busy: boolean; sid?: null | string },
+      journaled: <T>(write: () => T) => { value: T } | undefined
+    ) => {
+      const picked = journaled(() => composerActions.takeQueue(editIdx, full))?.value
+      composerActions.setQueueEdit(null)
+
+      if (!picked || !live.sid) {
+        return
+      }
+
+      // An edited authority row is admitted only after its original retires.
+      // The edit belongs to the session it was made in: focus may move to
+      // another (busy) session before the retirement resolves.
+      const control = captureBusyControl()
+      const editedWhileBusy = live.busy
+
+      return void Promise.resolve(picked).then(item => {
+        if (!item) {
+          return
+        }
+
+        if (editedWhileBusy) {
+          // 'interrupt' / 'steer' should reach the live turn instead of
+          // silently going back to the queue.  handleBusyInput resolves
+          // mode-specific behavior (interrupt-and-send, steer, or queue).
+          if (control.mode === 'queue' && !gw.isCanonical) {
+            return composerActions.prependQueue(item, control.destination)
+          }
+
+          return handleBusyInput(item, { fallbackToFront: true, control })
+        }
+
+        return sendQueued(item)
+      })
+    },
+    [composerActions, gw.isCanonical, handleBusyInput, sendQueued]
+  )
+
+  const submitSlashCommand = useCallback(
+    (
+      full: string,
+      toHistory: string,
+      submission: ReturnType<typeof prepareSubmission>,
+      submissionTokens: ComposerToken[],
+      destination: SubmissionDestination,
+      journaled: <T>(write: () => T) => { value: T } | undefined
+    ) => {
+      const slash = prepareSlashSubmission(full, submissionTokens)
+
+      appendMessage({ kind: 'slash', role: 'system', text: slash.display })
+      composerActions.pushHistory(toHistory)
+
+      const parsed = parseSlashCommand(full)
+
+      if (parsed.name === 'queue' || parsed.name === 'q') {
+        // The catalog advertises list/edit/rm/move/clear. Enqueueing those words
+        // is what sent them to the model. Handle them before the slash handler.
+        reportSlashCommand(gw, parsed.name, getUiState().sid)
+        const plan = planQueueSlash(slash.display, slash.command)
+
+        if (plan.kind === 'enqueue') {
+          const preview = plan.display.slice(0, 50)
+          const saved = journaled(() =>
+            composerActions.enqueue(plan.text, plan.display, destination, submission.attachments)
+          )
+
+          if (saved) {
+            sys(`queued: "${preview}${plan.display.length > 50 ? '…' : ''}"`)
+          }
+        } else {
+          composerActions.clearIn()
+          sys(
+            applyQueuePlan(plan, {
+              items: composerRefs.queueRef.current,
+              refresh: () => composerActions.setQueueEdit(null),
+              removeAt: index => composerActions.removeQueue(index),
+              rows: composerState.queuedDisplay
+            })
+          )
+        }
+      } else {
+        // Attachment commands capture the cleared composer's revision.
+        composerActions.clearIn()
+        // Image tokens are labels in the command; the descriptors and their
+        // expander ride along so a skill/alias send still carries the image.
+        slashRef.current(slash.command, { attachments: submission.attachments, expand: expandTokens(submissionTokens) })
+      }
+    },
+    [appendMessage, composerActions, composerRefs, composerState.queuedDisplay, gw, slashRef, sys]
+  )
+
   const dispatchSubmission = useCallback(
     (input: string | QueueItem) => {
       if (typeof input !== 'string') {
@@ -353,10 +542,16 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const submissionTokens = [...composerRefs.tokensRef.current]
       const submission = prepareSubmission(full, submissionTokens)
       const toHistory = submission.text
+      if (full.startsWith('!') && submissionTokens.some(token => full.includes(token.label))) {
+        return sys('Expand the paste before running a shell command.')
+      }
+      const matches = visibleInterpolations(full, submissionTokens.map(token => token.label))
 
       // Expanded here, before clearIn() empties the tokens the async rewind would expand against;
       // the tokens ride along so a rewind that cuts nothing restores the draft whole.
-      if (sendPendingRewind({ ...submission, tokens: submissionTokens }, getUiState().sid)) {
+      if (matches.length) {
+        cancelPendingRewind(sys)
+      } else if (sendPendingRewind({ ...submission, tokens: submissionTokens }, getUiState().sid)) {
         // The sent row shows each chip and expands it from these bodies, as an ordinary submit's does.
         stagePastes(full, submission.text, submissionTokens)
         composerActions.pushHistory(toHistory)
@@ -385,55 +580,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       if (looksLikeSlashCommand(full)) {
-        const slash = prepareSlashSubmission(full, submissionTokens)
-
-        appendMessage({ kind: 'slash', role: 'system', text: slash.display })
-        composerActions.pushHistory(toHistory)
-
-        const parsed = parseSlashCommand(full)
-
-        if (parsed.name === 'queue' || parsed.name === 'q') {
-          // The catalog advertises list/edit/rm/move/clear. Enqueueing those words
-          // is what sent them to the model. Handle them before the slash handler.
-          reportSlashCommand(gw, parsed.name, getUiState().sid)
-          const plan = planQueueSlash(slash.display, slash.command)
-
-          if (plan.kind === 'enqueue') {
-            const preview = plan.display.slice(0, 50)
-
-            const saved = journaled(() =>
-              composerActions.enqueue(plan.text, plan.display, destination, submission.attachments)
-            )
-
-            if (saved) {
-              sys(`queued: "${preview}${plan.display.length > 50 ? '…' : ''}"`)
-            }
-          } else {
-            composerActions.clearIn()
-            sys(
-              applyQueuePlan(plan, {
-                items: composerRefs.queueRef.current,
-                refresh: () => composerActions.setQueueEdit(null),
-                removeAt: index => composerActions.removeQueue(index),
-                rows: composerState.queuedDisplay
-              })
-            )
-          }
-        } else {
-          // Attachment commands capture the cleared composer's revision.
-          composerActions.clearIn()
-          // Image tokens are labels in the command; the descriptors and their
-          // expander ride along so a skill/alias send still carries the image.
-          slashRef.current(slash.command, { attachments: submission.attachments, expand: expandTokens(submissionTokens) })
-        }
-
-        return
-      }
-
-      if (full.startsWith('!')) {
-        composerActions.clearIn()
-
-        return shellExec(full.slice(1).trim())
+        return submitSlashCommand(full, toHistory, submission, submissionTokens, destination, journaled)
       }
 
       // The user row shows each chip and expands it from these payloads.
@@ -457,47 +604,21 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const editIdx = composerRefs.queueEditRef.current
 
       if (editIdx !== null) {
-        const picked = journaled(() => composerActions.takeQueue(editIdx, full))?.value
-        composerActions.setQueueEdit(null)
+        return submitEditedQueueItem(editIdx, full, live, journaled)
+      }
 
-        if (!picked || !live.sid) {
-          return
-        }
-
-        // An edited authority row is admitted only after its original retires.
-        // The edit belongs to the session it was made in: focus may move to
-        // another (busy) session before the retirement resolves.
-        const control = captureBusyControl()
-        const editedWhileBusy = live.busy
-
-        return void Promise.resolve(picked).then(item => {
-          if (!item) {
-            return
-          }
-
-          if (editedWhileBusy) {
-            // 'interrupt' / 'steer' should reach the live turn instead of
-            // silently going back to the queue.  handleBusyInput resolves
-            // mode-specific behavior (interrupt-and-send, steer, or queue).
-            if (control.mode === 'queue' && !gw.isCanonical) {
-              return composerActions.prependQueue(item, control.destination)
-            }
-
-            return handleBusyInput(item, { fallbackToFront: true, control })
-          }
-
-          return sendQueued(item)
-        })
+      if (full.startsWith('!')) {
+        return submitDirectShell(full, destination, live.busy, journaled)
       }
 
       composerActions.pushHistory(toHistory)
 
-      if (getUiState().busy) {
+      if (getUiState().busy || runningShells.current.has(shellKey(destination))) {
         return void journaled(() =>
           handleBusyInput({ ...queueItem(submission.text, submission.display), attachments: submission.attachments }))
       }
 
-      if (shouldInterpolateSubmission(full)) {
+      if (matches.length) {
         const staged = journaled(() => composerActions.stage?.(submission.text, submission.display, destination, submission.attachments))
 
         if (!staged) { return }
@@ -512,24 +633,23 @@ export function useSubmission(opts: UseSubmissionOptions) {
               queueItem: item, attachments: submission.attachments
             }),
           destination,
-          item
+          item,
+          matches
         )
       }
 
       journaled(() => send(submission.text, true, submission.display, value => value, { attachments: submission.attachments }))
     },
     [
-      appendMessage,
       composerActions,
       composerRefs,
-      composerState.queuedDisplay,
-      gw,
       handleBusyInput,
       interpolate,
       send,
       sendQueued,
-      shellExec,
-      slashRef,
+      submitDirectShell,
+      submitEditedQueueItem,
+      submitSlashCommand,
       sys
     ]
   )
@@ -608,7 +728,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
     [send]
   )
 
-  return { dispatchSubmission, send, sendQueued, submit, submitLiteral }
+  return { cancelShell, dispatchSubmission, send, sendQueued, submit, submitLiteral }
 }
 
 export interface UseSubmissionOptions {

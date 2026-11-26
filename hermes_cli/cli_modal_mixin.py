@@ -130,7 +130,8 @@ class CLIModalMixin:
         """Submit the draft an external editor left in ``buffer`` (Ctrl+G done-callback), mirroring
         the `enter` keybinding: empty save ignored, bang/slash dispatched, else queued. Runs on the
         prompt_toolkit loop, so it must stay cheap/non-blocking."""
-        from cli import _DIM, _RST, _cprint, _looks_like_slash_command
+        from cli import _cprint, _looks_like_slash_command
+        from hermes_cli.bang_shell import is_bang_command
         try:
             text = (getattr(buffer, "text", "") or "").strip()
         except Exception:
@@ -145,26 +146,11 @@ class CLIModalMixin:
             if app is not None:
                 app.invalidate()
 
-        # `!<command>` shell mode is checked before slash dispatch, matching the Enter path.
-        try:
-            if self.handle_bang_shell(text):
-                _done()
+        if is_bang_command(text) or _looks_like_slash_command(text):
+            if app is not None and self._tui_enter_inline_command(app, buffer, text, has_images=False):
                 return
-        except Exception as exc:
-            _cprint(f"  {_DIM}{t('cli.editor.shell_command_failed', error=exc)}{_RST}")
+            self._pending_input.put(text)
             _done()
-            return
-
-        if _looks_like_slash_command(text):
-            try:
-                if not self.process_command(text):
-                    self._should_exit = True
-                    if app is not None and app.is_running:
-                        app.exit()
-            except Exception as exc:
-                _cprint(f"  {_DIM}{t('cli.editor.command_failed', error=exc)}{_RST}")
-            finally:
-                _done()
             return
 
         if self._agent_running:

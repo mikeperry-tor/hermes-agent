@@ -1,11 +1,11 @@
 import type { Terminal } from '@xterm/xterm'
 import type { RefObject } from 'react'
 
-import type { HermesTerminalSession } from '@/global'
+import type { HermesTerminalReadScope, HermesTerminalSession } from '@/global'
 import { translateNow } from '@/i18n'
 import { hostHas } from '@/lib/host-capabilities'
 
-import { defaultTerminalGateway, runsOverSsh, terminalGatewayOf } from './terminal-gateway'
+import { defaultTerminalGateway, runsOnRemoteGateway, terminalGatewayOf } from './terminal-gateway'
 import { $terminals, adoptTerminalGateway, markTerminalPersistent, removeExitedTerminal } from './terminals'
 
 type TerminalApi = Window['hermesDesktop']['terminal']
@@ -70,6 +70,7 @@ export interface SessionAttemptController {
   input: (data: string) => void
   /** Whether the current shell is server-owned (replayed and resumed by the server). */
   isPersistent: () => boolean
+  executorReadScope: () => HermesTerminalReadScope | null
   /** Release the current attempt: unsubscribe, then detach or dispose its shell. */
   release: () => void
   start: () => void
@@ -193,6 +194,12 @@ export function createSessionAttemptController(
         restoreHistory()
         attemptSessionId = session.id
         sessionIdRef.current = session.id
+        if (terminalApi.executorReadScope?.(session.id)) {
+          // Finish clearing the previous attempt's output before the model
+          // may read this executor buffer.
+          ++replayWrites
+          term.write('\u001bc', () => { --replayWrites })
+        }
         onStarted(session)
 
         subscriptions.push(
@@ -297,7 +304,7 @@ export function createSessionAttemptController(
         } else if (signal === 'expired') {
           resumeOnly = false
           armRetry(TERMINAL_EXIT_MESSAGES.expired)
-        } else if (hostHas('retryTerminalSpawn') || runsOverSsh(gateway)) {
+        } else if (hostHas('retryTerminalSpawn') || runsOnRemoteGateway(gateway)) {
           // A browser host or an SSH gateway can come back (host offline,
           // tunnel still connecting): Enter tries again.
           armRetry(`Terminal failed to start: ${message}. Press Enter to retry.`)
@@ -332,6 +339,11 @@ export function createSessionAttemptController(
   }
 
   return {
+    executorReadScope: () => {
+      const id = sessionIdRef.current
+
+      return id && !replayWrites && !isReplayingHistory() ? terminalApi.executorReadScope?.(id) ?? null : null
+    },
     input,
     isPersistent: () => persistent,
     release: () => cleanupAttempt?.(),

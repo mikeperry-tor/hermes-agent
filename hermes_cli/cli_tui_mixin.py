@@ -924,9 +924,17 @@ class CLITuiMixin:
             event.app.exit()
 
     def _tui_handle_ctrl_c(self, event):
-        """Ctrl+C priority: cancel voice recording → cancel foreground UI/overlay prompt or the wait for a
-        command on its own gateway socket (a plugin command, /cron) → clear a typed draft, even mid-run (a correction must never kill the turn)
+        """Ctrl+C priority: cancel the executor shell while keeping the draft → close backtrack
+        → cancel voice recording → cancel a foreground prompt or a command on its own gateway socket (a plugin command,
+        /cron) → clear a typed draft, even mid-run (a correction must never kill the turn)
         → interrupt the running agent → force exit (second press within 2s) → when idle and empty, exit."""
+        interrupt_shell = getattr(self, "_operator_shell_interrupt", None)
+        if interrupt_shell is not None:
+            interrupt_shell()
+            return
+        if getattr(self, "_backtrack_state", None):
+            self._close_backtrack_picker()
+            return
         now = time.time()
         if self._tui_cancel_voice_recording(event):
             return
@@ -1424,7 +1432,7 @@ class CLITuiMixin:
         has_images = bool(self._attached_images)
         if not (text or has_images):
             return
-        if self._tui_enter_inline_command(event, text, has_images):
+        if self._tui_enter_inline_command(event.app, buf, text, has_images):
             return
         # Snapshot and clear attached images; bundle text + images as a tuple when present.
         images = list(self._attached_images)
@@ -1443,7 +1451,7 @@ class CLITuiMixin:
         self._inline_pastes(buf)
         buf.reset(append_to_history=True)
 
-    def _tui_enter_inline_command(self, event, text: str, has_images: bool) -> bool:
+    def _tui_enter_inline_command(self, app, buf, text: str, has_images: bool) -> bool:
         """Run /model, /steer, /bg, /btw directly on the UI thread; True when handled.
 
         /model needs the prompt_toolkit terminal-handoff helpers of the interactive pickers.
@@ -1460,16 +1468,16 @@ class CLITuiMixin:
         if self._should_handle_model_command_inline(text, has_images=has_images):
             if not self.process_command(text):
                 self._should_exit = True
-                if event.app.is_running:
-                    event.app.exit()
+                if app.is_running:
+                    app.exit()
         elif (self._should_handle_steer_command_inline(text, has_images=has_images)
               or self._should_handle_background_command_inline(text, has_images=has_images)
               or self._should_handle_stop_command_inline(text, has_images=has_images)):
             self.process_command(text)
         else:
             return False
-        event.app.current_buffer.reset(append_to_history=True)
-        event.app.invalidate()
+        buf.reset(append_to_history=True)
+        app.invalidate()
         return True
 
     def _tui_enter_while_busy(self, text: str, images: list, payload, mode: str | None = None) -> None:

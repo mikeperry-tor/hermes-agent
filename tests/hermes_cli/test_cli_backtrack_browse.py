@@ -177,6 +177,16 @@ def test_ctrl_c_closes_browse_and_leaves_everything_as_it_was(cli):
     cli._prefill_input_buffer.assert_not_called()
 
 
+def test_ctrl_c_cancels_an_executor_shell_before_closing_backtrack(cli):
+    assert cli._open_backtrack_picker()
+    cli._operator_shell_interrupt = MagicMock()
+
+    cli._tui_handle_ctrl_c(_event())
+
+    cli._operator_shell_interrupt.assert_called_once_with()
+    assert cli._backtrack_state is not None
+
+
 def test_any_other_key_closes_browse_and_is_replayed_into_the_composer(cli):
     assert cli._open_backtrack_picker()
     processor = MagicMock()

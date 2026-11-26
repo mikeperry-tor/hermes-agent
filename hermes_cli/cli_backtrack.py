@@ -301,12 +301,6 @@ class CLIBacktrackMixin:
             return None  # the press cancelled the pending edit; never exit on it
         return super()._tui_clear_or_exit(event)
 
-    def _tui_handle_ctrl_c(self, event):
-        if self._backtrack_state:
-            self._close_backtrack_picker()
-            return None
-        return super()._tui_handle_ctrl_c(event)
-
     def _tui_hint_text(self):
         hint = super()._tui_hint_text()
         if hint or self._backtrack_state:

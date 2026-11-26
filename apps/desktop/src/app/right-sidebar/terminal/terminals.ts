@@ -1,11 +1,14 @@
-import { randomUuid } from '@hermes/shared'
+import { LOCAL_CONNECTION_ID, randomUuid } from '@hermes/shared'
 import type { WebglAddon } from '@xterm/addon-webgl'
 import type { Terminal } from '@xterm/xterm'
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
+import { browserLaunchProfile, isBrowserHostedDesktop } from '@/lib/platform'
 import { readKey, writeKey } from '@/lib/storage'
+import { registryConnectionKind } from '@/store/connection-registry-state'
 import { notifyError } from '@/store/notifications'
-import { $currentCwd } from '@/store/session'
+import { $connection, $currentCwd } from '@/store/session'
+import { windowProfileOverride } from '@/store/windows'
 
 import { setTerminalTakeover } from '../store'
 
@@ -164,6 +167,7 @@ interface PersistedTerminalEntry {
 interface PersistedTerminalState {
   activeTerminalId: null | string
   terminals: PersistedTerminalEntry[]
+  terminalEnvironment?: 'executor' | 'gateway'
 }
 
 const TERMINALS_STORAGE_KEY = 'hermes.desktop.terminals.v1'
@@ -225,9 +229,13 @@ function loadPersistedTerminals(): PersistedTerminalState {
     }
 
     const record = parsed as Record<string, unknown>
+    const terminalEnvironment = record.terminalEnvironment === 'executor' ? 'executor' : 'gateway'
 
     const terminals = Array.isArray(record.terminals)
-      ? record.terminals.map(sanitizePersistedTerminal).filter((term): term is PersistedTerminalEntry => Boolean(term))
+      ? record.terminals.map(sanitizePersistedTerminal).filter((term): term is PersistedTerminalEntry =>
+          term !== null && (!window.__HERMES_TERMINAL_ENVIRONMENT__ ||
+            Boolean(term.connectionId && term.connectionId !== 'local') ||
+            terminalEnvironment === window.__HERMES_TERMINAL_ENVIRONMENT__))
       : []
 
     const active =
@@ -235,7 +243,7 @@ function loadPersistedTerminals(): PersistedTerminalState {
         ? record.activeTerminalId
         : (terminals[0]?.id ?? null)
 
-    return { activeTerminalId: active, terminals }
+    return { activeTerminalId: active, terminals, terminalEnvironment }
   } catch {
     return fallback
   }
@@ -267,7 +275,10 @@ function persistTerminals(list: readonly TerminalEntry[], activeTerminalId: null
   }
 
   const active = terminals.some(term => term.id === activeTerminalId) ? activeTerminalId : (terminals[0]?.id ?? null)
-  writeKey(TERMINALS_STORAGE_KEY, JSON.stringify({ activeTerminalId: active, terminals }))
+  const mode = window.__HERMES_TERMINAL_ENVIRONMENT__
+  // Failed startup reads cannot invalidate a saved placement.
+  writeKey(TERMINALS_STORAGE_KEY, JSON.stringify({ activeTerminalId: active, terminals,
+    terminalEnvironment: mode === null ? restored.terminalEnvironment : mode }))
 }
 
 const restored = loadPersistedTerminals()
@@ -288,20 +299,39 @@ export const $activeTerminal = computed(
 const newId = () => randomUuid()
 
 // The gateway picked in Sessions, as a shell host. terminal-gateway.ts binds the
-// registry-backed store on load; this module stays free of the connection
-// stores. Unbound (or with no registry, like the Webapp) there is one host.
+// registry-backed store on load. The browser bridge can also follow the
+// active connection when a tab has no explicit owner.
 let $defaultGateway: ReadableAtom<TerminalGateway | undefined> = atom(undefined)
 
 let unbindDefaultGateway = () => {}
+
+/** Snapshot the route even before the browser's saved-connections registry loads. */
+export function browserTerminalGateway(): TerminalGateway | undefined {
+  if (!isBrowserHostedDesktop()) {
+    return undefined
+  }
+
+  const active = $connection.get()
+  const connectionId = active?.connectionId ?? LOCAL_CONNECTION_ID
+  const launchProfile = connectionId === LOCAL_CONNECTION_ID ? browserLaunchProfile() : ''
+  return {
+    connectionId,
+    profile: active?.profile?.trim() || windowProfileOverride() || launchProfile || 'current'
+  }
+}
 
 /** Append a fresh terminal and focus it. Captures the current cwd once (its only
  *  tie to session/project state) and the gateway: an explicit one, else the one
  *  picked in Sessions now, so a failed first start can never retry elsewhere.
  *  Returns the id. */
-export function createTerminal(cwd: string = $currentCwd.get(), gateway?: TerminalGateway): string {
+export function createTerminal(cwd?: string, gateway?: TerminalGateway): string {
   const id = newId()
-  const owner = gateway ?? $defaultGateway.get()
-  $terminals.set([...$terminals.get(), { id, title: 'Terminal', auto: true, cwd, kind: 'user', ...owner }])
+  const owner = gateway ?? browserTerminalGateway() ?? $defaultGateway.get()
+  const connectionId = owner?.connectionId ?? LOCAL_CONNECTION_ID
+  const serverDefault = isBrowserHostedDesktop() && registryConnectionKind(connectionId) !== 'ssh'
+  $terminals.set([...$terminals.get(), {
+    id, title: 'Terminal', auto: true, cwd: cwd ?? (serverDefault ? '' : $currentCwd.get()), kind: 'user', ...owner
+  }])
   $activeTerminalId.set(id)
 
   return id
@@ -393,12 +423,12 @@ export function selectTerminal(id: string): void {
   }
 }
 
-// Compare-ready form of a directory path: trimmed, trailing separators dropped
+// Compare directories with platform-appropriate trailing separators dropped
 // (keeping a bare root intact) so `/repo/` and `/repo` are the same place.
 const normalizePath = (value: string) => {
-  const trimmed = value.trim()
+  const windows = /^[A-Za-z]:[\\/]|^\\\\/.test(value)
 
-  return trimmed.length > 1 ? trimmed.replace(/[\\/]+$/, '') || trimmed : trimmed
+  return value.length > 1 ? value.replace(windows ? /[\\/]+$/ : /\/+$/, '') || value : value
 }
 
 /** The directory a tab points at right now — the live shell cwd once observed
@@ -590,9 +620,9 @@ export function updateTerminalReviveBuffer(id: string, reviveBuffer: string): vo
  *  restart the PTY there instead of the original launch dir. User tabs only;
  *  no-ops when the value is empty or unchanged to avoid redundant persistence. */
 export function updateTerminalRestoreCwd(id: string, restoreCwd: string): void {
-  const next = restoreCwd.trim()
+  const next = restoreCwd
 
-  if (!next) {
+  if (!next.trim()) {
     return
   }
 

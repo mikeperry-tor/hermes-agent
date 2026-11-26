@@ -192,7 +192,7 @@ def _runner_command(name):
                  if get_plugin_command_handler(registered)), None)
 
 
-async def _run_runner_command(runner, live, name, arg, kind, shell):
+async def _run_runner_command(connection, runner, live, name, arg, kind, shell):
     """The messaging gateway's own quick-command / plugin-command dispatch for this session
     (``run_inbound_hooks``): the operator's slash access policy, the 30 s sanitized-env exec with
     redacted output, the plugin handler under this session's env scope."""
@@ -205,7 +205,22 @@ async def _run_runner_command(runner, live, name, arg, kind, shell):
         if refused:
             return refused
         from gateway.session_policy import policy_for_source
+        from hermes_cli.managed_operator_shell import OperatorShellUnavailable, placement, run_executor_async
         policy = policy_for_source(runner, live.source)
+        try:
+            selected = placement()
+            if selected is not None:
+                if not connection.native_owner or 'session:operator' not in connection.actor.capabilities:
+                    raise AuthorityRefusal('permission_denied')
+                from agent.redact import redact_sensitive_text
+                from gateway.session_terminal_cwd import operator_ssh_cwd
+                result = await run_executor_async(selected, shell, operator_ssh_cwd(runner, live.route, policy), timeout=30)
+                output = (result.stdout or result.stderr).strip()
+                return redact_sensitive_text(output) if output else t('gateway.quick_command.no_output')
+        except OperatorShellUnavailable as exc:
+            raise AuthorityRefusal('operator_shell_unavailable', detail=str(exc)) from None
+        except TimeoutError:
+            return t('gateway.quick_command.timed_out')
         cwd = getattr(policy, 'cwd', None) or None
         if cwd is None or not await asyncio.to_thread(os.path.isdir, cwd):
             # Never fall back to the gateway's own folder: a relative command would act there.
@@ -475,7 +490,7 @@ async def execute_command(connection, ref, params, *, dispatch=False):
         from gateway.plugin_command_choice import viewer_choices
         with (_profile_runtime_scope(home), _session_workspace(authority.runner, live.source),
               viewer_choices(live, ref.session_id)):
-            output = await _run_runner_command(authority.runner, live, name, arg, *runner_command)
+            output = await _run_runner_command(connection, authority.runner, live, name, arg, *runner_command)
         return {'type': 'exec', 'output': _text(output)}
     if definition is None:
         def build():  # in the session's folder: its trusted project skills, as its catalog lists them
