@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -6,7 +6,7 @@ import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/compone
 import { FieldHint } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/i18n'
-import { createRemoteDir, readDesktopDir, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
+import { createRemoteDir, desktopFsPickerKey, readDesktopDir, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { isSubmitEnter } from '@/lib/ime'
 import { cn } from '@/lib/utils'
@@ -43,6 +43,7 @@ function childPath(parent: string, name: string) {
 }
 
 interface PendingSelection {
+  connectionKey: string
   defaultPath: string
   resolve: (paths: string[]) => void
   title: string
@@ -52,6 +53,7 @@ export function RemoteFolderPicker() {
   const { t } = useI18n()
   const r = t.rightSidebar
   const [pending, setPending] = useState<PendingSelection | null>(null)
+  const activeSelection = useRef<PendingSelection | null>(null)
   const [currentPath, setCurrentPath] = useState('/')
   const [entries, setEntries] = useState<Array<{ name: string; path: string }>>([])
   const [error, setError] = useState<string | null>(null)
@@ -69,7 +71,14 @@ export function RemoteFolderPicker() {
           setCurrentPath(defaultPath)
           setNewFolderName(null)
           setNewFolderError(null)
-          setPending({ defaultPath, resolve, title: options?.title || r.remotePickerTitle })
+          setCreating(false)
+          activeSelection.current?.resolve([])
+          const selection = {
+            connectionKey: desktopFsPickerKey(), defaultPath, resolve, title: options?.title || r.remotePickerTitle
+          }
+
+          activeSelection.current = selection
+          setPending(selection)
         })
     })
 
@@ -78,6 +87,14 @@ export function RemoteFolderPicker() {
 
   useEffect(() => {
     if (!pending) {
+      return
+    }
+
+    if (pending.connectionKey !== desktopFsPickerKey()) {
+      pending.resolve([])
+      activeSelection.current = null
+      setPending(null)
+
       return
     }
 
@@ -138,12 +155,17 @@ export function RemoteFolderPicker() {
   }
 
   const navigate = (path: string) => {
+    if (creating) {
+      return
+    }
+
     cancelNewFolder()
     setCurrentPath(path)
   }
 
   const close = (paths: string[] = []) => {
-    pending?.resolve(paths)
+    pending?.resolve(pending.connectionKey === desktopFsPickerKey() ? paths : [])
+    activeSelection.current = null
     setPending(null)
     setEntries([])
     setError(null)
@@ -153,7 +175,13 @@ export function RemoteFolderPicker() {
   const createFolder = async () => {
     const name = (newFolderName ?? '').trim()
 
-    if (creating) {
+    if (creating || !pending) {
+      return
+    }
+
+    if (pending.connectionKey !== desktopFsPickerKey()) {
+      close()
+
       return
     }
 
@@ -166,13 +194,21 @@ export function RemoteFolderPicker() {
     setCreating(true)
     setNewFolderError(null)
 
+    const stillOpen = () => activeSelection.current === pending && pending.connectionKey === desktopFsPickerKey()
+
     try {
       const created = await createRemoteDir(childPath(currentPath, name))
-      navigate(clean(created))
+      if (stillOpen()) {
+        navigate(clean(created))
+      }
     } catch (err) {
-      setNewFolderError(r.remotePickerCreateFolderFailed(err instanceof Error ? err.message : String(err)))
+      if (stillOpen()) {
+        setNewFolderError(r.remotePickerCreateFolderFailed(err instanceof Error ? err.message : String(err)))
+      }
     } finally {
-      setCreating(false)
+      if (activeSelection.current === pending) {
+        setCreating(false)
+      }
     }
   }
 
@@ -185,7 +221,9 @@ export function RemoteFolderPicker() {
           // One cancel gesture does one thing: Escape abandons the name first.
           if (newFolderName !== null) {
             event.preventDefault()
-            cancelNewFolder()
+            if (!creating) {
+              cancelNewFolder()
+            }
           }
         }}
       >
@@ -274,7 +312,7 @@ export function RemoteFolderPicker() {
           <div className="min-w-0 truncate text-xs text-muted-foreground">{displayPath(currentPath)}</div>
           <div className="flex shrink-0 items-center gap-2">
             <Button
-              disabled={newFolderName !== null || Boolean(error)}
+              disabled={creating || newFolderName !== null || Boolean(error)}
               onClick={() => setNewFolderName('')}
               size="sm"
               variant="ghost"
@@ -285,7 +323,7 @@ export function RemoteFolderPicker() {
             <Button onClick={() => close()} size="sm" variant="ghost">
               {t.common.cancel}
             </Button>
-            <Button onClick={() => close([currentPath])} size="sm">
+            <Button disabled={creating} onClick={() => close([currentPath])} size="sm">
               {r.remotePickerSelect}
             </Button>
           </div>

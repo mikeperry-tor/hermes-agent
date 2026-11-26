@@ -113,13 +113,17 @@ def _resolve_session_cwd(session_key: str | None) -> str:
 
 
 def build_init_prompt_for_cwd(cwd: str | None = None, extra: str = "",
-                              session_key: str | None = None) -> str:
+                              session_key: str | None = None, *, terminal_policy: dict | None = None) -> str:
     """Convenience wrapper used by the dispatch surfaces.
 
     An explicit ``cwd`` wins while it still exists; a stale one (deleted project, removed
     worktree) falls through to :func:`_resolve_session_cwd` — the guard lives here so every
     dispatch surface shares it rather than each one validating its own record.
     """
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        return _executor_init_prompt(cwd, extra, session_key, terminal_policy)
     resolved = os.path.abspath(cwd if cwd and os.path.isdir(cwd) else _resolve_session_cwd(session_key))
     existing: str | None = None
     agents_path = os.path.join(resolved, "AGENTS.md")
@@ -138,3 +142,31 @@ def build_init_prompt_for_cwd(cwd: str | None = None, extra: str = "",
     except OSError:
         existing = None
     return build_init_prompt(resolved, existing_file=existing, extra=extra)
+
+
+def _executor_init_prompt(cwd, extra, session_key, terminal_policy):
+    import base64
+
+    from agent.prompt_builder import _get_context_file_max_chars
+    from agent.ssh_context_references import reference_workspace
+    from gateway.session_context import get_session_env
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from tools.terminal_tool import get_session_cwd
+
+    key = session_key if session_key is not None else get_session_env("HERMES_SESSION_KEY", "")
+    workspace = reference_workspace(terminal_policy, directory=get_session_cwd(key) or cwd)
+    if workspace is None:
+        raise SshWorkspaceFsError("ECONN", "The SSH executor workspace is unavailable.")
+    limit = 4 * _get_context_file_max_chars()
+    existing = None
+    try:
+        _, size, payload = workspace.backend.reference_path(
+            f"{workspace.cwd}/AGENTS.md", (workspace.cwd,), kind="regular", limit=limit)
+    except SshWorkspaceFsError as exc:
+        if exc.code != "ENOENT":
+            raise
+    else:
+        if size > limit:
+            raise SshWorkspaceFsError("EFBIG", "AGENTS.md is too large to include in the /init prompt.")
+        existing = base64.b64decode(payload[1], validate=True).decode("utf-8-sig", errors="replace")
+    return build_init_prompt(workspace.cwd, existing_file=existing, extra=extra)

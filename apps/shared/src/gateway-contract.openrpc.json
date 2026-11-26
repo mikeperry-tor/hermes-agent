@@ -32818,6 +32818,18 @@
             "title": "Isgit",
             "type": "boolean"
           },
+          "workspace_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Available"
+          },
           "sessions": {
             "items": {
               "$ref": "#/components/schemas/ProjectTreeSession"
@@ -32891,6 +32903,18 @@
             "title": "Isnoproject",
             "type": "boolean"
           },
+          "workspace_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Available"
+          },
           "sessionCount": {
             "default": 0,
             "title": "Sessioncount",
@@ -32962,6 +32986,18 @@
             ],
             "default": null,
             "title": "Path"
+          },
+          "workspace_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Available"
           },
           "groups": {
             "items": {
@@ -33282,6 +33318,18 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "workspace_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Available"
           }
         },
         "required": [
@@ -33595,6 +33643,18 @@
             "default": "",
             "title": "Branch",
             "type": "string"
+          },
+          "available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Available"
           }
         },
         "required": [

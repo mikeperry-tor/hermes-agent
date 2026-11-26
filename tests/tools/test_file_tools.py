@@ -4,8 +4,12 @@ Tests verify tool schemas, handler dispatch, validation logic, and error
 handling without requiring a running terminal environment.
 """
 
+import base64
+import hashlib
 import json
 import logging
+import os
+import shutil
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +17,216 @@ import pytest
 from tools.file_tools import (
     read_file_tool,
 )
+
+
+def _ssh_test_environment():
+    from tools.environments.ssh import SSHEnvironment
+
+    return MagicMock(spec=SSHEnvironment, host="executor", port=22, user="test", _sync_manager=None)
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_read_uses_executor_path_and_baseline(tmp_path, monkeypatch):
+    from tools import file_tools
+    from tools.file_operations import ReadResult, SSHPathState
+    from tools.file_tools_read_tracking import SSHFileKey, programmatic_file_read
+
+    secret = tmp_path / ".env"
+    secret.write_text("host only")
+    alias = tmp_path / "alias "
+    alias.symlink_to(secret)
+    executor_target = "/workspace/notes.txt"
+    env = _ssh_test_environment()
+    metadata = (10, 20, 14, 30, 40)
+    digest = hashlib.sha256(b"executor bytes").digest()
+    ops = MagicMock(env=env, spec_set=["env", "read_inspected_ssh_file", "inspect_ssh_path"])
+    state = SSHPathState(executor_target, "regular", metadata)
+    ops.inspect_ssh_path.return_value = state
+    ops.read_inspected_ssh_file.return_value = ReadResult(content="1|executor bytes", total_lines=1,
+                                                         _snapshot=(*metadata, digest))
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    key = SSHFileKey.for_backend(env, executor_target)
+    task_id = "ssh-read-placement"
+    with programmatic_file_read():
+        assert json.loads(read_file_tool(str(alias), task_id=task_id))["content"] == "1|executor bytes"
+    assert key not in file_tools._read_tracker[task_id]["full_write_baselines"]
+    assert json.loads(read_file_tool(str(alias), task_id=task_id))["content"] == "1|executor bytes"
+    ops.inspect_ssh_path.assert_called_with(str(alias), protect_read=True)
+    assert ops.read_inspected_ssh_file.call_args.args[0] == state
+    assert file_tools._read_tracker[task_id]["full_write_baselines"][key] == (*metadata, digest)
+
+    for revision in range(4):
+        new_content = f"revision {revision}"
+        new_metadata = (*metadata[:4], 100 + revision)
+        new_version = (*new_metadata, hashlib.sha256(new_content.encode()).digest())
+        ops.inspect_ssh_path.return_value = SSHPathState(executor_target, "regular", new_metadata)
+        ops.read_inspected_ssh_file.return_value = ReadResult(
+            content=f"1|{new_content}", total_lines=1, _snapshot=new_version)
+        assert json.loads(read_file_tool(str(alias), task_id=task_id))["content"] == f"1|{new_content}"
+        assert file_tools._read_tracker[task_id]["full_write_baselines"][key] == new_version
+
+    ops.inspect_ssh_path.return_value = SSHPathState(executor_target, "regular", (*metadata[:4], 104))
+    for revision in range(4):
+        content = f"1|formatted revision {revision}"
+        ops.read_inspected_ssh_file.return_value = ReadResult(content=content, total_lines=1)
+        result = json.loads(read_file_tool(str(alias), task_id=task_id))
+        assert result.get("content") == content, result
+        assert key not in file_tools._read_tracker[task_id]["full_write_baselines"]
+
+
+def test_ssh_read_denies_canonical_credential_target_before_read(monkeypatch):
+    from tools import file_tools
+    from tools.file_operations import SSHPathState
+
+    ops = MagicMock(env=_ssh_test_environment())
+    ops.inspect_ssh_path.return_value = SSHPathState("/project/.env", "regular", (1, 2, 3, 4, 5))
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    result = json.loads(read_file_tool("/project/literal ${secret}", task_id="ssh-read-denial"))
+
+    assert "secret-bearing environment file" in result["error"]
+    ops.read_inspected_ssh_file.assert_not_called()
+
+
+def test_ssh_pruned_archive_uses_state_after_sync(monkeypatch):
+    from tools import file_tools
+    from tools.file_operations import ReadResult, ShellFileOperations, SSHPathState
+
+    path = "/workspace/cache/pruned/archive.txt"
+    absent = SSHPathState(path, "absent", None)
+    fresh = SSHPathState(path, "regular", (1, 2, 9, 4, 5))
+    env = _ssh_test_environment()
+    env._sync_manager = MagicMock()
+    ops = MagicMock(env=env)
+    ops.inspect_ssh_path.side_effect = [absent, fresh]
+    ops._unicode_variant_match.return_value = None
+    ops._add_line_numbers.side_effect = ShellFileOperations(None)._add_line_numbers
+    ops.read_inspected_ssh_bytes.return_value = ReadResult(
+        base64_content=base64.b64encode(b"new archive").decode(), file_size=11)
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    result = json.loads(read_file_tool(path, task_id="ssh-fresh-archive"))
+
+    assert "1|new archive" in result["content"]
+    ops.env._sync_manager.sync.assert_called_once_with(force=True)
+    assert ops.read_inspected_ssh_bytes.call_args.args[0] == fresh
+
+
+def test_ssh_read_refuses_backend_mismatch_before_inspection(monkeypatch):
+    from tools import file_tools
+
+    ops = MagicMock()
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    result = json.loads(read_file_tool("/workspace/notes.txt", task_id="ssh-backend-mismatch"))
+
+    assert "could not confirm the selected SSH backend" in result["error"]
+    ops.inspect_ssh_path.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_search_uses_executor_policy_before_paging(tmp_path, monkeypatch, capsys):
+    from tools import file_tools
+    from tools.file_operations import ShellFileOperations
+
+    home = tmp_path / "executor-home"
+    profile = home / ".hermes"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    project = tmp_path / "project :42: results"
+    project.mkdir()
+    visible = project / "part:31-\nresult "
+    visible.write_text("before\nmatch :13: row\nafter\n")
+    (project / "empty").write_text("nothing found\n")
+    denied = project / "hidden-result"
+    denied.write_text("match credential bytes\n")
+    (profile / "auth.json").symlink_to(denied)
+    secret = project / ".netrc"
+    secret.write_text('password: "shortsecret"\n')
+    (project / "config-alias").symlink_to(secret)
+
+    def executor_response(snippet):
+        exec(compile(snippet, "<ssh executor>", "exec"), {})
+        return capsys.readouterr().out
+
+    ops = ShellFileOperations(_ssh_test_environment())
+    monkeypatch.setattr(ops, "_framed_ssh_file_output", executor_response)
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    def search(path=project, pattern="match", **kwargs):
+        return json.loads(file_tools.search_tool(pattern, path=str(path),
+                                                task_id="ssh-search-policy", **kwargs))
+
+    count = search(output_mode="count", limit=1)
+    assert count["counts"] == {str(visible): 1}
+    assert count["total_count"] == 1 and not count.get("truncated")
+    assert "error" in search(path=denied)
+    assert search(context=1)["matches"] == [
+        {"path": str(visible), "line": 1, "content": "before"},
+        {"path": str(visible), "line": 2, "content": "match :13: row"},
+        {"path": str(visible), "line": 3, "content": "after"},
+    ]
+    redacted = search(path=project / "config-alias", pattern="password")
+    assert redacted["matches"] and "shortsecret" not in str(redacted)
+
+    first_root = project / "first"
+    second_root = project / "second"
+    first_root.write_text("root match\n")
+    second_root.write_text("root match\n")
+    multi = search(path=f"{first_root}, {denied}, {second_root}", pattern="root match",
+                   output_mode="count", limit=1, offset=1)
+    assert multi["counts"] == {str(second_root): 1}
+    assert multi["total_count"] == 2 and str(denied) not in str(multi)
+    literal = project / "first, second"
+    literal.write_text("literal comma path\n")
+    assert search(path=literal, pattern="literal comma")["matches"][0]["path"] == str(literal)
+
+    if shutil.which("rg"):
+        recent = project / "recent-directory"
+        recent.mkdir()
+        for file in project.iterdir():
+            if file.is_file() and not file.is_symlink():
+                os.utime(file, (1000, 1000))
+        os.utime(recent, (2000, 2000))
+        first = search(pattern="*", target="files", limit=1)
+        assert first["files"] == [str(recent)] and first["truncated"]
+        literal = search(path=visible, file_glob="*.no-match")
+        assert literal["matches"][0]["path"] == str(visible)
+        assert search(path=visible, file_glob="[z-a]")["error"]
+        binary = project / "binary"
+        binary.write_bytes(b"filler\n" * 2000 + b"\0\nbefore\nmatch :13: row\n")
+        multiline = search(pattern=r"before\nmatch", output_mode="count")
+        assert multiline["counts"] == {str(visible): 1}
+
+
+def test_ssh_missing_read_suggestions_use_executor_protection(monkeypatch):
+    from tools import file_tools
+    from tools.file_operations import ReadResult, SSHPathState
+
+    path = "/workspace/readme"
+    visible = "/workspace/readme.txt"
+    protected_alias = "/workspace/readme-old"
+    version = (1, 2, 3, 4, 5)
+    ops = MagicMock(env=_ssh_test_environment())
+    ops.inspect_ssh_path.side_effect = [SSHPathState(path, "absent", None),
+                                        SSHPathState(visible, "regular", version),
+                                        SSHPathState("/workspace/.env", "regular", version)]
+    ops._unicode_variant_match.return_value = None
+    ops.read_inspected_ssh_file.return_value = ReadResult(
+        error=f"File not found: {path}", similar_files=[visible, protected_alias])
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _: ops)
+    monkeypatch.setattr(file_tools, "uses_ssh_for_task", lambda _: True)
+
+    result = json.loads(read_file_tool(path, task_id="ssh-suggestions"))
+
+    assert result["similar_files"] == [visible]
 
 
 class TestReadFileHandler:

@@ -1381,6 +1381,8 @@ def _default_workspace_kind(board: dict[str, Any]) -> str:
     workdir = str(board.get("default_workdir") or "").strip()
     if not workdir:
         return "scratch"
+    if kbw._managed_workspace_unavailable():
+        return "dir"
     try:
         return "worktree" if kbw._git_toplevel(Path(workdir)) else "dir"
     except (OSError, ValueError):
@@ -1427,6 +1429,8 @@ def list_boards(include_archived: bool = Query(False)):
 
 def _validate_workdir(raw: str) -> str:
     """Board default_workdir must be an absolute, existing directory (400 otherwise)."""
+    if kbw._managed_workspace_unavailable():
+        raise HTTPException(status_code=400, detail="Kanban workspaces are unavailable on the SSH executor.")
     requested = Path(raw).expanduser()
     if not requested.is_absolute():
         raise HTTPException(status_code=400, detail="Project directory must be an absolute path.")

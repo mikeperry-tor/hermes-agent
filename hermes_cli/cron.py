@@ -703,6 +703,33 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
     return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
 
 
+def _cron_workspace_issues(job: dict[str, Any]) -> list[str]:
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    script = str(job.get("script") or "").strip()
+    workdir = str(job.get("workdir") or "").strip()
+    if not uses_managed_executor():
+        issues = []
+        if script and (script_issue := _script_health_issue(script)):
+            issues.append(script_issue)
+        if workdir and not Path(workdir).expanduser().exists():
+            issues.append(f"workdir not found: {workdir}")
+        return issues
+
+    from cron.executor_script import check_executor_script
+    from cron.executor_workspace import executor_workdir
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    try:
+        if workdir:
+            workdir, _ = executor_workdir(workdir)
+        monitor = str(job.get("monitor_script") or "").strip()
+        return [issue for path in dict.fromkeys((script, monitor)) if path
+                if (issue := check_executor_script(path, workdir or None, job.get("interpreter")))]
+    except (ValueError, OSError, SshWorkspaceFsError) as exc:
+        return [f"SSH executor cron health is unavailable. {exc}"]
+
+
 def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
@@ -732,11 +759,7 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     script = str(job.get("script") or "").strip()
     if job.get("no_agent") and not script:
         issues.append("no-agent job has no script")
-    if script and (script_issue := _script_health_issue(script)):
-        issues.append(script_issue)
-    workdir = str(job.get("workdir") or "").strip()
-    if workdir and not Path(workdir).expanduser().exists():
-        issues.append(f"workdir not found: {workdir}")
+    issues.extend(_cron_workspace_issues(job))
     if job.get("timezone"):
         from cron.jobs_time import zone_for_job
         if zone_for_job(job) is None:

@@ -443,9 +443,28 @@ def _script_argv(
     return [python_exe, str(path)], env_overlay, None
 
 
+def _format_script_output(returncode: int, stdout_raw: str, stderr_raw: str) -> tuple[bool, str]:
+    from agent.redact import redact_sensitive_text
+
+    try:
+        stdout = redact_sensitive_text((stdout_raw or "").strip())
+        stderr = redact_sensitive_text((stderr_raw or "").strip())
+    except (ImportError, TypeError, ValueError) as exc:
+        logger.warning("Failed to redact sensitive text from output: %s", exc)
+        stdout = stderr = "[REDACTED - redaction failed]"
+    if returncode == 0:
+        return True, stdout
+    parts = [f"Script exited with code {returncode}"]
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    if stdout:
+        parts.append(f"stdout:\n{stdout}")
+    return False, "\n".join(parts)
+
+
 def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
-    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None, *, job=None,
 ) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
@@ -461,6 +480,19 @@ def _run_job_script(
     from tools.hosted_tool_policy import host_feature_refusal
     if refusal := host_feature_refusal("cron_scripts", "A cron script"):
         return False, refusal
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        from cron.executor_script import run_executor_script
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+        try:
+            _, result = run_executor_script(script_path, workdir, interpreter, _get_script_timeout(), cancel_event, job=job)
+        except (OSError, ValueError, SshWorkspaceFsError) as exc:
+            return False, str(exc)
+        if isinstance(result, str):
+            return False, result
+        stdout, stderr, returncode = result
+        return _format_script_output(returncode, stdout, stderr)
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
@@ -531,26 +563,7 @@ def _run_job_script(
             except subprocess.TimeoutExpired:
                 continue
 
-        stdout = (stdout_raw or "").strip()
-        stderr = (stderr_raw or "").strip()
-
-        # Redact secrets before ANY return path.
-        try:
-            from agent.redact import redact_sensitive_text
-            stdout = redact_sensitive_text(stdout)
-            stderr = redact_sensitive_text(stderr)
-        except Exception as e:
-            logger.warning("Failed to redact sensitive text from output: %s", e)
-            stdout = stderr = "[REDACTED - redaction failed]"
-
-        if proc.returncode != 0:
-            parts = [f"Script exited with code {proc.returncode}"]
-            if stderr:
-                parts.append(f"stderr:\n{stderr}")
-            if stdout:
-                parts.append(f"stdout:\n{stdout}")
-            return False, "\n".join(parts)
-        return True, stdout
+        return _format_script_output(proc.returncode, stdout_raw, stderr_raw)
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
@@ -563,7 +576,7 @@ def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.
         target=contextvars.copy_context().run, args=(loop_fn,), name=name, daemon=True)
     try:
         thread.start()
-    except Exception:
+    except (OSError, RuntimeError):
         fail_log()
         return None
     return thread
@@ -578,8 +591,11 @@ def _run_job_script_with_claim_heartbeat(
     Recurring/unclaimed runs have no durable claim → no thread. The owner is captured from the
     dispatched job, never re-read, so a stale runner cannot extend a replacement owner's claim."""
     def run() -> tuple[bool, str]:
+        from hermes_cli.main_resume_args import uses_managed_executor
+
+        options = {"job": job} if uses_managed_executor() and job.get("no_agent") else {}
         return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event,
-                               interpreter=job.get("interpreter"))
+                               interpreter=job.get("interpreter"), **options)
 
     schedule = job.get("schedule")
     claim = job.get("run_claim")

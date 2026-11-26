@@ -206,6 +206,7 @@ When `workdir` is set:
 - `terminal`, `read_file`, `write_file`, `patch`, `search_files`, and `execute_code` all use that directory as their working directory
 - The path must be an absolute directory that exists — relative paths and missing directories are rejected at create / update time
 - Pass `--workdir ""` (or `workdir=""` via the tool) on edit to clear it and restore the old behaviour
+- With [managed SSH workspaces](../managed-scope.md), explicit `workdir` paths, scheduled scripts (`script`, `monitor_script`, and `no_agent` scripts), and `hermes cron doctor` checks resolve on the SSH executor instead of the Hermes host, script artifacts are fetched from the executor before delivery, and executor workdirs are excluded from host-side Git worktree maintenance sweeps.
 
 :::note Isolation
 Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. Set `cron.max_parallel_jobs` if you want to limit total cron concurrency.

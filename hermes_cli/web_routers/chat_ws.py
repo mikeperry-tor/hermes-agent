@@ -472,6 +472,17 @@ async def _pty_channel_marker_state(
     return active_session_file, marker_preexisting, resume
 
 
+async def _new_chat_workspace(ws, profile, resume):
+    # The saved session owns its cwd when a chat resumes.
+    requested = ws.query_params.get("cwd")
+    if resume or not requested:
+        return None
+    from hermes_cli.web_routers._common import config_scoped_to_thread
+    from hermes_cli.web_routers.chat_workspaces import resolve_chat_cwd
+
+    return await config_scoped_to_thread(profile, lambda: resolve_chat_cwd(requested))
+
+
 @router.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     from hermes_cli.web_server_chat import PTY_REGISTRY, PtyBridge, PtyUnavailableError, _PTY_BRIDGE_AVAILABLE, _RESIZE_RE
@@ -512,18 +523,9 @@ async def pty_ws(ws: WebSocket) -> None:
     resolve_kwargs = {"resume": resume, "sidecar_url": sidecar_url, "profile": profile}
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
-    # A picked workspace only applies to a FRESH chat; a resumed session keeps its own cwd.
-    if not resume:
-        from hermes_cli.web_routers.chat_workspaces import resolve_chat_cwd
-        try:
-            workspace_cwd = resolve_chat_cwd(ws.query_params.get("cwd"))
-        except HTTPException as exc:  # dead/relative path: fail closed, never the launch dir
-            await _pty_fail(ws, exc)
-            return
-        if workspace_cwd:
-            resolve_kwargs["workspace_cwd"] = workspace_cwd
-
     try:
+        if workspace_cwd := await _new_chat_workspace(ws, profile, resume):
+            resolve_kwargs["workspace_cwd"] = workspace_cwd
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
     except HTTPException as exc:  # unknown/invalid profile
         if not marker_preexisting:

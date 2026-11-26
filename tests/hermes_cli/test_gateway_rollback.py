@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from hermes_cli import gateway_rollback
+from hermes_cli.gateway_client import GatewayRPCError
 from hermes_cli.gateway_connection import GatewayConnection
 
 
@@ -15,7 +16,10 @@ class _Client:
 
     async def rpc(self, method, *, _timeout=None, **params):
         self.calls.append((method, params))
-        return self.answers[method]
+        answer = self.answers[method]
+        if isinstance(answer, GatewayRPCError):
+            raise answer
+        return answer
 
 
 def _connection(client):
@@ -71,5 +75,17 @@ def test_rollback_all_reaches_the_gateway_and_kept_edits_are_shown(capsys, monke
         assert client.calls[-1] == ("rollback.restore", {"session_id": "local-rb", "hash": "1", "all": True})
         gateway_rollback.rollback(cli, conn, "/rollback 1 a.txt --force")
         assert client.calls[-1] == ("rollback.restore", {"session_id": "local-rb", "hash": "1", "file_path": "a.txt"})
+    finally:
+        conn.close()
+
+
+def test_rollback_shows_the_owner_checkpoint_refusal(capsys):
+    detail = 'Filesystem checkpoints and rollback are unavailable for terminal.backend=ssh.'
+    conn = _connection(_Client({
+        'rollback.list': GatewayRPCError('unsupported_terminal_backend', data={'detail': detail, 'field': 'checkpoint'}),
+    }))
+    try:
+        gateway_rollback.rollback(_Cli(), conn, '/rollback')
+        assert detail in capsys.readouterr().out
     finally:
         conn.close()

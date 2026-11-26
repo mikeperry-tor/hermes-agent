@@ -31,7 +31,7 @@ def workspaces(tmp_path, monkeypatch):
         folder.mkdir()
         (folder / "notes.txt").write_text(body, encoding="utf-8")
     monkeypatch.setenv("TERMINAL_CWD", str(daemon))
-    policies = {"local-chat": SimpleNamespace(cwd=str(project))}
+    policies = {"local-chat": SimpleNamespace(cwd=str(project), terminal_json='{"TERMINAL_ENV":"local"}')}
     monkeypatch.setattr(session_policy, "policy_for_source",
                         lambda runner, source: policies.get(source.chat_id) if source.platform == Platform.LOCAL else None)
 

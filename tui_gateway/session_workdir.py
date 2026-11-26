@@ -1022,3 +1022,20 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
 def register(server) -> None:
     """Publish this module's helpers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))
+
+
+def bind_sidecar_project(cwd, session):
+    """Bind a selected sidecar project's pinned terminal policy for local commands."""
+    from agent.runtime_scope import bind_terminal_policy
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from hermes_cli.ssh_project_probe import _absolute_project, _under_roots, managed_project_access
+    from hermes_constants import get_hermes_home
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    if not _absolute_project(cwd) or (session and not session.get("explicit_cwd")) or not uses_managed_executor():
+        return None
+    home = get_hermes_home()
+    access = managed_project_access(build_profile_terminal_scope(home))
+    if not access or not _under_roots(cwd, access[0]):
+        return None
+    return bind_terminal_policy(dict(access[1], TERMINAL_CWD=cwd, TERMINAL_SSH_PROJECT_SELECTED="1"), profile_home=home)

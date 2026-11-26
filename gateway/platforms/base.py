@@ -31,6 +31,9 @@ from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 
+from gateway.ssh_media import (managed_media_delivery as _managed_media_delivery,
+                               managed_media_tokens, validated_delivery_path as _validated_delivery_path)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1027,14 +1030,14 @@ def _translate_docker_container_media_path(
     return None
 
 
-def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
+def validate_media_delivery_path(path: str, session_key: str = "", *, literal: bool = False) -> Optional[str]:
     """Safe absolute file path for native media delivery, else None. Default: any existing
     regular file outside the credential / system denylist (symmetric with inbound). Strict
     (``HERMES_MEDIA_DELIVERY_STRICT=1``, public bots where prompt injection must not exfiltrate
     host secrets): MUST be under a Hermes cache, an operator root (``HERMES_MEDIA_ALLOW_DIRS``),
     or freshly produced within the recency window. Symlinks are resolved before any check."""
     from tools.hosted_tool_policy import host_feature_enabled
-    if not host_feature_enabled("media_delivery") or not (candidate := _normalize_media_tag_path(path)):
+    if not host_feature_enabled("media_delivery") or not (candidate := path if literal else _normalize_media_tag_path(path)):
         return None
     try:
         expanded = Path(os.path.expanduser(candidate))
@@ -1043,8 +1046,8 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
         return None
     if not expanded.is_absolute():
         return None
-    # Docker agents emit MEDIA:/workspace/... — map container paths to host paths first.
-    resolved = _translate_docker_container_media_path(expanded, session_key=session_key) or _resolve_path(expanded, strict=True)
+    resolved = (None if literal else _translate_docker_container_media_path(
+        expanded, session_key=session_key)) or _resolve_path(expanded, strict=True)
     if resolved is None or not resolved.is_file():
         return None
     # Project-local secret env files (.env, .envrc, ...) are read-blocked anywhere on disk by
@@ -1068,27 +1071,6 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
             and _file_is_recently_produced(resolved, window)):
         return str(resolved)
     return None
-
-
-def _validated_delivery_path(raw_path, session_key: str, label: str,
-                             dropped: Optional[list[dict]] = None) -> Optional[str]:
-    """``validate_media_delivery_path`` plus the shared "Skipping unsafe ..." warning. A path the
-    host cannot see is retried against the active remote sandbox (ssh/modal/...; #466). When
-    ``dropped`` is a list, a rejected path is appended as ``{"path", "reason"}`` so the caller can
-    report the drop instead of booking a delivery that never happened (#115908)."""
-    raw = str(raw_path)
-    safe_path = validate_media_delivery_path(raw, session_key=session_key)
-    if not safe_path:
-        from gateway.media_fetch import fetch_remote_media
-        safe_path = fetch_remote_media(raw)
-    if not safe_path:
-        # Say WHY: a path that does not exist on the host is the common case (a model hallucinated or
-        # a sandbox path failed to translate) and is not a security rejection.
-        reason = "not found on this host" if not _existing_regular_file(raw) else "denied by the delivery policy"
-        logger.warning("Skipping %s (%s): %s", label, reason, _log_safe_path(raw))
-        if dropped is not None:
-            dropped.append({"path": raw, "reason": reason})
-    return safe_path
 
 
 def _existing_regular_file(raw: str) -> bool:
@@ -1340,7 +1322,10 @@ def _real_media_tag_spans(masked: str) -> list:
     """(start, end) spans of deliverable MEDIA tags on a masked copy: known-extension tags
     unconditionally, extension-less / unknown ones only if validate_media_delivery_path accepts."""
     spans: list = [m.span() for m in MEDIA_TAG_CLEANUP_RE.finditer(masked)]
-    spans.extend((match.start(), end) for match, _, end in _extensionless_media_matches(masked))
+    if _managed_media_delivery():
+        spans.extend((start, end) for start, end, _ in managed_media_tokens(masked, MEDIA_TAG_CLEANUP_RE))
+    else:
+        spans.extend((match.start(), end) for match, _, end in _extensionless_media_matches(masked))
     return spans
 
 
@@ -3108,16 +3093,18 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
 
     @staticmethod
     def filter_media_delivery_paths(media_files, session_key: str = "",
-                                    dropped: Optional[list[dict]] = None) -> list[tuple[str, bool]]:
+                                    dropped: Optional[list[dict]] = None, *, approved=(), cwd=None) -> list[tuple[str, bool]]:
         """Drop unsafe MEDIA paths and normalize accepted paths; ``dropped`` collects the rejects."""
         return [
             (safe_path, bool(is_voice)) for media_path, is_voice in media_files or []
-            if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path", dropped))]
+            if (safe_path := _validated_delivery_path(media_path, session_key, "MEDIA directive path",
+                                                      dropped, approved=approved, cwd=cwd))]
 
     @staticmethod
-    def filter_local_delivery_paths(file_paths, session_key: str = "") -> list[str]:
+    def filter_local_delivery_paths(file_paths, session_key: str = "", *, approved=(), cwd=None) -> list[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
-        safe_paths = (_validated_delivery_path(p, session_key, "local file path") for p in file_paths or [])
+        safe_paths = (_validated_delivery_path(p, session_key, "local file path", approved=approved, cwd=cwd)
+                      for p in file_paths or [])
         return [p for p in safe_paths if p]
 
     @staticmethod
@@ -3126,17 +3113,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         valid) against MEDIA: false positives; backtick-quoted paths inside MEDIA: tags stay
         scannable."""
         spans: list = [m.span() for m in _FENCED_CODE_RE.finditer(content)]
+        managed = _managed_media_delivery()
         for m in _INLINE_CODE_RE.finditer(content):
             start = m.start()
             if re.search(r'MEDIA:\s*$', content[max(0, start - 20):start]):
                 continue  # This is a MEDIA path quote, not inline code
-            # A whole tag in inline code (`MEDIA:/path.csv`) is a real directive (models format
-            # paths as code): deliver IF it validates; non-existent examples stay masked.
-            # See #35695.
             inner = m.group(0)[1:-1].strip()
             if inner.upper().startswith("MEDIA:"):
                 candidate = _normalize_media_tag_path(inner[6:])
-                if candidate and validate_media_delivery_path(candidate):
+                if candidate and (managed or validate_media_delivery_path(candidate)):
                     continue  # Real deliverable tag in inline code — keep it scannable
             spans.append((start, m.end()))
         spans.extend(m.span() for m in re.finditer(r'^>.*$', content, re.MULTILINE))
@@ -3170,14 +3155,13 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         ``[[as_document]]`` (unmodified sendDocument for large images) is detected by dispatch sites
         on the ORIGINAL response and only stripped here."""
         media = []
+        managed = _managed_media_delivery()
         has_voice_tag = "[[audio_as_voice]]" in content
         cleaned = content.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
         # Scan a masked copy so example/stored MEDIA paths (code, quotes, JSON values) are never
         # delivered: code blocks / inline code / blockquotes hold prose examples (#35695), serialized
         # JSON string values hold stored tool-result text (#34375); both maskers preserve offsets.
         scan_content = _mask_media_scan_text(content)
-        # Dedupe on the expanded path (first occurrence wins) so the same file referenced twice in one
-        # response — e.g. a MEDIA tag inline AND in a summary footer — is uploaded once, not twice (#29131).
         seen_paths: set = set()
         dropped_nul = False
 
@@ -3193,11 +3177,13 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         for match in MEDIA_TAG_CLEANUP_RE.finditer(scan_content):
             path = _normalize_media_tag_path(match.group("path"))
             if path:  # never expanduser a NUL path: it raises, and _add must still see it to drop its tag
-                _add(path if "\x00" in path else os.path.expanduser(path))
-        for _, safe_path, _ in _extensionless_media_matches(scan_content):
-            _add(safe_path)
-        # Locate tag spans on a masked copy, delete them from the unmasked text (protected spans
-        # survive).
+                _add(path if managed or "\x00" in path else os.path.expanduser(path))
+        if managed:
+            for _, _, token in managed_media_tokens(scan_content, MEDIA_TAG_CLEANUP_RE):
+                _add(token)
+        else:
+            for _, safe_path, _ in _extensionless_media_matches(scan_content):
+                _add(safe_path)
         if media or dropped_nul:
             spans = _deliverable_tag_spans(cleaned)
             if spans:
@@ -3214,7 +3200,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
 
     @staticmethod
-    def extract_local_files(content: str) -> tuple[list[str], str]:
+    def extract_local_files(content: str, *, resolve=None) -> tuple[list[str], str]:
         """Bare local file paths (absolute, ``~/`` or drive-letter) with deliverable extensions ->
         ``(expanded_paths, cleaned_text)``. Candidates must exist on disk (URLs / hallucinated paths
         ignored); paths inside fenced or inline code are skipped so code samples are never
@@ -3229,12 +3215,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             re.IGNORECASE)
         code_spans = _code_spans(content)
         unique: dict = {}  # expanded_path -> raw_match_text, deduped in discovery order
+        managed = _managed_media_delivery()
+        if managed and resolve is None:
+            return [], content
         for match in path_re.finditer(content):
             if any(s <= match.start() < e for s, e in code_spans):
                 continue
             raw = match.group(0)
-            expanded = os.path.expanduser(raw)
-            if os.path.isfile(expanded):
+            expanded = resolve(raw) if managed else os.path.expanduser(raw)
+            if expanded and (managed or os.path.isfile(expanded)):
                 unique.setdefault(expanded, raw)
             else:
                 # Most common reason a promised file never arrives — log the gap.
@@ -4259,22 +4248,32 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
-        # The handler's routed profile scope is gone by now; Docker MEDIA translation and the
-        # bare-path validator infer the sandbox from the ACTIVE profile (#109024).
         with self._media_delivery_scope(event.source):
+            approved = getattr(event, "_managed_media_producers", ())
+            cwd = getattr(event, "_managed_media_cwd", None)
             media_files, response = self.extract_media(response)
-            media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
+            managed = _managed_media_delivery()
+            if managed:
+                media_files = await asyncio.to_thread(
+                    self.filter_media_delivery_paths, media_files, session_key=session_key, approved=approved, cwd=cwd)
+            else:
+                media_files = self.filter_media_delivery_paths(media_files, session_key=session_key)
             images, text_content = self.extract_images(response)
-            # Strip any remaining internal directives from message body (fixes #1561). _strip_media_directives
-            # shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag with an unknown extension is intentionally left in
-            # the body for extract_local_files below to pick up rather than silently dropped (#34517).
             text_content = _strip_media_directives(text_content).strip()
             if images:
                 logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
             local_files = []
             if not is_ephemeral_response:
-                local_files, text_content = self.extract_local_files(text_content)
-                local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
+                if managed:
+                    from functools import partial
+
+                    resolve = partial(_validated_delivery_path, session_key=session_key, label="local file path",
+                                      approved=approved, cwd=cwd)
+                    local_files, text_content = await asyncio.to_thread(self.extract_local_files, text_content,
+                                                                       resolve=resolve)
+                else:
+                    local_files, text_content = self.extract_local_files(text_content)
+                    local_files = self.filter_local_delivery_paths(local_files, session_key=session_key)
             from gateway.platforms.docker_media_paths import hand_back_unreadable_media
             await hand_back_unreadable_media([p for p, _ in media_files] + local_files)
         history = (await self._bounded_history_media_paths_for_session(session_key)

@@ -103,6 +103,10 @@ def _kanban_dispatch_allowed() -> bool:
     Checked every tick before spawning, so a pause applies on the next tick;
     in-flight workers are never touched. Fails open if estop is unimportable.
     """
+    from hermes_cli.kanban_db_workspace import _managed_workspace_unavailable
+
+    if _managed_workspace_unavailable():
+        return False
     try:
         from agent.estop import check_paused
     except ImportError:

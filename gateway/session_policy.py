@@ -430,9 +430,32 @@ def present_sections(config):
     return config
 
 
-def build_policy(params, config, *, private_secrets=None, profile_terminal=True, workspace_posture=False,
-                 client_local=False):
+def _launch_cwd(params, executor_project):
     from agent.runtime_cwd import resolve_agent_cwd
+    from hermes_constants import get_hermes_home
+    row_cwd = params.get('row_cwd')
+    if 'row_cwd' in params and (not isinstance(row_cwd, str) or (row_cwd and not Path(row_cwd).is_absolute())):
+        _refuse('row_cwd', 'must be an absolute path when set')
+    if executor_project is not None:
+        return executor_project[0]
+    cwd = params.get('cwd', str(resolve_agent_cwd()))
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
+        _refuse('cwd', 'must be an absolute path to an existing directory')
+    if params.get('cwd_explicit') is False and 'cwd' in params:
+        cwd = _profile_workspace_cwd(get_hermes_home()) or cwd
+    return cwd
+
+
+def public_create_request(params, private_secrets):
+    request = {k: v for k, v in params.items() if k not in {'request_id', 'api_key', 'client_env'}}
+    request.setdefault('source', 'cli')
+    from gateway.session_local_mcp import private_editor_request
+    private_editor_request(request, private_secrets)
+    return request
+
+
+def build_policy(params, config, *, private_secrets=None, profile_terminal=True, workspace_posture=False,
+                 client_local=False, executor_project=None):
     from tools.terminal_scope import build_profile_terminal_scope, default_terminal_scope
     from hermes_constants import get_hermes_home
 
@@ -454,14 +477,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
     model = params.get('model')
     if 'model' in params and (not isinstance(model, str) or not model.strip()):
         _refuse('model', 'must be a non-empty string')
-    cwd = params.get('cwd', str(resolve_agent_cwd()))
-    if not isinstance(cwd, str) or not Path(cwd).is_absolute() or not Path(cwd).is_dir():
-        _refuse('cwd', 'must be an absolute path to an existing directory')
-    row_cwd = params.get('row_cwd')
-    if 'row_cwd' in params and (not isinstance(row_cwd, str) or (row_cwd and not Path(row_cwd).is_absolute())):
-        _refuse('row_cwd', 'must be an absolute path when set')
-    if params.get('cwd_explicit') is False and 'cwd' in params:
-        cwd = _profile_workspace_cwd(get_hermes_home()) or cwd
+    cwd = _launch_cwd(params, executor_project)
     from gateway.session_local_editor import validate_editor
     validate_editor(source, params.get('editor'))
     if 'client' in params:  # a self-declared label kept in the request as sent; no decision below reads it
@@ -481,12 +497,17 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
     # directory (the fallback above) is no workspace, and ``tool`` is a third-party integration. An explicit
     # pick wins anyway; skipping it here also spares the probe.
     named = workspace_posture and source != 'tool' and 'cwd' in params and 'toolsets' not in params
-    coding_posture = named and _in_coding_workspace(config, source, cwd)
+    picked = 'cwd' in params and params.get('cwd_explicit', source not in ('cli', 'oneshot', 'tui', 'tool'))
+    coding_posture = named and (executor_project is None or picked) and _in_coding_workspace(
+        config, source, cwd, executor_project=executor_project)
     enabled = _resolve_toolsets(params, config, source, safe_mode, coding_posture, bypass=ignore_user_config)
     terminal = build_profile_terminal_scope(get_hermes_home()) if profile_terminal else default_terminal_scope()
     # The client's launch folder is a path on THIS host: a remote or container backend keeps its own
     # configured cwd unless the user picked this folder for the session.
-    if params.get('cwd_explicit') is True or terminal_uses_host_cwd(terminal):
+    if executor_project is not None:
+        terminal.update(executor_project[1])
+        terminal['TERMINAL_SSH_PROJECT_SELECTED'] = '1' if picked or cwd != '/workspace' else '0'
+    if executor_project is not None or params.get('cwd_explicit') is True or terminal_uses_host_cwd(terminal):
         terminal['TERMINAL_CWD'] = cwd
     client_env = rules = None
     if 'client_env' in params:
@@ -498,10 +519,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
             _refuse('client_env', str(exc))
         rules = json.dumps(rules, sort_keys=True)
     # Values stay out of the request: ``launch_request`` is echoed to every viewer of the session.
-    request = {k: v for k, v in params.items() if k not in {'request_id', 'api_key', 'client_env'}}
-    request.setdefault('source', 'cli')
-    from gateway.session_local_mcp import private_editor_request
-    private_editor_request(request, private_secrets)
+    request = public_create_request(params, private_secrets)
     _extract_config_secrets(config, private_secrets)
     _extract_config_secrets(terminal, private_secrets, (None,))
     return LocalSessionPolicy(source, SURFACES[source], cwd, model, tuple(sorted(enabled)),
@@ -748,11 +766,18 @@ def _unnamed_extension_toolsets(explicit, requested, config):
     return (plugin_keys | enabled_mcp_server_names(config)) - named - covered
 
 
-def _in_coding_workspace(config, source, cwd):
+def _in_coding_workspace(config, source, cwd, *, executor_project=None):
     """Whether *cwd* selects the coding posture (``agent.coding_context: focus`` in a code workspace).
     A detection failure keeps the profile default rather than refusing the session."""
     from agent.coding_context import in_focus_workspace
     try:
+        if executor_project is not None:
+            from agent.coding_context import INTERACTIVE_CODING_PLATFORMS, _coding_mode
+            from agent.ssh_project_context import executor_coding_workspace
+
+            if _coding_mode(config) != "focus" or SURFACES[source] not in INTERACTIVE_CODING_PLATFORMS:
+                return False
+            return bool(executor_coding_workspace(terminal=executor_project[1], directory=cwd)[1])
         return in_focus_workspace(platform=SURFACES[source], cwd=cwd, config=config)
     except Exception:
         logger.debug('coding posture detection failed for %s; keeping the profile default', cwd, exc_info=True)
@@ -857,6 +882,13 @@ def register_worker_hooks(policy):
     register_outbound_webhooks(config)
 
 
+def launch_keys_match(left: str, right: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(left.encode('utf-8', errors='surrogatepass'),
+                               right.encode('utf-8', errors='surrogatepass'))
+
+
 def bind_launch_key(authority, session_id, policy, api_key, *, config_secrets=None, owner_key=False,
                     client_request=None):
     """CLI keys live only in this authority lifetime, never its durable receipt.
@@ -869,7 +901,6 @@ def bind_launch_key(authority, session_id, policy, api_key, *, config_secrets=No
     then fingerprints the key it runs with.
     """
     from dataclasses import replace
-    import hmac
     from gateway.session_local_mcp import PRIVATE_KEY, bind_editor_mcp
     config_secrets = dict(config_secrets or {})
     policy = bind_editor_mcp(authority, session_id, policy, config_secrets.pop(PRIVATE_KEY, None))
@@ -890,7 +921,7 @@ def bind_launch_key(authority, session_id, policy, api_key, *, config_secrets=No
         api_key = old if same_create_retry(owners[ref], policy.request_json, client_request or {}) else api_key
     # Only a key that IS being bound can conflict: binding config secrets alone (a provider
     # change drops the launch key) must not be refused by the key the session already holds.
-    if api_key is not None and old is not None and not hmac.compare_digest(old, api_key):
+    if api_key is not None and old is not None and not launch_keys_match(old, api_key):
         raise AuthorityRefusal('admission_conflict')
     configs = getattr(authority, '_local_config_secrets', None)
     if configs is None:
@@ -944,7 +975,7 @@ def rebind_launch_key(authority, session, api_key):
         keys = authority._local_launch_keys = {}
     held = keys.get(_key_slot(ref))
     if held is not None:
-        if not hmac.compare_digest(held, api_key):
+        if not launch_keys_match(held, api_key):
             raise AuthorityRefusal('admission_conflict')
         return
     _, _, fingerprint = ref.partition('#')
@@ -1239,13 +1270,65 @@ def policy_for_source(runner, source):
     return None
 
 
-def workspace_ready(policy) -> bool:
-    """Readiness, not structure: a removed workspace keeps the chat readable and movable, but no
-    turn runs in a missing directory. A cwd spelled for another OS restores (the receipt records where the
-    session was made) but is never ready here: on Windows ``/Users/x`` would resolve against the current
-    drive and bind a folder the session never named."""
+def display_workspace_cwd(policy):
+    """Use a saved SSH execution directory when a receipt predates managed project selection."""
+    from hermes_cli.ssh_project_probe import _absolute_project
+    from tools.file_tools_paths import managed_ssh_workspace_roots
+
+    terminal = json.loads(policy.terminal_json)
+    if terminal.get('TERMINAL_ENV') != 'ssh':
+        return policy.cwd
+    try:
+        roots = managed_ssh_workspace_roots()
+    except ValueError:
+        roots = ()
+    if roots is None:
+        return policy.cwd
+    cwd = terminal.get('TERMINAL_CWD')
+    if _absolute_project(cwd):
+        return cwd
+    return roots[0] if roots else policy.cwd
+
+
+def _runtime_workspace(policy, home):
+    from hermes_cli.ssh_project_probe import inspect_managed_project
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_constants import get_hermes_home
+
+    terminal = json.loads(policy.terminal_json)
+    requested = terminal.get('TERMINAL_CWD')
+    if requested in {None, '', '.', 'auto', 'cwd', '~'}:
+        requested = None
+    project = None
+    if policy.source in SURFACES:
+        try:
+            project = inspect_managed_project(terminal, requested, profile_key=str(home or get_hermes_home()))
+        except SshWorkspaceFsError as exc:
+            raise AuthorityRefusal('workspace_unavailable', field='cwd', detail=str(exc)) from exc
+    if project is not None:
+        facts, pinned = project
+        if requested is not None and facts['cwd'] != requested:
+            raise AuthorityRefusal('workspace_unavailable', field='cwd', detail=requested)
+        return facts['cwd'], pinned
+    if terminal.get('TERMINAL_SSH_PROJECT_SELECTED') in ('0', '1'):
+        raise AuthorityRefusal('workspace_unavailable', field='cwd', detail=policy.cwd)
     cwd = Path(policy.cwd)
-    return cwd.is_absolute() and cwd.is_dir()
+    if not cwd.is_absolute() or not cwd.is_dir():
+        raise AuthorityRefusal('workspace_unavailable', field='cwd', detail=policy.cwd)
+    return policy.cwd, terminal
+
+
+def ready_workspace(policy):
+    """Get the verified working directory and terminal policy for this turn."""
+    try:
+        return _runtime_workspace(policy, None)
+    except AuthorityRefusal:
+        return None
+
+
+def workspace_ready(policy) -> bool:
+    """Check the filesystem used by a turn without changing the saved session."""
+    return ready_workspace(policy) is not None
 
 
 def workspace_unavailable_result(policy) -> dict:
@@ -1254,7 +1337,7 @@ def workspace_unavailable_result(policy) -> dict:
     instead of the generic "something went wrong" apology."""
     from agent.i18n import t
     from agent.turn_failure_copy import stamp_failure
-    text = t("gateway.errors.workspace_unavailable", path=policy.cwd)
+    text = t("gateway.errors.workspace_unavailable", path=display_workspace_cwd(policy))
     return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
                           "failed": True, "completed": False, "error": text},
                          "workspace_unavailable", False)
@@ -1281,23 +1364,22 @@ def refused_turn_result(policy, exc) -> dict | None:
 
 
 @contextmanager
-def policy_scope(policy, *, authority=None, home=None):
+def policy_scope(policy, *, authority=None, home=None, verified_workspace=None):
     """Bind a session's frozen policy for a turn. *home* is the profile that owns the session (its
     terminal policy's owner); it defaults to *authority*'s profile."""
     if policy is None:
         yield
         return
-    if not workspace_ready(policy):
-        raise AuthorityRefusal('workspace_unavailable', field='cwd', detail=policy.cwd)
+    owner = home if home is not None else getattr(authority, 'profile_id', None)
+    cwd, terminal = verified_workspace or _runtime_workspace(policy, owner)
     from agent.runtime_cwd import set_session_cwd
     from agent.runtime_scope import bind_terminal_policy
     from tools.terminal_scope import reset_terminal_scope
-    terminal = json.loads(policy.terminal_json)
     live = policy.read_profile(authority, for_turn=True)
     if policy.config_secret_ref is not None:
         from gateway.session_policy_credentials import recover_config_secrets
         for path, value in recover_config_secrets(authority, policy, skip=policy.followed_sections if live else None).items():
-            if path[0] is None:
+            if path[0] is None and terminal.get(path[1]) is None:
                 terminal[path[1]] = value
     # A following session's turn reads its profile once; every resolution in the turn uses that read.
     profile_token = _TURN_PROFILE.set((policy, live))
@@ -1305,8 +1387,7 @@ def policy_scope(policy, *, authority=None, home=None):
     if policy.follows_profile:
         from dataclasses import replace
         active = replace(policy, toolsets=policy.current_toolsets(policy.config(authority, secrets=False)))
-    cwd_token = set_session_cwd(policy.cwd)
-    owner = home if home is not None else getattr(authority, 'profile_id', None)
+    cwd_token = set_session_cwd(cwd)
     terminal_token = bind_terminal_policy(terminal, profile_home=owner)
     policy_token = _ACTIVE_POLICY.set(active)
     from gateway.session_local_editor import editor_scope

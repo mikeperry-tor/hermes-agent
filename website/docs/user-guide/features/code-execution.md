@@ -135,6 +135,12 @@ print(json.dumps(report, indent=2))
 | **`project`** (default) | The session's working directory (same as `terminal()`) | Active `VIRTUAL_ENV` / `CONDA_PREFIX` python, falling back to Hermes's own python |
 | `strict` | A temp staging directory isolated from the user's project | `sys.executable` (Hermes's own python) |
 
+Managed SSH uses `python3` from the executor's PATH in both modes. In project
+mode, the kernel starts in the session's selected executor directory. Moving
+the session to another project starts a fresh kernel for that directory. In
+strict mode, Python starts in a private temporary directory on the executor.
+Single-turn gateway workers release their kernels when the worker exits.
+
 **When to leave it on `project`:** you want `import pandas`, `from my_project import foo`, or relative paths like `open(".env")` to work the same way they do in `terminal()`. This is almost always what you want.
 
 **When to flip to `strict`:** you need maximum reproducibility — you want the same interpreter every session regardless of which venv the user activated, and you want scripts quarantined from the project tree (no risk of accidentally reading project files through a relative path).

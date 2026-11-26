@@ -379,7 +379,10 @@ def _gate_workspace() -> tuple[Optional[str], Optional[str]]:
     and no agent turn can fix it, so the caller pauses instead of retrying.
     No declared workspace keeps the classic resolution (TERMINAL_CWD, else the launch directory)."""
     from agent.runtime_cwd import resolve_agent_cwd, scoped_session_cwd
+    from hermes_cli.main_resume_args import uses_managed_executor
 
+    if uses_managed_executor():
+        return None, "quality gates are unavailable for an SSH executor workspace"
     declared = scoped_session_cwd()
     if declared:
         path = Path(declared).expanduser()

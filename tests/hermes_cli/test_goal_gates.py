@@ -322,3 +322,23 @@ def test_gate_without_a_session_workspace_keeps_the_launch_directory(backend_and
     judge.assert_called_once()
     assert decision["verdict"] == "done"
     assert str(backend.resolve()) in mgr.state.gates[0].last_output_tail
+
+
+def test_managed_ssh_goal_gate_pauses_before_the_hermes_copy(backend_and_session, monkeypatch):
+    from hermes_cli import main_resume_args
+
+    backend, _session, bind = backend_and_session
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: True)
+    manager = _mgr_with_goal("gate-ssh-project")
+    manager.add_gate("sh check.sh")
+    unbind = bind(backend)
+    try:
+        with patch("hermes_cli.goals.run_gate") as run:
+            decision, judge = _evaluate_with_done_judge(manager)
+    finally:
+        unbind()
+    run.assert_not_called()
+    judge.assert_not_called()
+    assert decision["status"] == "paused"
+    assert "unavailable for an SSH executor workspace" in decision["message"]
+    assert manager.state.gates[0].attempts == 0

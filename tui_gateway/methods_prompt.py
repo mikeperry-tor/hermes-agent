@@ -1163,6 +1163,11 @@ def _(rid, params: dict) -> dict:
     if not raw and not data_url:
         return _err(rid, 4015, "path or data_url required")
     try:
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if uses_managed_executor():
+            from hermes_constants import get_hermes_home
+            session = {**session, "profile_home": session.get("profile_home") or get_hermes_home(),
+                       "executor_attachment_session": str(params["session_id"])}
         stored_path, uploaded = _stage_session_file_attachment(
             session, raw_path=raw, data_url=data_url, name=name)
         ref_path = _attachment_ref_path(session, stored_path)

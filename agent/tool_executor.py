@@ -109,11 +109,12 @@ def _ensure_file_checkpoint(agent, function_name: str, function_args: dict, effe
     file_path = function_args.get("path", "")
     if not file_path:
         return
+    from agent.checkpoints.manager import CheckpointManager
     from agent.file_safety import is_nt_namespace_path
-    from tools.file_tools_paths import _resolve_path_for_task, container_backend_for_task
+    from tools.file_tools_paths import _resolve_path_for_task
 
-    if container_backend_for_task(effective_task_id or "default") is not None:
-        return  # container paths: nothing to checkpoint on the host
+    if CheckpointManager.unsupported_backend_reason(effective_task_id or "default"):
+        return
 
     # Resolving an NT-namespace path is itself the NTLM-leak trigger; leave the
     # tool's raw-string guard to refuse it without a checkpoint stat.
@@ -1066,8 +1067,8 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
         elif function_name == "terminal":
             command = function_args.get("command", "")
             if _is_destructive_command(command):
-                from tools.file_tools_paths import container_backend_for_task
-                if container_backend_for_task(effective_task_id or "default") is None:
+                from agent.checkpoints.manager import CheckpointManager
+                if not CheckpointManager.unsupported_backend_reason(effective_task_id or "default"):
                     from agent.runtime_cwd import scope_terminal_cwd
                     cwd = function_args.get("workdir") or scope_terminal_cwd() or os.getcwd()
                     agent._checkpoint_mgr.ensure_checkpoint(cwd, f"before terminal: {command[:60]}")
@@ -1121,6 +1122,7 @@ def _commit_tool_result(
     if not (blocked or is_error):
         function_result = observe_onboarding_result(agent, function_name, function_args, function_result)
     if observed:
+        mutation_result = function_result
         if not blocked:
             function_result = agent._append_guardrail_observation(
                 function_name, function_args, function_result, failed=is_error, tool_call_id=tool_call_id,
@@ -1132,7 +1134,7 @@ def _commit_tool_result(
         if not blocked:
             try:
                 agent._record_file_mutation_result(
-                    function_name, function_args, function_result, is_error, task_id=effective_task_id,
+                    function_name, function_args, mutation_result, is_error, task_id=effective_task_id,
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
@@ -1974,7 +1976,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     if segments is None:
         _active_env = get_active_env(effective_task_id)
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
-        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
+        segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd,
+                                            task_id=effective_task_id)
 
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):

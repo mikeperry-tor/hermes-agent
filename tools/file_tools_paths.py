@@ -13,10 +13,36 @@ import sys
 import time
 from pathlib import Path, PurePosixPath
 
+import hermes_yaml as yaml
 from agent.runtime_self_protection import split_entry
+from hermes_cli.config_backend import ConfigBackendUnavailable
+from hermes_cli.managed_scope import load_managed_config
 from tools.terminal_tool_config import _is_container_backend
 
 logger = logging.getLogger(__name__)
+
+
+def managed_ssh_workspace_roots(managed: dict | None = None) -> tuple[str, ...] | None:
+    """Read the administrator's executor roots without resolving them on this host."""
+    if managed is None:
+        try:
+            managed = load_managed_config(strict=True)
+        except (ConfigBackendUnavailable, OSError, ValueError, yaml.YAMLError) as exc:
+            raise ValueError("The managed SSH workspace roots could not be read.") from exc
+    terminal = managed.get("terminal", {})
+    if not isinstance(terminal, dict):
+        raise ValueError("The managed terminal settings must be a mapping.")
+    if "ssh_workspace_roots" not in terminal:
+        return None
+    roots = terminal["ssh_workspace_roots"]
+    if not isinstance(roots, list) or not roots or any(
+        not isinstance(root, str) or not root.startswith("/") or root.startswith("//")
+        or root == "/" or "\0" in root or posixpath.normpath(root) != root
+        for root in roots
+    ):
+        raise ValueError("The managed SSH workspace roots must be absolute directory paths.")
+    return tuple(dict.fromkeys(roots))
+
 
 # ``TERMINAL_CWD`` values that mean "not configured" ("." from a stale config;
 # "auto"/"cwd" are wizard placeholders). gateway/run.py sanitizes the same set.
@@ -111,6 +137,15 @@ def _uses_container_paths(task_id: str = "default") -> bool:
 def container_backend_for_task(task_id: str = "default") -> str | None:
     """The task's backend name when its file paths belong to a container, else None."""
     return _terminal_env_type_for_task(task_id) if _uses_container_paths(task_id) else None
+
+
+def uses_ssh_for_task(task_id: str) -> bool:
+    """Check the scoped SSH policy before consulting the task's live backend."""
+    from tools.terminal_scope import get_terminal_scope, terminal_env
+
+    if get_terminal_scope() is not None and terminal_env("TERMINAL_ENV").lower() == "ssh":
+        return True
+    return _terminal_env_type_for_task(task_id) == "ssh"
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -274,17 +309,17 @@ def _ssh_remote_home(task_id: str) -> str | None:
     return home if isinstance(home, str) and posixpath.isabs(home) else None
 
 
-def _resolve_ssh_path(filepath: str, task_id: str) -> PurePosixPath:
-    """Resolve *filepath* in the SSH target's namespace, never via the Hermes host
-    (``Path.resolve()`` and ``get_subprocess_home()`` both name host directories).
-
-    ``~`` becomes the remote home once the live environment has detected it, so the
-    result is absolute and the write guards see the real target. Before that it stays
-    ``~``-prefixed for the remote shell; ``~user`` always does.
-    """
-    text = str(filepath or "").strip()
+def _anchor_ssh_path(filepath: str, task_id: str) -> str:
+    """Join the SSH session directory without interpreting symlinks or parent components."""
+    text = str(filepath or "")
     if not text.startswith("~") and not posixpath.isabs(text):
         text = posixpath.join(_ssh_remote_anchor(task_id), text)
+    return text
+
+
+def _resolve_ssh_path(filepath: str, task_id: str) -> PurePosixPath:
+    """Normalize a path for display without examining the SSH filesystem."""
+    text = _anchor_ssh_path(str(filepath or "").strip(), task_id)
     if text == "~" or text.startswith("~/"):
         home = _ssh_remote_home(task_id)
         text = home + text[1:] if home else text

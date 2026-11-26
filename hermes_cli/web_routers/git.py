@@ -34,13 +34,54 @@ router = APIRouter()
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 
 
-async def _git_op(fn, *args):
-    """Run a (blocking) git op off the event loop; map a failed mutation to 400."""
-    loop = asyncio.get_running_loop()
+def _run_git_op(fn, path, args, file, request, guard_cwd):
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from hermes_cli.web_git_executor import CURRENT, executor_git
+
+    if uses_managed_executor():
+        if fn in (_web_git.review_ship_info, _web_git.review_pr_list, _web_git.review_commit,
+                  _web_git.review_push, _web_git.review_create_pr, _web_git.review_commit_context):
+            raise HTTPException(status_code=501, detail="This Git operation is unavailable through the SSH workspace.")
+        executor, cwd = executor_git(path)
+        if file is not None:
+            from hermes_cli.web_server_files import _file_url_path
+            if file.lower().startswith("file:"):
+                try:
+                    file = _file_url_path(file)
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail="Invalid Git file path") from exc
+            executor.file(cwd, file)
+            args = (file, *args)
+        token = CURRENT.set(executor)
+        try:
+            return fn(cwd, *args)
+        finally:
+            CURRENT.reset(token)
+
+    cwd = _git_path(path)
+    if file is not None:
+        target = _fs_path(file, cwd=cwd)
+        _hosted_fs_read_guard(target, request)
+        args = (str(target), *args)
+    elif guard_cwd:
+        root = _hosted_fs_read_guard(Path(cwd), request)
+        args = (partial(_hosted_fs_path_allowed, root) if root is not None else None, *args)
+    elif fn is _web_git.worktree_remove:
+        args = (_git_path(args[0]), *args[1:])
+    return fn(cwd, *args)
+
+
+async def _git_op(fn, path, *args, file=None, request=None, guard_cwd=False):
+    """Run a Git operation off the event loop inside the selected filesystem."""
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_cli.web_routers.files import _raise_fs_backend_error
+
     try:
-        return await loop.run_in_executor(None, fn, *args)
+        return await asyncio.to_thread(_run_git_op, fn, path, args, file, request, guard_cwd)
+    except SshWorkspaceFsError as exc:
+        _raise_fs_backend_error(exc)
     except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc) or "git operation failed")
+        raise HTTPException(status_code=400, detail=str(exc) or "git operation failed") from exc
 
 
 def _git_path(path: str) -> str:
@@ -49,7 +90,7 @@ def _git_path(path: str) -> str:
 
 @router.get("/api/git/status")
 async def git_status_route(path: str):
-    return await _git_op(_web_git.repo_status, _git_path(path))
+    return await _git_op(_web_git.repo_status, path)
 
 
 # Cached `gh auth status` for the desktop composer's GitHub suggestion pill. GitHub
@@ -85,6 +126,10 @@ def _clear_gh_auth_probe_task(completed_task: asyncio.Task) -> None:
 async def gh_auth_status_route(refresh: bool = False):
     """``{"available", "authenticated"}`` for the `gh` CLI; cached 5 min
     (``refresh=true`` bypasses so the pill withdraws right after a login)."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return {"available": False, "authenticated": False}
+
     global _gh_auth_cache, _gh_auth_probe_task, _gh_auth_probe_started
     asked = time.monotonic()
     if not refresh and _gh_auth_cache and asked - _gh_auth_cache[0] < _GH_AUTH_TTL_S:
@@ -109,22 +154,22 @@ async def gh_auth_status_route(refresh: bool = False):
 
 @router.get("/api/git/worktrees")
 async def git_worktrees_route(path: str):
-    return {"worktrees": await _git_op(_web_git.worktree_list, _git_path(path))}
+    return {"worktrees": await _git_op(_web_git.worktree_list, path)}
 
 
 @router.get("/api/git/branches")
 async def git_branches_route(path: str):
-    return {"branches": await _git_op(_web_git.branch_list, _git_path(path))}
+    return {"branches": await _git_op(_web_git.branch_list, path)}
 
 
 @router.get("/api/git/base-branches")
 async def git_base_branches_route(path: str):
-    return {"branches": await _git_op(_web_git.base_branch_list, _git_path(path))}
+    return {"branches": await _git_op(_web_git.base_branch_list, path)}
 
 
 @router.get("/api/git/review/list")
 async def git_review_list_route(path: str, scope: str = "uncommitted", base: Optional[str] = None):
-    return await _git_op(_web_git.review_list, _git_path(path), scope, base)
+    return await _git_op(_web_git.review_list, path, scope, base)
 
 
 @router.get("/api/git/review/diff")
@@ -132,71 +177,62 @@ async def git_review_diff_route(
     path: str, file: str, request: Request,
     scope: str = "uncommitted", base: Optional[str] = None, staged: bool = False
 ):
-    cwd = _git_path(path)
-    target = _fs_path(file, cwd=cwd)
-    _hosted_fs_read_guard(target, request)
-    return {"diff": await _git_op(_web_git.review_diff, cwd, str(target), scope, base, staged)}
+    return {"diff": await _git_op(_web_git.review_diff, path, scope, base, staged, file=file, request=request)}
 
 
 @router.get("/api/git/file-diff")
 async def git_file_diff_route(path: str, file: str, request: Request):
-    cwd = _git_path(path)
-    target = _fs_path(file, cwd=cwd)
-    _hosted_fs_read_guard(target, request)
-    return {"diff": await _git_op(_web_git.file_diff_vs_head, cwd, str(target))}
+    return {"diff": await _git_op(_web_git.file_diff_vs_head, path, file=file, request=request)}
 
 
 @router.get("/api/git/review/commit-context")
 async def git_commit_context_route(path: str, request: Request):
-    cwd = _git_path(path)
-    root = _hosted_fs_read_guard(Path(cwd), request)
-    allowed = partial(_hosted_fs_path_allowed, root) if root is not None else None
-    return await _git_op(_web_git.review_commit_context, cwd, allowed)
+    return await _git_op(_web_git.review_commit_context, path, guard_cwd=True, request=request)
 
 
 @router.get("/api/git/review/rev-parse")
 async def git_rev_parse_route(path: str, ref: Optional[str] = None):
-    return {"sha": await _git_op(_web_git.review_rev_parse, _git_path(path), ref)}
+    return {"sha": await _git_op(_web_git.review_rev_parse, path, ref)}
 
 
 @router.get("/api/git/review/ship-info")
 async def git_ship_info_route(path: str):
-    return await _git_op(_web_git.review_ship_info, _git_path(path))
+    return await _git_op(_web_git.review_ship_info, path)
 
 
 @router.post("/api/git/review/pr-list")
 async def git_pr_list_route(body: GitPrListBody):
-    return await _git_op(_web_git.review_pr_list, _git_path(body.path), body.branches, body.numbers)
+    return await _git_op(_web_git.review_pr_list, body.path, body.branches, body.numbers)
 
 
 @router.post("/api/git/review/stage")
 async def git_stage_route(body: GitFileBody):
-    return await _git_op(_web_git.review_stage, _git_path(body.path), body.file)
+    return await _git_op(_web_git.review_stage, body.path, body.file)
 
 
 @router.post("/api/git/review/unstage")
 async def git_unstage_route(body: GitFileBody):
-    return await _git_op(_web_git.review_unstage, _git_path(body.path), body.file)
+    return await _git_op(_web_git.review_unstage, body.path, body.file)
 
 
 @router.post("/api/git/review/revert")
 async def git_revert_route(body: GitFileBody):
-    return await _git_op(_web_git.review_revert, _git_path(body.path), body.file)
+    return await _git_op(_web_git.review_revert, body.path, body.file)
 
 
 @router.post("/api/git/review/commit")
 async def git_commit_route(body: GitCommitBody):
-    return await _git_op(_web_git.review_commit, _git_path(body.path), body.message, body.push)
+    return await _git_op(_web_git.review_commit, body.path, body.message, body.push)
 
 
 @router.post("/api/git/review/push")
 async def git_push_route(body: GitPathBody):
-    return await _git_op(_web_git.review_push, _git_path(body.path))
+    return await _git_op(_web_git.review_push, body.path)
 
 
 @router.post("/api/git/review/create-pr")
 async def git_create_pr_route(body: GitPathBody):
-    return await _git_op(_web_git.review_create_pr, _git_path(body.path))
+    return await _git_op(_web_git.review_create_pr, body.path)
 
 
 @router.post("/api/git/worktree/add")
@@ -206,16 +242,16 @@ async def git_worktree_add_route(body: GitWorktreeAddBody):
         for key, value in body.model_dump(include={"name", "branch", "base", "existingBranch"}).items()
         if value
     }
-    return await _git_op(_web_git.worktree_add, _git_path(body.path), options)
+    return await _git_op(_web_git.worktree_add, body.path, options)
 
 
 @router.post("/api/git/worktree/remove")
 async def git_worktree_remove_route(body: GitWorktreeRemoveBody):
     return await _git_op(
-        _web_git.worktree_remove, _git_path(body.path), _git_path(body.worktreePath), body.force
+        _web_git.worktree_remove, body.path, body.worktreePath, body.force
     )
 
 
 @router.post("/api/git/branch/switch")
 async def git_branch_switch_route(body: GitBranchSwitchBody):
-    return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
+    return await _git_op(_web_git.branch_switch, body.path, body.branch)

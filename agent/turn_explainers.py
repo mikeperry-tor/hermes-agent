@@ -132,20 +132,28 @@ class TurnExplainersMixin:
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
-        if landed:
-            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
+        from tools.file_tools_paths import uses_ssh_for_task
+        from tools.terminal_scope import TerminalPolicyUnavailable
+        try:
+            ssh = uses_ssh_for_task(task_id or "default")
+        except TerminalPolicyUnavailable:
+            return
+        if landed or ssh:
+            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result, report_only=not landed)
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(landed_paths)
             # Feed the checkpoint agent-write ledger so /rollback's safe mode can tell
             # Hermes-authored content from later user hand-edits.
             mgr = getattr(self, "_checkpoint_mgr", None)
-            if mgr is not None and getattr(mgr, "enabled", False):
-                from tools.file_tools_paths import container_backend_for_task
-                if container_backend_for_task(task_id or "default") is None:  # container paths carry no host ledger entry
+            if not ssh and mgr is not None and getattr(mgr, "enabled", False):
+                from agent.checkpoints.manager import CheckpointManager
+                if not CheckpointManager.unsupported_backend_reason(task_id or "default"):
                     for _p in landed_paths:
                         with suppress(Exception):
                             mgr.record_agent_write(_p)
+        if ssh:
+            return  # The failure verifier requires filesystem metadata from the file's backend.
         if is_error and not landed:
             # Keep the FIRST error per path unless a later success replaces it.
             preview = _extract_error_preview(result)

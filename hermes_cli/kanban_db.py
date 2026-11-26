@@ -2815,8 +2815,8 @@ def _stage_completion_artifacts(
     """Copy scratch artifacts to the attachments dir and record each as an
     attachment row; returns the copies so the caller can discard them if its
     transaction rolls back."""
-    _persist_scratch_completion_artifacts(conn, task_id, metadata)
-    staged = [Path(stored_path) for stored_path in metadata.pop("_staged_artifacts", [])]
+    metadata.pop("_staged_artifacts", None)
+    staged = _persist_scratch_completion_artifacts(conn, task_id, metadata)
     for path in staged:
         _insert_completion_attachment(
             conn, task_id, filename=path.name, stored_path=str(path),
@@ -2917,28 +2917,28 @@ def _merge_completion_prose_artifacts(
 
 def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict,
-) -> None:
+) -> list[Path]:
     """Copy scratch-workspace completion artifacts before cleanup removes them."""
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
-        return
+        return []
 
     workspace = _scratch_workspace(conn, task_id)
     if workspace is None:
-        return
+        return []
     is_managed, board = _managed_scratch_path_info(workspace)
     if not is_managed:
-        return
+        return []
 
     try:
         workspace_root = workspace.resolve()
     except OSError:
-        return
+        return []
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
     used_destinations: set[Path] = set()
-    changed = False
+    staged: list[Path] = []
 
     def _discard_copies() -> None:
         _discard_staged_copies(used_destinations, attachment_dir)
@@ -2986,14 +2986,13 @@ def _persist_scratch_completion_artifacts(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
             ) from exc
         used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
-        changed = True
+        final_path = dest.resolve()
+        staged.append(final_path)
+        persisted.append(str(final_path))
 
-    if changed:
+    if staged:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+    return staged
 
 
 def _discard_staged_copies(copies: Iterable[Path], attachment_dir: Path) -> None:

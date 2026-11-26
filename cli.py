@@ -550,9 +550,11 @@ _active_worktree: Optional[dict[str, str]] = None
 
 def _cleanup_worktree(info: dict[str, str] | None = None) -> None:
     """Remove a clean worktree and its branch on exit; preserve recoverable work."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+
     global _active_worktree
     info = info or _active_worktree
-    if not info:
+    if not info or uses_managed_executor():
         return
 
     wt_path, branch, repo_root = info["path"], info["branch"], info["repo_root"]
@@ -1632,6 +1634,10 @@ def _start_worktree_setup(list_tools, list_toolsets, worktree, w):
     """
     if list_tools or list_toolsets or not (worktree or w or CLI_CONFIG.get("worktree", False)):
         return None
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        raise ValueError("Worktree creation is unavailable for an SSH executor workspace.")
     # Overlap tool discovery with the I/O-bound worktree setup so show_banner() hits a warm
     # cache (~0.4s). Only on the -w path: plain `hermes` has no I/O wait to hide.
     def _prewarm_tools() -> None:

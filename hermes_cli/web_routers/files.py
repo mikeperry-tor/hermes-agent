@@ -13,6 +13,7 @@ import importlib
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -505,6 +506,44 @@ def _remote_fs_backend(path: str, profile: Optional[str]):
     return _fs_backend(profile)
 
 
+def _remote_fs_request(path: str, profile: Optional[str], session: Optional[dict]):
+    """Resolve an owned staged file or the workspace endpoint and path for this request."""
+    from hermes_cli.ssh_project_probe import managed_project_access
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_cli.web_routers.session_files import managed_file_request, staged_file_candidate
+
+    failure = None
+    try:
+        access = managed_project_access({"TERMINAL_ENV": "ssh"})
+        if access is None:
+            backend = _remote_fs_backend(path, profile)
+            cwd = (session or {}).get("cwd")
+            if (backend is not None and isinstance(cwd, str) and cwd.startswith("/")
+                    and not path.strip().startswith(("/", "~", "\\"))
+                    and re.match(r"^[a-z]:", path.strip(), re.IGNORECASE) is None
+                    and not path.lower().startswith("file:")):
+                path = posixpath.normpath(posixpath.join(cwd, path.strip()))
+            return backend, path, None
+    except SshWorkspaceFsError as exc:
+        failure = exc
+    try:
+        requested = _file_url_path(path) if path.lower().startswith("file:") else path
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid file path") from exc
+    _fs_profile_home(profile)  # refuse profiles_run_elsewhere with HTTP 409 before dialing SSH
+    with _profile_scope(profile):
+        home = get_hermes_home()
+        staged = staged_file_candidate(requested, home, _chat_image_dir(home))
+    if staged and not Path(requested).is_symlink() and _is_host_file(path, profile):
+        return None, path, None
+    if failure is not None:
+        _raise_fs_backend_error(failure)
+    try:
+        return managed_file_request(requested, profile, session, home, *access)
+    except SshWorkspaceFsError as exc:
+        _raise_fs_backend_error(exc)
+
+
 def _raise_fs_backend_error(exc: Exception) -> None:
     from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
 
@@ -513,11 +552,17 @@ def _raise_fs_backend_error(exc: Exception) -> None:
     status = {
         "EACCES": 403,
         "ECONN": 503,
+        "EEXIST": 409,
         "EFBIG": 413,
+        "EGRANT": 403,
         "EINVAL": 400,
         "EIO": 502,
         "ENOENT": 404,
         "ENOTREG": 400,
+        "ESTALE": 409,
+        "EWORKSPACE": 409,
+        "EWRITE": 403,
+        "EWRITETYPE": 400,
     }.get(exc.code, 400)
     detail = {
         "EACCES": "File is not readable",
@@ -527,6 +572,7 @@ def _raise_fs_backend_error(exc: Exception) -> None:
         "EIO": "SSH workspace request failed",
         "ENOENT": "File not found",
         "ENOTREG": "Only regular files can be read",
+        "ESTALE": "The SSH file changed before saving. Reopen it and retry.",
     }.get(exc.code, str(exc) or "Filesystem request failed")
     raise HTTPException(status_code=status, detail=detail)
 
@@ -946,7 +992,7 @@ async def issue_file_ticket(payload: FileTicketRequest, request: Request):
             )
         else:
             # An SSH profile's clip is captured on its SSH machine; a host-staged file on this host.
-            authority = await _remote_file_authority(payload.path, payload.profile, owner, _remote_stream_target)
+            authority = await _remote_file_authority(payload.path, payload.profile, owner, _remote_stream_target, session)
             path = payload.path
             if authority is None and (payload.session_id is not None or path.lower().startswith("file:")):
                 path = str(await _fs_download_path(path, payload.profile, payload.session_id, session=session))
@@ -999,12 +1045,12 @@ async def stream_managed_file(
     session = await _fs_owned_session(session_id, profile)
     authority = getattr(request.state, "file_ticket_authority", None)
     if authority is not None and authority.workspace is not None:
-        target, size = await _ticketed_remote_target(authority, _remote_stream_target)
-        return remote_media_response(request, authority.workspace, target, size, _fs_mime_type(Path(target)))
+        backend, target, size = await _ticketed_remote_target(authority, _remote_stream_target, path, profile, session)
+        return remote_media_response(request, backend, target, size, _fs_mime_type(Path(target)))
     if authority is None:
-        backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
+        backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, path, profile, session)
         if backend is not None:
-            target, size = await asyncio.to_thread(_remote_stream_target, backend, path)
+            target, size = await asyncio.to_thread(_remote_stream_target, backend, remote_path, roots=roots)
             return remote_media_response(request, backend, target, size, _fs_mime_type(Path(target)))
         if session_id is not None or path.lower().startswith("file:"):
             path = str(await _fs_download_path(path, profile, session_id, session=session))
@@ -1169,14 +1215,44 @@ def _fs_list_entries(target: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _managed_project_backend(profile):
+    from hermes_cli.ssh_project_probe import managed_project_connection
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_constants import get_hermes_home
+    from tui_gateway.managed_project_queries import managed_project_config_snapshot, profile_project_access
+
+    active, managed = managed_project_config_snapshot()
+    if not active:
+        return None
+    _fs_profile_home(profile)  # refuse profiles_run_elsewhere with HTTP 409 before dialing SSH
+    if managed is None:
+        raise SshWorkspaceFsError("ECONN", "The managed SSH workspace settings are unavailable.")
+    with _config_profile_scope(profile):
+        access = profile_project_access(managed=managed)
+        if not access or not access[0]:
+            raise SshWorkspaceFsError("ECONN", "The managed SSH workspace settings are unavailable.")
+        roots, terminal = access
+        return managed_project_connection(terminal, str(get_hermes_home())), roots
+
+
+def _list_fs_backend(path, profile):
+    managed = _managed_project_backend(profile)
+    if managed is not None:
+        backend, roots = managed
+        return backend.list_project_directory(path, roots, _FS_READDIR_HIDDEN)
+    backend = _fs_backend(profile)
+    if backend is not None:
+        return backend.list_dir(path, _FS_READDIR_HIDDEN)
+    return None
+
+
 @router.get("/api/fs/list")
 async def fs_list(path: str, request: Request, profile: Optional[str] = None):
-    backend = await asyncio.to_thread(_fs_backend, profile)
-    if backend is not None:
-        try:
-            listing = await asyncio.to_thread(backend.list_dir, path, _FS_READDIR_HIDDEN)
-        except Exception as exc:
-            _raise_fs_backend_error(exc)
+    try:
+        listing = await asyncio.to_thread(_list_fs_backend, path, profile)
+    except Exception as exc:
+        _raise_fs_backend_error(exc)
+    if listing is not None:
         # Entry paths are the SSH host's own: hide its credential stores as the local scan does.
         listing["entries"] = [e for e in listing["entries"] if not _is_sensitive_path(PurePosixPath(e["path"]))]
         return listing
@@ -1192,19 +1268,39 @@ async def fs_list(path: str, request: Request, profile: Optional[str] = None):
         return {"entries": [], "error": getattr(exc, "strerror", None) or "read-error"}
 
 
+@router.post("/api/fs/mkdir")
+def fs_mkdir(payload: ManagedDirectoryCreate, request: Request, profile: Optional[str] = None):
+    """Create a folder through the backend used by the workspace picker."""
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    try:
+        managed = _managed_project_backend(profile)
+        backend, roots = managed if managed is not None else (_fs_backend(profile), None)
+        if backend is None:
+            with _profile_scope(profile):
+                return create_managed_directory(payload, request)
+        target = backend.normalize(payload.path)
+        if _is_sensitive_path(PurePosixPath(target)):
+            raise SshWorkspaceFsError("EWRITE", "Access to sensitive files is not allowed")
+        return {"ok": True, "path": backend.mkdir(target, roots=roots)}
+    except SshWorkspaceFsError as exc:
+        _raise_fs_backend_error(exc)
+
+
 @router.get("/api/fs/read-text")
 async def fs_read_text(
     path: str, request: Request = None, profile: Optional[str] = None, session_id: Optional[str] = None,
 ):
     session = await _fs_owned_session(session_id, profile)
     # A staged paste or pick previews from this host, as read-data-url reads it back to send.
-    backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
+    backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, path, profile, session)
     if backend is not None:
         try:
             data, size, target = await asyncio.to_thread(
                 _remote_read_bytes,
                 backend,
-                path,
+                remote_path,
+                roots=roots,
                 max_bytes=_FS_TEXT_SOURCE_MAX_BYTES,
                 read_limit=_FS_TEXT_PREVIEW_MAX_BYTES,
             )
@@ -1269,25 +1365,29 @@ async def fs_write_text(payload: FsWriteText, profile: Optional[str] = None):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     session = await _fs_owned_session(payload.session_id, profile)
     # Save where read-text read: a staged paste or pick on this host, all else on the SSH machine.
-    backend = await asyncio.to_thread(_remote_fs_backend, payload.path, profile)
+    backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, payload.path, profile, session)
     if backend is not None:
-        # The SSH write replaces the lexical path (mv onto a link swaps the link), so judge that
-        # path exactly as the adapter writes it: stripped, ``~`` and cwd expanded, ``..`` folded.
+        # Apply the sensitive name guard to the path the adapter opens. Managed
+        # saves also check the executor's inspected entry and target before publishing.
         from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
 
         try:
-            target = backend.normalize(payload.path)
+            target = backend.normalize(remote_path)
         except SshWorkspaceFsError as exc:
             _raise_fs_backend_error(exc)
         if _is_sensitive_path(Path(target)):
             raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
         try:
-            target, byte_size = await asyncio.to_thread(
-                backend.write_text,
-                target,
-                text,
-                max_bytes=_FS_TEXT_WRITE_MAX_BYTES,
-            )
+            if roots is None:
+                target, byte_size = await asyncio.to_thread(
+                    backend.write_text, target, text, max_bytes=_FS_TEXT_WRITE_MAX_BYTES,
+                )
+            else:
+                target, byte_size = await asyncio.to_thread(
+                    backend.write_managed_text, target, text, roots=roots,
+                    is_sensitive=lambda candidate: _is_sensitive_path(Path(candidate)),
+                    max_bytes=_FS_TEXT_WRITE_MAX_BYTES,
+                )
         except Exception as exc:
             _raise_fs_backend_error(exc)
         return {"ok": True, "path": target, "byteSize": byte_size}
@@ -1389,11 +1489,11 @@ async def fs_read_data_url(
 ):
     from hermes_cli.web_server import _FS_DATA_URL_MAX_BYTES
     session = await _fs_owned_session(session_id, profile)
-    backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
+    backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, path, profile, session)
     if backend is not None:
         try:
             data, _size, target = await asyncio.to_thread(
-                _remote_read_bytes, backend, path, max_bytes=_FS_DATA_URL_MAX_BYTES
+                _remote_read_bytes, backend, remote_path, roots=roots, max_bytes=_FS_DATA_URL_MAX_BYTES
             )
         except Exception as exc:
             _raise_fs_backend_error(exc)
@@ -1433,14 +1533,17 @@ def _if_none_match(request: Request) -> set[str]:
     return {tag.strip().removeprefix("W/") for tag in request.headers.get("if-none-match", "").split(",")}
 
 
-def _remote_download_target(backend, path: str) -> tuple[str, int]:
+def _remote_download_target(backend, path: str, *, roots=None) -> tuple[str, int]:
     """*path* resolved on the SSH workspace to a regular file a download may read, and its size."""
+    from hermes_cli.ssh_project_probe import _under_roots
     from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
 
     try:
         target, size = backend.inspect_file(path)
     except SshWorkspaceFsError as exc:
         _raise_fs_backend_error(exc)
+    if roots is not None and not _under_roots(target, roots):
+        raise HTTPException(status_code=403, detail="The file resolves outside the applied SSH workspace roots.")
     # SSH inspect_file realpaths symlinks; guard the requested name too, so
     # ~/.ssh -> ~/keys cannot make a requested ~/.ssh/id_ed25519 readable.
     # Judge the spelling inspect_file resolved too: normalize strips whitespace and joins a relative path to the cwd.
@@ -1450,46 +1553,51 @@ def _remote_download_target(backend, path: str) -> tuple[str, int]:
     return target, size
 
 
-def _remote_read_bytes(backend, path: str, **limits) -> tuple[bytes, int, str]:
+def _remote_read_bytes(backend, path: str, *, roots=None, **limits) -> tuple[bytes, int, str]:
     """*path* read from the SSH workspace once download's checks pass on the path it resolves to:
     a link named ``notes.txt`` that points at ``~/.hermes/.env`` is refused before any byte moves."""
-    target, _size = _remote_download_target(backend, path)
+    target, _size = _remote_download_target(backend, path, roots=roots)
     return backend.read_bytes(target, **limits)
 
 
-def _remote_stream_target(backend, path: str) -> tuple[str, int]:
+def _remote_stream_target(backend, path: str, *, roots=None) -> tuple[str, int]:
     """*path* on the SSH workspace as media the stream route may serve, and its size: download's
     checks, then the host stream's media-type check. No size cap: served one Range at a time."""
-    target, size = _remote_download_target(backend, path)
+    target, size = _remote_download_target(backend, path, roots=roots)
     if PurePosixPath(target).suffix.lower() not in _STREAMABLE_MEDIA_EXTENSIONS:
         raise HTTPException(status_code=415, detail="Unsupported media type")
     return target, size
 
 
 async def _remote_file_authority(
-    path: str, profile: Optional[str], owner: Path, inspect,
+    path: str, profile: Optional[str], owner: Path, inspect, session: Optional[dict],
 ) -> Optional[file_tickets.FileAuthority]:
     """A ticket's authority for *path* on the profile's SSH workspace, checked by *inspect*
     (download's or the stream's rules), or None when this host owns the path."""
-    backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
+    backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, path, profile, session)
     if backend is None:
         return None
-    target, _size = await asyncio.to_thread(inspect, backend, path)
-    authority = file_tickets.FileAuthority(PurePosixPath(target), (owner,), workspace=backend)
+    target, _size = await asyncio.to_thread(inspect, backend, remote_path, roots=roots)
+    authority = file_tickets.FileAuthority(PurePosixPath(target), (owner,), workspace=backend, managed=roots is not None)
     await asyncio.to_thread(authority.check_live)
     return authority
 
 
-async def _ticketed_remote_target(authority: file_tickets.FileAuthority, inspect) -> tuple[str, int]:
+async def _ticketed_remote_target(authority: file_tickets.FileAuthority, inspect, path, profile, session):
     """The SSH file a ticket captured, re-checked by *inspect* while its profile is still live."""
     try:
         await asyncio.to_thread(authority.check_live)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="File ticket profile or resource is unavailable") from exc
-    target, size = await asyncio.to_thread(inspect, authority.workspace, str(authority.target))
+    backend, remote_path, roots = authority.workspace, str(authority.target), None
+    if authority.managed:
+        backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, path, profile, session)
+        if roots is None or backend is not authority.workspace:
+            raise HTTPException(status_code=403, detail="File ticket workspace changed")
+    target, size = await asyncio.to_thread(inspect, backend, remote_path, roots=roots)
     if target != str(authority.target):
         raise HTTPException(status_code=403, detail="File ticket target changed")
-    return target, size
+    return backend, target, size
 
 
 def _remote_download_response(request: Optional[Request], backend, target: str, size: int) -> Response:
@@ -1511,7 +1619,7 @@ async def _fs_download_authority(
     profile's SSH workspace when it has one, else on this host under the same read rules."""
     from hermes_constants import named_profile_home
 
-    remote = await _remote_file_authority(path, profile, owner, _remote_download_target)
+    remote = await _remote_file_authority(path, profile, owner, _remote_download_target, session)
     if remote is not None:
         return remote
     local = await _fs_download_path(path, profile, session_id, session=session)
@@ -1531,12 +1639,12 @@ async def _fs_download_authority(
 
 
 async def _ticketed_fs_download(
-    request: Request, authority: file_tickets.FileAuthority, profile: Optional[str],
+    request: Request, authority: file_tickets.FileAuthority, path, profile, session,
 ) -> Response:
     """Serve the file a download ticket captured while its profile homes are still live."""
     if authority.workspace is not None:
-        target, size = await _ticketed_remote_target(authority, _remote_download_target)
-        return _remote_download_response(request, authority.workspace, target, size)
+        backend, target, size = await _ticketed_remote_target(authority, _remote_download_target, path, profile, session)
+        return _remote_download_response(request, backend, target, size)
 
     from hermes_cli.web_server_file_response import OpenedFileResponse
 
@@ -1564,10 +1672,10 @@ async def fs_download(
     session = await _fs_owned_session(session_id, profile)
     authority = getattr(getattr(request, "state", None), "file_ticket_authority", None)
     if authority is not None:
-        return await _ticketed_fs_download(request, authority, profile)
-    backend = await asyncio.to_thread(_remote_fs_backend, path, profile)
+        return await _ticketed_fs_download(request, authority, path, profile, session)
+    backend, remote_path, roots = await asyncio.to_thread(_remote_fs_request, path, profile, session)
     if backend is not None:
-        target, size = await asyncio.to_thread(_remote_download_target, backend, path)
+        target, size = await asyncio.to_thread(_remote_download_target, backend, remote_path, roots=roots)
         return _remote_download_response(request, backend, target, size)
     target = await _fs_download_path(path, profile, session_id, session=session)
     await asyncio.to_thread(_hosted_fs_read_guard, target, request)
@@ -1581,8 +1689,48 @@ async def fs_download(
     )
 
 
+def _managed_fs_project(profile, path=None):
+    from tui_gateway.managed_project_queries import (
+        current_project_facts,
+        managed_project_config_snapshot,
+        profile_project_access,
+        profile_project_location,
+    )
+    from hermes_cli.ssh_project_probe import _absolute_project, managed_project_connection, _under_roots
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_constants import get_hermes_home
+
+    active, managed = managed_project_config_snapshot()
+    if not active:
+        return None
+    _fs_profile_home(profile)  # refuse profiles_run_elsewhere with HTTP 409 before dialing SSH
+    with _config_profile_scope(profile):
+        access = ((), {}) if managed is None else (profile_project_access(managed=managed) or ((), {}))
+        if path is None:
+            return profile_project_location(access)
+        if not _absolute_project(path):
+            raise HTTPException(status_code=400, detail="An absolute executor project path is required")
+        info = current_project_facts(access, [path]).get(path, {})
+        if info.get("cwd"):
+            return {"root": info.get("worktree_root")}
+        roots, terminal = access
+        if not _under_roots(path, roots):
+            return {"root": None}
+        try:
+            workspace = managed_project_connection(terminal, str(get_hermes_home()))
+            resolved, _ = workspace.inspect_file(path)
+        except SshWorkspaceFsError:
+            return {"root": None}
+        if not _under_roots(resolved, roots):
+            return {"root": None}
+        parent = str(PurePosixPath(resolved).parent)
+        return {"root": current_project_facts(access, [parent]).get(parent, {}).get("worktree_root")}
+
+
 @router.get("/api/fs/git-root")
 async def fs_git_root(path: str, profile: Optional[str] = None):
+    if (result := await asyncio.to_thread(_managed_fs_project, profile, path)) is not None:
+        return result
     backend = await asyncio.to_thread(_fs_backend, profile)
     if backend is not None:
         try:
@@ -1600,6 +1748,8 @@ async def fs_git_root(path: str, profile: Optional[str] = None):
 
 @router.get("/api/fs/default-cwd")
 async def fs_default_cwd(profile: Optional[str] = None):
+    if (result := await asyncio.to_thread(_managed_fs_project, profile)) is not None:
+        return result
     backend = await asyncio.to_thread(_fs_backend, profile)
     if backend is not None:
         cwd = backend.cwd

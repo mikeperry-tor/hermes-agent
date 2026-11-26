@@ -233,17 +233,27 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
     collecting candidates, so it asks for hidden rows too."""
     from agent.skill_utils import (
         TIER_PROJECT, is_disabled_entry, iter_project_skill_files, iter_skill_index_files, resolve_skill_catalog)
+    from agent.ssh_project_skills import project_skill_metadata
+
+    project_rows = project_skill_metadata()
     cache_key = ("with_disabled" if skip_disabled else "filtered", include_hidden)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
     roots, _ = skill_search_dirs()
     signature = _skills_scan_signature([d for _t, d in roots], disabled)
     now = time.monotonic()
     cached = _SKILLS_CACHE.get(cache_key)
-    if cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
+    if not project_rows and cached is not None and cached[0] == signature and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS:
         # Shallow copies: callers mutate the returned dicts (web_server annotates
         # s["enabled"]/s["usage"]); handing out cached objects would poison the cache.
         return [dict(s) for s in cached[2]]
-    scanned = []
+    scanned = [{
+        "name": str(metadata.get("name") or skill_file.parent.name)[:MAX_NAME_LENGTH],
+        "description": _truncate_description(str(metadata.get("description") or "")),
+        "category": "/".join(skill_file.relative_to(root).parts[:-2]) or None,
+        "tier": TIER_PROJECT, "root": root, "path": skill_file, "executor_project": True,
+        "visible": bool(skill_matches_platform(metadata) and skill_matches_environment(metadata)
+                        and skill_matches_apps(metadata)),
+    } for root, skill_file, metadata in project_rows]
     for tier, scan_dir in roots:  # project dirs go through the quarantine chokepoint
         _iter = iter_project_skill_files if tier == TIER_PROJECT else lambda d: iter_skill_index_files(d, "SKILL.md")
         for skill_md in _iter(scan_dir):
@@ -270,7 +280,8 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
               if (s.pop("visible") or include_hidden) and not is_disabled_entry(s, disabled)]
     # Keyed by the signature computed BEFORE the scan: a write racing the scan changes the
     # signature, so the next call re-scans instead of serving a torn result.
-    _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    if not project_rows:
+        _SKILLS_CACHE[cache_key] = (signature, now, skills)
     return [dict(s) for s in skills]
 
 
@@ -630,6 +641,55 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
         logger.warning("Skill security warning for '%s': %s", name, "; ".join(warnings))
 
 
+def _managed_project_skill(name, file_path, task_id, preprocess):
+    from agent.skill_preprocessing import preprocess_skill_content
+    from agent.ssh_project_skills import load_project_skill
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    if not uses_managed_executor() or ":" in name:
+        return None
+    try:
+        skill = load_project_skill(name, file_path)
+    except (OSError, ValueError, SshWorkspaceFsError) as exc:
+        return _fail(str(exc))
+    if skill is None:
+        return None
+    directory, content = skill["directory"], skill["content"]
+    frontmatter = _safe_frontmatter(content=content)
+    skill_name = frontmatter.get("name", directory.name)
+    if _is_skill_disabled(skill_name, name):
+        return _fail(f"Skill '{skill_name}' is disabled.")
+    if not skill_matches_platform(frontmatter):
+        return _fail(f"Skill '{skill_name}' is not supported on this platform.")
+    if file_path is not None:
+        return json.dumps(skill["support"])
+    # Project metadata cannot request profile environment values, local files, or package installs.
+    if preprocess:
+        content = preprocess_skill_content(content, Path(directory), session_id=task_id, executor_project=True)
+    result = {
+        "success": True, "name": skill_name, "description": frontmatter.get("description", ""),
+        "content": content, "path": skill["load_path"], "skill_dir": str(directory), "linked_files": skill["linked"],
+        "executor_project": True,
+    }
+    if frontmatter.get("deps"):
+        result["deps_note"] = "Project skill dependencies must be available in the SSH executor."
+    if frontmatter.get("required_environment_variables") or frontmatter.get("required_credential_files"):
+        result["setup_note"] = "Project skills cannot request credentials from the Hermes profile."
+    return json.dumps(result)
+
+
+def _resolve_skill_request(name, file_path, task_id, preprocess):
+    if lookup_error := skill_lookup_path_error(name):
+        return _fail(lookup_error, hint=_LOOKUP_HINT), None
+    if ":" not in name:
+        return _managed_project_skill(name, file_path, task_id, preprocess), None
+    served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
+    if served is None and local_category_name and (lookup_error := skill_lookup_path_error(local_category_name)):
+        return _fail(lookup_error, hint=_LOOKUP_HINT), None
+    return served, local_category_name
+
+
 @_host_skills
 def skill_view(
     name: str, file_path: str | None = None, task_id: str | None = None, preprocess: bool = True) -> str:
@@ -638,19 +698,9 @@ def skill_view(
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
     slash/preload callers render the message themselves."""
     try:
-        # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
-        # reinterpreted as a plugin namespace.
-        if lookup_error := skill_lookup_path_error(name):
-            return _fail(lookup_error, hint=_LOOKUP_HINT)
-        local_category_name: str | None = None
-        if ":" in name:  # plugin registry; bare names use the flat-tree scan below
-            served, local_category_name = _resolve_plugin_skill(name, file_path, task_id, preprocess)
-            if served is not None:
-                return served
-        # The fall-through form (namespace/bare) joins onto each search dir too; re-validate it
-        # since `bare` is not namespace-checked.
-        if local_category_name and (lookup_error := skill_lookup_path_error(local_category_name)):
-            return _fail(lookup_error, hint=_LOOKUP_HINT)
+        served, local_category_name = _resolve_skill_request(name, file_path, task_id, preprocess)
+        if served is not None:
+            return served
         roots, active_skills_dir = skill_search_dirs()
         all_dirs = [d for _t, d in roots]
         error, skill_dir, skill_md = locate_skill(name, local_category_name, roots)
@@ -716,10 +766,16 @@ def skill_view(
                     + "` and reload."
                 )
 
+        visible_dir = str(skill_dir) if skill_dir else None
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if preprocess and skill_dir and uses_managed_executor():
+            from agent.ssh_skill_shell import skill_execution_directory
+            visible_dir = skill_execution_directory(skill_dir)
+
         result = {
             "success": True, "name": skill_name, "description": frontmatter.get("description", ""),
             "tags": tags, "related_skills": related_skills, "content": rendered_content,
-            "path": rel_path, "skill_dir": str(skill_dir) if skill_dir else None,
+            "path": rel_path, "skill_dir": visible_dir,
             "linked_files": linked_files if linked_files else None,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'" if linked_files else None,
             **readiness,

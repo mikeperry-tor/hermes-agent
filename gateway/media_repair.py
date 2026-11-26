@@ -144,6 +144,12 @@ def _canonical_capture_paths(turn_messages: list[dict[str, Any]]) -> dict[str, s
     return canonical
 
 
+def tool_produced_media_paths(tags, messages, history_offset=0):
+    """Exact Hermes-owned paths emitted by the media tools in this turn."""
+    captures = _canonical_capture_paths(_current_turn_messages(messages, history_offset))
+    return list(dict.fromkeys([*(tag.removeprefix("MEDIA:") for tag in tags), *captures.values()]))
+
+
 def _repair_explicit_computer_use_media_paths_inner(response: str, messages: list[dict[str, Any]], history_offset: int = 0) -> str:
     if "MEDIA:" not in response:
         return response

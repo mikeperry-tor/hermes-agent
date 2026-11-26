@@ -26,7 +26,7 @@ def project(tmp_path, monkeypatch):
         (project / f'{name}.txt').write_text(name * 1800, encoding='utf-8')
     monkeypatch.setenv('TERMINAL_CWD', str(daemon))
     monkeypatch.setattr(session_policy, 'policy_for_source', lambda runner, source: SimpleNamespace(
-        cwd=str(project)) if source.platform == Platform.LOCAL else None)
+        cwd=str(project), terminal_json='{"TERMINAL_ENV":"local"}') if source.platform == Platform.LOCAL else None)
     return project
 
 

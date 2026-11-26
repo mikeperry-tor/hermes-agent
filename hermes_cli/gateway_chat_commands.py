@@ -136,7 +136,11 @@ async def _new(view, rest):
     request = {key: value for key, value in (info.get("launch_request") or {}).items()
                if key in accepted and key not in {"request_id", "title", "client"}}
     if info.get("cwd") and "cwd" in accepted:
+        from hermes_cli.main_resume_args import uses_managed_executor
+
         request["cwd"] = info["cwd"]
+        if "cwd_explicit" in accepted and uses_managed_executor():
+            request.setdefault("cwd_explicit", info["cwd"] != "/workspace")
     # The frozen request never holds the launch key; the one this terminal supplied rides along.
     if getattr(view, "launch_api_key", None) and "api_key" in accepted:
         request["api_key"] = view.launch_api_key
@@ -234,3 +238,26 @@ def help_text():
             "restart), /yolo [on|off], /quit (detach). /branch [title], /model <model> [--provider name], "
             "/compress [here [N] | <focus>] [--preview]. /title [name], /undo [N], /retry, /new [title] "
             f"(/reset), /usage, /tools.\nReports run by the gateway: {reports}.\nParity table: {PARITY_DOC}")
+
+
+def classic_working_diff(cli, mode, paths):
+    import os
+    from hermes_cli.main_resume_args import requested_executor_project, uses_managed_executor
+    from tools.working_diff import collect_executor_working_diff, collect_working_diff
+
+    if not uses_managed_executor():
+        return collect_working_diff(os.getenv("TERMINAL_CWD", os.getcwd()), mode=mode, paths=paths)
+
+    from hermes_cli.gateway_client import GatewayClientError
+    from hermes_cli.gateway_side import connection_for
+
+    connection = connection_for(cli)
+    try:
+        if connection is None or not cli.session_id:
+            resolved = requested_executor_project() or None
+        else:
+            owner = connection.call("shell.cwd", session_id=cli.session_id, executor=True)
+            resolved = owner.get("cwd")
+    except (AttributeError, GatewayClientError):
+        return {"success": False, "error": "The chat owner is unavailable. Reopen the chat to inspect the executor workspace."}
+    return collect_executor_working_diff(resolved, mode=mode, paths=paths)

@@ -247,9 +247,15 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import BasePlatformAdapter, _managed_media_delivery, should_send_media_as_audio
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            if _managed_media_delivery():
+                approved = getattr(event, "_managed_media_producers", ())
+                media_files = await asyncio.to_thread(
+                    BasePlatformAdapter.filter_media_delivery_paths, media_files, approved=approved,
+                    cwd=getattr(event, "_managed_media_cwd", None))
+            else:
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             from gateway.platforms.docker_media_paths import hand_back_unreadable_media
             await hand_back_unreadable_media([p for p, _ in media_files])
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
@@ -310,6 +316,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        delivery_producers=(), delivery_cwd=None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -386,8 +393,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
         if not deliver_media:
             return True
+        event = MessageEvent(text="", source=source, message_id=event_message_id)
+        event._managed_media_producers = tuple(delivery_producers)
+        event._managed_media_cwd = delivery_cwd
         await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+            response, event, adapter,
             thread_metadata=metadata,
         )
         return True

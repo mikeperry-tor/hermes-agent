@@ -168,6 +168,8 @@ def _start(
     )
     from tools.delegate_tool_dispatch import _Batch, _capture_origin, _run_batch
     from tools.delegation_live_log import create_live_transcripts
+    from tools.delegate_tool_resumable import hold_claim, last_workspace
+    from hermes_cli.main_resume_args import uses_managed_executor
 
     route = spec["route"]
     if run_origin == "auto":  # the scheduler has no turn to join a result into: it only ever detaches
@@ -175,6 +177,9 @@ def _start(
         origin = _capture_origin()
         if _resolve_async_wake_sid(origin[0], origin[4]) is None:
             return None, "Not continued: this session cannot receive a detached result."
+    workspace = last_workspace(parent_agent, sid)
+    if workspace is None and uses_managed_executor():
+        return None, "The child has no saved SSH executor project to continue."
     with _transcript_store(parent_agent) as db:
         session_id = _segment_tip(db, sid, spec["session_id"])
         history = _conversation(db, session_id) if db is not None else []
@@ -194,15 +199,16 @@ def _start(
             max_iterations=delegate_tool_config._load_config().get("max_iterations", DEFAULT_MAX_ITERATIONS), parent_agent=parent_agent,
             live_deleg_id=live_id, live_writers=writers,
             rebuild=[{"toolsets": spec.get("toolsets") or None, "model": spec.get("model") or route.creds["model"],
-                      "subagent_id": sid, "session_id": session_id, "expect_endpoint": spec.get("endpoint")}],
+                      "subagent_id": sid, "session_id": session_id, "expect_endpoint": spec.get("endpoint"),
+                      "continued_cwd": workspace["cwd"] if workspace else None,
+                      "continued_project_selected": workspace.get("executor_project_selected") if workspace else None}],
         )
         if err:
             return None, err
         db.sessions.reopen(session_id)  # its close() ended it; the continued child's close() ends it again
         children[0][2]._delegate_continue_history = history
         children[0][2]._delegate_run_origin = run_origin  # a parent's own continue ends automatic resumes of it
-        from tools.delegate_tool_resumable import hold_claim, last_workspace
-        children[0][2]._delegate_continue_workspace = last_workspace(parent_agent, sid)
+        children[0][2]._delegate_continue_workspace = workspace
         if record is not None:  # a run that fails before it records itself hands the claim back
             hold_claim(children[0][2], parent_agent, sid, record)
         if run_origin == "auto":  # the last word is the parent's: a stop, /stop, /new or replacement since the claim

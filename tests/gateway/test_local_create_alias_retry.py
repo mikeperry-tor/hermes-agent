@@ -98,6 +98,20 @@ async def test_exact_alias_retry_after_an_owner_key_rotation_returns_the_origina
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('fields', [{}, {'model': 'alias-key', 'provider': 'CUSTOM'}])
+async def test_exact_create_retry_skips_an_unreadable_profile(owner, monkeypatch, fields):
+    home, authority, connection = owner
+    params = _params(home, **fields)
+    ref = _create(authority, connection, params)
+
+    def unreadable(*args, **kwargs):
+        pytest.fail("an exact retry tried to reload the launch configuration")
+
+    monkeypatch.setattr('gateway.session_local.load_profile_config', unreadable)
+    assert _create(authority, connection, params) == ref
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('changed', [{'api_key': 'alias-key-1'}, {'api_key': 'other'},
                                      {'base_url': 'http://endpoint-1.invalid/v1'}])
 async def test_an_alias_retry_that_adds_a_client_route_field_is_refused(owner, changed):
@@ -171,7 +185,8 @@ async def test_a_different_alias_or_model_under_one_request_id_is_refused(owner,
 @pytest.mark.asyncio
 @pytest.mark.parametrize('alias, old_shape', [
     ('alias-key', lambda request: request.pop('route_derived', None)),  # stamped model_requested only
-    ('same-name', lambda request: [request.pop(key, None) for key in ('model_requested', 'route_derived')]),
+    ('same-name', lambda request: [request.pop(key, None) for key in (
+        'model_requested', 'route_derived', 'provider_requested')]),
 ])
 async def test_a_receipt_committed_before_this_change_still_takes_its_exact_retry(owner, monkeypatch, alias,
                                                                                  old_shape):
@@ -179,7 +194,8 @@ async def test_a_receipt_committed_before_this_change_still_takes_its_exact_retr
     was stamped for it), retried after the owner restarts on this code: the unchanged retry still
     returns the original session."""
     home, authority, connection = owner
-    params = _params(home, model=alias)
+    explicit = {'provider': 'custom'} if alias == 'same-name' else {}
+    params = _params(home, model=alias, **explicit)
     ref = _create(authority, connection, params)
 
     def rewrite(conn):
@@ -282,3 +298,35 @@ async def test_an_overlapping_alias_retry_differing_only_in_a_dropped_name_reuse
     ref = _commit(authority, staged[1])
     assert _commit(authority, staged[0]) == ref
     assert launch_key(authority, restore_policy(_policy(authority, ref))) == 'alias-key-1'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('first_has_key', [False, True])
+async def test_overlapping_create_rejects_a_different_client_key_presence(owner, first_has_key):
+    home, authority, connection = owner
+    without_key = _params(home, model='plain', base_url='http://fixture.invalid/v1')
+    with_key = {**without_key, 'api_key': 'test-only-launch-key'}
+    attempts = (with_key, without_key) if first_has_key else (without_key, with_key)
+    first, second = (_stage(authority, connection, params) for params in attempts)
+    _commit(authority, first)
+    assert _refusal(_commit, authority, second) == 'admission_conflict'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalid', [{'api_key': None}, {'api_key': 42}, {'editor': 'wrong'}])
+async def test_existing_create_rejects_invalid_credential_or_editor_shape(owner, invalid):
+    home, authority, connection = owner
+    params = _params(home, model='plain')
+    _create(authority, connection, params)
+    assert _refusal(_create, authority, connection, {**params, **invalid}) == 'invalid_params'
+
+
+@pytest.mark.asyncio
+async def test_exact_launch_key_retry_handles_non_ascii_credentials(owner):
+    home, authority, connection = owner
+    params = _params(home, model='plain', api_key='test-only-\u00e9')
+    first = _stage(authority, connection, params)
+    second = _stage(authority, connection, params)
+    ref = _commit(authority, first)
+    assert _commit(authority, second) == ref
+    assert _create(authority, connection, params) == ref

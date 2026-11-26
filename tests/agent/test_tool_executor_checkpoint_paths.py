@@ -19,14 +19,12 @@ def manager(tmp_path, monkeypatch):
     return CheckpointManager(enabled=True)
 
 
-@pytest.fixture
-def container_task_id(monkeypatch):
-    class FakeDockerEnvironment:  # class-name hint is how file_tools_paths classifies live envs
-        pass
-
-    task_id = "container-checkpoint-task"
+@pytest.fixture(params=("docker", "ssh"))
+def remote_task_id(monkeypatch, request):
+    environment = SimpleNamespace(_hermes_backend_name=request.param)
+    task_id = "remote-checkpoint-task"
     with _env_lock:
-        monkeypatch.setitem(_active_environments, task_id, FakeDockerEnvironment())
+        monkeypatch.setitem(_active_environments, task_id, environment)
     yield task_id
     with _env_lock:
         _active_environments.pop(task_id, None)
@@ -62,10 +60,8 @@ def test_relative_file_checkpoint_uses_task_workspace(tmp_path, monkeypatch):
     assert manager.list_checkpoints(str(process_cwd)) == []
 
 
-def test_container_backend_task_leaves_host_store_untouched(tmp_path, manager, container_task_id):
-    """A container-backed task's paths are container paths: no host snapshot from the file or
-    destructive-terminal hooks and no host ledger entry, even when an unrelated host tree shares
-    the spelling. A local task on the same manager still gets its checkpoint (control)."""
+def test_remote_backend_task_leaves_host_store_untouched(tmp_path, manager, remote_task_id):
+    """A remote write leaves the local checkpoint store untouched even at a matching path."""
     host_file = tmp_path / "workspace" / "project" / "a.txt"
     host_file.parent.mkdir(parents=True)
     host_file.write_text("host content\n", encoding="utf-8")
@@ -75,12 +71,12 @@ def test_container_backend_task_leaves_host_store_untouched(tmp_path, manager, c
         quiet_mode=True, tool_progress_callback=None, tool_start_callback=None, _touch_activity=lambda *_: None,
     )
 
-    _ensure_file_checkpoint(agent, "write_file", {"path": path}, container_task_id)
-    ref = _ToolCallRef("terminal", {"command": f"rm -rf {host_file.parent}"}, container_task_id, "call-1", [])
+    _ensure_file_checkpoint(agent, "write_file", {"path": path}, remote_task_id)
+    ref = _ToolCallRef("terminal", {"command": f"rm -rf {host_file.parent}"}, remote_task_id, "call-1", [])
     _begin_tool_execution(agent, ref, None)
     TurnExplainersMixin._record_file_mutation_result(
         agent, "write_file", {"path": path, "content": "x"},
-        json.dumps({"bytes_written": 1, "resolved_path": path}), False, task_id=container_task_id,
+        json.dumps({"bytes_written": 1, "resolved_path": path}), False, task_id=remote_task_id,
     )
     assert manager.list_checkpoints(str(host_file.parent)) == []
     assert not (get_hermes_home() / "checkpoints").exists()
@@ -89,8 +85,41 @@ def test_container_backend_task_leaves_host_store_untouched(tmp_path, manager, c
     assert len(manager.list_checkpoints(str(host_file.parent))) == 1
 
 
+def test_ssh_file_error_skips_the_host_failure_verifier(monkeypatch):
+    from agent import turn_explainers
+
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+
+    def fail_lookup(*args):
+        raise AssertionError("an SSH write must not probe the Hermes path")
+
+    monkeypatch.setattr(turn_explainers, "_file_mutation_identity", fail_lookup)
+    monkeypatch.setattr(turn_explainers, "_file_stat_signature", fail_lookup)
+    agent = SimpleNamespace(_turn_failed_file_mutations={})
+    TurnExplainersMixin._record_file_mutation_result(
+        agent, "write_file", {"path": "/workspace/a.txt"}, '{"error": "SSH unreachable"}', True,
+    )
+    assert agent._turn_failed_file_mutations == {}
+
+
+def test_checkpoints_follow_resolved_terminal_policy(monkeypatch):
+    from tools import terminal_tool
+    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
+
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": "local"})
+    assert CheckpointManager.unsupported_backend_reason() is None
+
+    token = set_terminal_scope({"TERMINAL_ENV": "ssh"})
+    try:
+        assert "terminal.backend=ssh" in CheckpointManager.unsupported_backend_reason()
+    finally:
+        reset_terminal_scope(token)
+
+
 @pytest.mark.asyncio
-async def test_container_session_refuses_host_rollback_on_every_surface(tmp_path, monkeypatch, manager, capsys):
+@pytest.mark.parametrize("backend", ("docker", "ssh"))
+async def test_remote_session_refuses_host_rollback_on_every_surface(tmp_path, monkeypatch, manager, capsys, backend):
     """A host checkpoint left by an earlier local session is never restored or diffed from a
     container-backed session: CLI /rollback + /diff session, gateway /rollback + /diff session,
     and the rollback.restore RPC all answer with the backend reason instead."""
@@ -105,7 +134,7 @@ async def test_container_session_refuses_host_rollback_on_every_surface(tmp_path
     host_dir.mkdir(parents=True)
     (host_dir / "a.txt").write_text("before\n", encoding="utf-8")
     manager.ensure_checkpoint(str(host_dir), "earlier local session")
-    monkeypatch.setenv("TERMINAL_ENV", "docker")  # the configured backend, as the product bridges it
+    monkeypatch.setenv("TERMINAL_ENV", backend)
     monkeypatch.setenv("TERMINAL_CWD", str(host_dir))
 
     def refuse(*_args, **_kwargs):
@@ -114,6 +143,9 @@ async def test_container_session_refuses_host_rollback_on_every_surface(tmp_path
     monkeypatch.setattr(manager, "restore", refuse)
     monkeypatch.setattr(manager, "diff", refuse)
     monkeypatch.setattr(manager, "session_diff", refuse)
+    list_checkpoints = manager.list_checkpoints
+    if backend == "ssh":
+        monkeypatch.setattr(manager, "list_checkpoints", refuse)
 
     cli = SimpleNamespace(
         _checkpoint_manager=lambda _lines: manager,
@@ -122,18 +154,23 @@ async def test_container_session_refuses_host_rollback_on_every_surface(tmp_path
     )
     for command in ("/rollback 1 --all", "/rollback diff 1"):
         CLICommandsMixin._handle_rollback_command(cli, command)
-        assert "docker" in "".join(capsys.readouterr())
+        assert backend in "".join(capsys.readouterr())
     CLICommandsMixin._print_session_diff(cli, str(host_dir), False)
-    assert "docker" in "".join(capsys.readouterr())
+    assert backend in "".join(capsys.readouterr())
 
     runner = object.__new__(gateway_run.GatewayRunner)
     runner._checkpoint_manager = lambda source=None: manager
     source = SessionSource(platform=Platform.TELEGRAM, user_id="u", chat_id="c", user_name="t", chat_type="dm")
     for text in ("/rollback 1", "/rollback 1 --all"):
-        assert "docker" in await runner._handle_rollback_command(MessageEvent(text=text, source=source))
-    assert "docker" in await runner._handle_diff_command(MessageEvent(text="/diff session", source=source))
+        assert backend in await runner._handle_rollback_command(MessageEvent(text=text, source=source))
+    assert backend in await runner._handle_diff_command(MessageEvent(text="/diff session", source=source))
     listing = await runner._handle_rollback_command(MessageEvent(text="/rollback", source=source))
-    assert "docker" in listing and "earlier local session" in listing  # listing stays visible
+    assert backend in listing
+    if backend == "docker":
+        assert "earlier local session" in listing
+    else:
+        CLICommandsMixin._handle_rollback_command(cli, "/rollback")
+        assert backend in capsys.readouterr().out
 
     session = {
         "agent": SimpleNamespace(_checkpoint_mgr=manager), "cwd": str(host_dir), "running": False,
@@ -143,9 +180,15 @@ async def test_container_session_refuses_host_rollback_on_every_surface(tmp_path
     resp = server.handle_request(
         {"id": "1", "method": "rollback.restore", "params": {"session_id": "container-sid", "hash": "1"}}
     )
-    assert resp["result"]["success"] is False and "docker" in resp["result"]["error"]
+    assert resp["result"]["success"] is False and backend in resp["result"]["error"]
+    if backend == "ssh":
+        resp = server.handle_request(
+            {"id": "list", "method": "rollback.list", "params": {"session_id": "container-sid"}}
+        )
+        assert backend in resp["error"]["message"]
 
     monkeypatch.setenv("TERMINAL_ENV", "local")  # control: a local session still dispatches
+    monkeypatch.setattr(manager, "list_checkpoints", list_checkpoints)
     monkeypatch.setattr(manager, "restore", lambda *a, **k: {"success": True, "restored_to": "x", "reason": "r"})
     resp = server.handle_request(
         {"id": "2", "method": "rollback.restore", "params": {"session_id": "container-sid", "hash": "1"}}

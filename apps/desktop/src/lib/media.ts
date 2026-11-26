@@ -140,8 +140,31 @@ export function isFileMediaPath(path: string): boolean {
   return /^(?:file:|\/|~\/|[a-z]:[\\/]|\\\\)/i.test(path)
 }
 
-export async function resolveMediaDisplaySrc(path: string, owner?: OwnerScope): Promise<string> {
-  if (isInlineMediaSrc(path) || !isFileMediaPath(path)) {
+async function readBrowserSessionMedia(path: string, sessionId: string, owner?: OwnerScope): Promise<string> {
+  const via = sessionFileOwnerScope(sessionId) ?? owner
+  const query = new URLSearchParams({ path, session_id: sessionId })
+  const result = await hermesApi<string | { dataUrl?: string }>({ ...via, path: `/api/fs/read-data-url?${query}` })
+
+  return typeof result === 'string' ? result : result.dataUrl || ''
+}
+
+async function readNativeMediaFile(path: string): Promise<string> {
+  const dataUrl = await window.hermesDesktop?.readFileDataUrl?.(filePathFromMediaPath(path))
+  if (isReadFileErrorResult(dataUrl)) {
+    throw new Error(dataUrl.message || `Media file read failed: ${dataUrl.error}`)
+  }
+
+  return dataUrl || ''
+}
+
+function canReadNativeMedia(owner?: OwnerScope): boolean {
+  return owner?.connectionId === LOCAL_CONNECTION_ID && hostHas('nativeHostFiles') &&
+    Boolean(window.hermesDesktop?.readFileDataUrl)
+}
+
+export async function resolveMediaDisplaySrc(path: string, owner?: OwnerScope, sessionId?: string): Promise<string> {
+  const browserSession = sessionId && !hostHas('nativeHostFiles') ? sessionId : undefined
+  if (isInlineMediaSrc(path) || /^blob:/i.test(path) || (!browserSession && !isFileMediaPath(path))) {
     return path
   }
 
@@ -150,18 +173,12 @@ export async function resolveMediaDisplaySrc(path: string, owner?: OwnerScope): 
   // endpoint has a separate fixed limit. A browser page's local connection is
   // the serving backend instead, whose bridge reads follow the foreground
   // profile; it takes the owner-pinned read below.
-  if (
-    owner?.connectionId === LOCAL_CONNECTION_ID &&
-    hostHas('nativeHostFiles') &&
-    window.hermesDesktop?.readFileDataUrl
-  ) {
-    const dataUrl = await window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
+  if (canReadNativeMedia(owner)) {
+    return readNativeMediaFile(path)
+  }
 
-    if (isReadFileErrorResult(dataUrl)) {
-      throw new Error(dataUrl.message || `Media file read failed: ${dataUrl.error}`)
-    }
-
-    return dataUrl
+  if (browserSession) {
+    return readBrowserSessionMedia(path, browserSession, owner)
   }
 
   // A tile can belong to a different gateway than the foreground. Pin both
@@ -184,13 +201,7 @@ export async function resolveMediaDisplaySrc(path: string, owner?: OwnerScope): 
     return mediaExternalUrl(path)
   }
 
-  const dataUrl = await window.hermesDesktop.readFileDataUrl(filePathFromMediaPath(path))
-
-  if (isReadFileErrorResult(dataUrl)) {
-    throw new Error(dataUrl.message || `Media file read failed: ${dataUrl.error}`)
-  }
-
-  return dataUrl
+  return readNativeMediaFile(path)
 }
 
 export interface MediaImageDimensions {
@@ -204,7 +215,12 @@ export interface MediaImageDimensions {
 // of reserving a frame that collapses again.
 const imageDimensions = new LruCache<string, 'broken' | MediaImageDimensions>(512)
 
-export function mediaImageKey(path: string, connection: HermesConnection | null, owner?: OwnerScope): string {
+export function mediaImageKey(
+  path: string,
+  connection: HermesConnection | null,
+  owner?: OwnerScope,
+  sessionId?: string
+): string {
   // File reads ignore URL query/fragment, but callers can use them to identify
   // a new revision. Keep them in the geometry key while joining proven aliases.
   const revision = /^file:/i.test(path) ? (path.match(/[?#].*$/)?.[0] ?? '') : ''
@@ -215,7 +231,8 @@ export function mediaImageKey(path: string, connection: HermesConnection | null,
       desktopFsCacheKey(connection && { ...connection, profile: owner?.profile ?? connection.profile }),
     owner?.profile ?? connection?.profile ?? '',
     mediaSourceIdentity(path),
-    revision
+    revision,
+    ...(!isInlineMediaSrc(path) && sessionId ? [sessionId] : [])
   ])
 }
 
@@ -277,8 +294,7 @@ export async function resolveMediaPlaybackSrc(path: string, owner?: OwnerScope, 
   if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
     if (window.hermesDesktop.getGatewayFileStreamUrl) {
       const conn = $connection.get()
-      // A Docker agent's /workspace is its session's own sandbox. The session id goes only with
-      // the profile that owns it; with no known owner the clip names no session.
+      // Send the originating session so the gateway can resolve a clip in that workspace.
       const session = sessionId ? sessionFileOwnerScope(sessionId) : null
       const via = session ?? owner
 
@@ -288,14 +304,18 @@ export async function resolveMediaPlaybackSrc(path: string, owner?: OwnerScope, 
         // The gateway OS owns file-URI conversion, including drive letters and UNC hosts.
         path,
         profile: via?.profile || conn?.profile,
-        ...(session ? { sessionId } : {})
+        ...(sessionId ? { sessionId } : {})
       })
+    }
+
+    if (sessionId && !hostHas('nativeHostFiles')) {
+      throw new Error('Gateway file stream bridge is unavailable')
     }
 
     return isRemoteGateway() ? mediaGatewayStreamUrl(path) : mediaStreamUrl(path)
   }
 
-  return resolveMediaDisplaySrc(path, owner)
+  return resolveMediaDisplaySrc(path, owner, sessionId)
 }
 
 // Resolve a media path to a URL the shell can open. Remote mode rewrites
@@ -452,7 +472,8 @@ export async function downloadGatewayMediaFile(
   }
 
   const conn = $connection.get()
-  const owner = origin.owner ?? { connectionId: conn?.connectionId, profile: origin.profile ?? conn?.profile }
+  const sessionOwner = origin.sessionId ? sessionFileOwnerScope(origin.sessionId) : null
+  const owner = origin.owner ?? sessionOwner ?? { connectionId: conn?.connectionId, profile: origin.profile ?? conn?.profile }
 
   return window.hermesDesktop.saveGatewayFile({
     ...(owner.connectionId ? { connectionId: owner.connectionId } : {}),

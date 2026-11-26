@@ -183,6 +183,11 @@ _ACTIONS = {"list": _list, "prune": _prune, "restore": _restore}
 
 def cmd_worktree(args) -> int:
     from hermes_cli import worktree_gc
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        print("Worktree commands are unavailable for an SSH executor workspace.")
+        return 1
     repo_root = getattr(args, "repo", None)
     if not repo_root:
         import cli as _cli

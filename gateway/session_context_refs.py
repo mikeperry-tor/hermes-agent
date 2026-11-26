@@ -15,13 +15,15 @@ from gateway.config import Platform
 logger = logging.getLogger(__name__)
 
 
-async def expand_references(text, *, cwd, context_length, plugins=True):
+async def expand_references(text, *, cwd, context_length, plugins=True, terminal_policy=None, attachment_session_id=None):
     """``(text, refusal)``: the expanded text, or the refusal when the injection was refused. A failed
     expansion leaves the text as typed."""
     from agent.i18n import t
     try:
         from agent.context_references import preprocess_context_references_async
-        expand = partial(preprocess_context_references_async, cwd=cwd, context_length=context_length, allowed_root=cwd)
+        expand = partial(preprocess_context_references_async, cwd=cwd, context_length=context_length,
+                         allowed_root=cwd, terminal_policy=terminal_policy,
+                         **({"attachment_session_id": attachment_session_id} if attachment_session_id else {}))
         result = await (expand(text) if plugins else expand(text, plugins=False))
     except Exception as exc:
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
@@ -31,8 +33,9 @@ async def expand_references(text, *, cwd, context_length, plugins=True):
     return (result.message if result.expanded else text), None
 
 
-def _inbound_cwd(runner, source):
+def _inbound_workspace(runner, source):
     from gateway.session_policy import policy_for_source
+    import json
     try:
         from tools.terminal_scope import terminal_env
     except ImportError:
@@ -40,19 +43,20 @@ def _inbound_cwd(runner, source):
     # A local session's references resolve in ITS workspace: this runs before the turn binds
     # the policy scope, so TERMINAL_CWD is still the daemon's own.
     if (policy := policy_for_source(runner, source)) is not None:
-        return policy.cwd
-    return terminal_env("TERMINAL_CWD", os.path.expanduser("~"))
+        return policy.cwd, json.loads(policy.terminal_json)
+    return terminal_env("TERMINAL_CWD", os.path.expanduser("~")), None
 
 
 async def inbound_references(runner, source, session_key, text):
     """``expand_references`` for an inbound turn: a local session's policy cwd, else the terminal cwd."""
     try:
-        cwd = _inbound_cwd(runner, source)
+        cwd, terminal_policy = _inbound_workspace(runner, source)
         context_length = await runner._inbound_model_context_length(source, session_key)
     except Exception as exc:
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
         return text, None
-    return await expand_references(text, cwd=cwd, context_length=context_length)
+    return await expand_references(text, cwd=cwd, context_length=context_length, terminal_policy=terminal_policy,
+                                   attachment_session_id=source.chat_id if source.platform == Platform.LOCAL else None)
 
 
 async def turn_references(runner, event, source, session_key, text):
@@ -103,8 +107,13 @@ async def managed_turn_text(authority, row, policy):
     except Exception as exc:
         logger.warning("@ context reference expansion failed: %s", exc, exc_info=True)
         return text, None
+    import json
+    from collections.abc import Mapping
+    attachment_session_id = row.get('target_session_id') if isinstance(row, Mapping) else None
     return await expand_references(text, cwd=policy.cwd, context_length=context_length,
-                                   plugins=not policy.ignore_user_config)
+                                   plugins=not policy.ignore_user_config,
+                                   terminal_policy=json.loads(policy.terminal_json),
+                                   attachment_session_id=attachment_session_id)
 
 
 def refused_turn_result(row, refusal):

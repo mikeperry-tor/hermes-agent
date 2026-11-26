@@ -103,7 +103,7 @@ def _actor(authority, actor):
     return SessionActor(CRON_PRINCIPAL_ID, authority.profile_id, actor.capabilities, actor.transport_id)
 
 
-def _create(authority, actor, params):
+async def _create(authority, actor, params):
     from cron.jobs import get_job
     from persistence.authority.bindings import local_session_id
     from gateway.session_local_recovery import restore_local_session
@@ -135,9 +135,15 @@ def _create(authority, actor, params):
     config = _load_gateway_config()
     private = {}
     launch = {'source': 'cli', 'request_id': request_id, 'toolsets': []}
+    executor_project = None
     if job.get('workdir'):
         launch['cwd'] = job['workdir']
-    policy = build_policy(launch, config, private_secrets=private)
+        from cron.executor_workspace import executor_workdir
+        try:
+            executor_project = await asyncio.to_thread(executor_workdir, job['workdir'], home=authority.profile_id)
+        except ValueError as exc:
+            raise AuthorityRefusal('invalid_params', field='workdir', detail=str(exc)) from exc
+    policy = build_policy(launch, config, private_secrets=private, executor_project=executor_project)
     policy = replace(policy, source='cron', platform='cron', model=_load_cron_job_config(job, jid, job.get('name') or jid).model,
                      request_json=json.dumps({'cron_job': job, 'extra_prompt': extra, 'request_id': request_id}))
     policy = bind_launch_key(authority, sid, policy, None, config_secrets=private)
@@ -158,7 +164,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # Run-side verdicts run_job stamps on the job dict for the firing scheduler's bookkeeping tail
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model). They cross the authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds')
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_delivery_producers', '_delivery_cwd')
 
 
 async def operation(authority, name, params, actor=None):
@@ -199,7 +205,7 @@ async def operation(authority, name, params, actor=None):
         from gateway.session_authorities import owner_scope
         # The job id, jobs file and gateway config belong to the OWNING profile.
         with owner_scope(authority):
-            ref, request_id = _create(authority, actor, params)
+            ref, request_id = await _create(authority, actor, params)
         from functools import partial
         from gateway.session_runtime_workers import tracked_write
         if isinstance(ref, dict):

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -131,15 +132,30 @@ def _session_provider(view, config=None):
                                      getattr(view, "base_url", None), getattr(view, "model", None), config=config)
 
 
+def _inventory_branch(policy, cwd):
+    if not cwd:
+        return ""
+    from hermes_cli.ssh_project_probe import managed_project_access
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from tui_gateway import git_probe
+
+    try:
+        if policy is not None and managed_project_access(json.loads(policy.terminal_json)) is not None:
+            return ""
+    except SshWorkspaceFsError:
+        return ""
+    return git_probe.branch(cwd)
+
+
 def session_inventory(authority, policy, agent, cwd):
     """Main's banner/status fields for one session. Each section degrades to main's empty value on
     its own, so one failing builder never blanks the others (main wrapped each in ``suppress``)."""
     from gateway.session_authorities import owner_scope
-    from tui_gateway import git_probe
     info: dict = {"tools": {}, "skills": {}, "mcp_servers": [], "version": "", "release_date": "",
                   "update_behind": None, "update_command": "",
-                  "branch": git_probe.branch(cwd) if cwd else "", "project": _project(cwd)}
+                  "project": _project(cwd)}
     with owner_scope(authority):
+        info["branch"] = _inventory_branch(policy, cwd)
         config = policy.config(authority, secrets=False) if policy is not None else {}
         if agent is not None:
             from agent.voice_turn_route import session_runtime_view

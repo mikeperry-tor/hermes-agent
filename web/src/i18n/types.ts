@@ -232,6 +232,7 @@ export interface Translations {
     workspaceDefault: string;
     workspaceRescan: string;
     workspaceCustom: string;
+    workspaceUnavailable?: string;
     previousPage: string;
     nextPage: string;
     roles: {

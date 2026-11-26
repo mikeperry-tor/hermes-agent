@@ -1,4 +1,4 @@
-import { hermesApi, sessionFileOwnerScope } from '@/api/client'
+import { connectionScoped, hermesApi, sessionFileOwnerScope } from '@/api/client'
 import type {
   HermesConnection,
   HermesReadDirResult,
@@ -44,6 +44,11 @@ export function desktopFsCacheKey(connection: HermesConnection | null = $connect
   return connectionCacheKey(connection)
 }
 
+/** Invalidate an open picker if the descriptor or the REST request route changes. */
+export function desktopFsPickerKey() {
+  return JSON.stringify([desktopFsCacheKey(), connectionScoped().connectionId])
+}
+
 export function isDesktopFsRemoteMode() {
   return $connection.get()?.mode === 'remote' || !hostHas('nativeHostFiles')
 }
@@ -67,12 +72,12 @@ interface FsRoute {
 
 /** Where a gateway file request goes. A session id travels only with the profile (and
  *  connection) that owns it: a Bot or pooled chat's owner can differ from the window's. With
- *  no known owner the request names no session and goes to the window's profile. */
+ *  no known owner the active profile must still verify the named session. */
 function fsRoute(scope?: DesktopFsSessionScope): FsRoute {
   const sessionId = scope?.sessionId || undefined
   const owner = sessionId ? sessionFileOwnerScope(sessionId) : null
 
-  return owner ? { owner, sessionId } : { owner: { profile: desktopFsProfile() } }
+  return { owner: owner ?? { profile: desktopFsProfile() }, sessionId }
 }
 
 function fsPath(endpoint: string, filePath: string, sessionId?: string) {
@@ -181,10 +186,10 @@ export async function writeDesktopFileText(
   return { path: result.path || path }
 }
 
-// Create a folder on the connected backend (POST /api/files/mkdir). Remote-only:
+// Create a folder on the connected backend (POST /api/fs/mkdir). Remote-only:
 // in local mode the picker is the native dialog, which creates folders itself.
 export async function createRemoteDir(path: string): Promise<string> {
-  const result = await remoteFsApi<{ path?: string }>('/api/files/mkdir', { path })
+  const result = await remoteFsApi<{ path?: string }>('/api/fs/mkdir', { path })
 
   return result.path || path
 }

@@ -151,6 +151,7 @@ def test_ssh_workspace_factory_disables_agent_file_sync(monkeypatch):
             "key_path": "/keys/id_ed25519",
             "sync_files": False,
             "ssh_config": "/etc/hermes/executor-ssh.conf",
+            "fresh_connections": False,
         }
     ]
 

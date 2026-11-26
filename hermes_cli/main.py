@@ -1118,6 +1118,10 @@ def _resolve_workspace_key() -> Optional[str]:
     subdirs/worktrees group together), else the CWD itself. Returns None when
     neither can be determined — callers fall back to the global MRU then.
     """
+    from hermes_cli.main_resume_args import managed_executor_workspace, uses_managed_executor
+
+    if uses_managed_executor():
+        return managed_executor_workspace()
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -1343,7 +1347,7 @@ def _resolve_chat_session_args(args, use_tui: bool) -> None:
 
     _resolve_continue_arg(args, use_tui=use_tui)
 
-    from hermes_cli.main_resume_args import import_foreign_resume, recreate_resumed_tui_worktree
+    from hermes_cli.main_resume_args import import_foreign_resume, restore_resumed_workspace
     import_foreign_resume(args)
 
     resume_val = getattr(args, "resume", None)
@@ -1351,23 +1355,7 @@ def _resolve_chat_session_args(args, use_tui: bool) -> None:
         # On miss keep the original so _init_agent reports "Session not found" with it.
         args.resume = _resolve_session_by_name_or_id(resume_val) or resume_val
 
-    recreate_resumed_tui_worktree(args)
-
-    # cd back into a resumed session's recorded cwd (opt out: --no-restore-cwd;
-    # --worktree owns its own dir). A missing dir warns and stays put.
-    if (
-        getattr(args, "resume", None)
-        and not getattr(args, "no_restore_cwd", False)
-        and not getattr(args, "worktree", False)
-    ):
-        with _session_db() as db:  # never let cwd-restore break a resume
-            session = db.persistence.sessions.get(args.resume)
-            _saved_cwd = ((session.cwd if session else None) or "").strip()
-            if _saved_cwd and not os.path.isdir(_saved_cwd):
-                print(f"⚠ session's recorded dir is gone ({_saved_cwd}); staying in {os.getcwd()}")
-            elif _saved_cwd and os.path.realpath(_saved_cwd) != os.path.realpath(os.getcwd()):
-                os.chdir(_saved_cwd)
-                print(f"↪ restored workspace dir: {_saved_cwd}")
+    restore_resumed_workspace(args, _session_db)
 
 
 def _warn_retired_xai_models() -> None:

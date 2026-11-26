@@ -58,6 +58,8 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    if kbw._managed_workspace_unavailable():
+        return _err("Kanban workers are unavailable for SSH executor workspaces.")
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
@@ -302,13 +304,11 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
-def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+def _gc_archived_workspaces() -> int:
+    if kbw._managed_workspace_unavailable():
+        print("Skipped Kanban workspace cleanup for the SSH executor.")
+        return 0
     import shutil
-    event_days = getattr(args, "event_retention_days", 30)
-    log_days = getattr(args, "log_retention_days", 30)
-    if event_days < 0 or log_days < 0:
-        return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kbc.connect_closing() as conn:
@@ -342,6 +342,17 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             shutil.rmtree(path, ignore_errors=True)
             if not path.exists():
                 removed_ws += 1
+
+    return removed_ws
+
+
+def _cmd_gc(args: argparse.Namespace) -> int:
+    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+    event_days = getattr(args, "event_retention_days", 30)
+    log_days = getattr(args, "log_retention_days", 30)
+    if event_days < 0 or log_days < 0:
+        return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
+    removed_ws = _gc_archived_workspaces()
 
     removed_events = 0
     if event_days:

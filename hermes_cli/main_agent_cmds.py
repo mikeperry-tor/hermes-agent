@@ -205,9 +205,36 @@ def _cmd_skills_trust(args):
         find_project_root,
         iter_skill_index_files)
     from hermes_cli.config import load_config, save_config
+    from hermes_cli.main_resume_args import requested_executor_project, uses_managed_executor
+
     action = args.skills_action
     raw_path = getattr(args, "path", None)
-    if raw_path:
+    managed = uses_managed_executor()
+    if managed:
+        from agent.ssh_context_references import reference_workspace
+        from hermes_cli.ssh_project_probe import _absolute_project
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+        from tui_gateway.git_probe import _GIT_TIMEOUT
+
+        target = raw_path or requested_executor_project()
+        if not _absolute_project(target):
+            print("Pass the absolute executor project path.")
+            return
+        if action == "untrust":
+            # Revocation stays available when the executor or directory is gone.
+            root = Path(target)
+        else:
+            try:
+                workspace = reference_workspace(None, directory=target)
+                if workspace is None:
+                    raise SshWorkspaceFsError("ECONN", "The managed SSH workspace settings are unavailable.")
+                facts = workspace.backend.inspect_projects(
+                    [workspace.cwd], workspace.grants, git_timeout=_GIT_TIMEOUT)[workspace.cwd]
+                root = Path(facts.get("worktree_root") or workspace.cwd)
+            except SshWorkspaceFsError as exc:
+                print(f"Could not verify the executor project. {exc}")
+                return
+    elif raw_path:
         root = Path(raw_path).expanduser().resolve()
         if not root.is_dir():
             print(f"Not a directory: {root}")
@@ -229,7 +256,7 @@ def _cmd_skills_trust(args):
     root_str = str(root)
 
     def _same(t: str) -> bool:
-        return str(Path(t).expanduser().resolve()) == root_str
+        return t == root_str if managed else str(Path(t).expanduser().resolve()) == root_str
 
     if action == "untrust":
         kept = [t for t in trusted if not _same(t)]
@@ -249,6 +276,10 @@ def _cmd_skills_trust(args):
         skills_cfg["trusted_project_dirs"] = trusted
         save_config(config)
         print(f"Trusted: {root}")
+
+    if managed:
+        print("Project skills from this executor checkout can load in chats that select it.")
+        return
 
     # Show what this unlocks
     count = sum(

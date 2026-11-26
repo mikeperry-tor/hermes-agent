@@ -1014,15 +1014,22 @@ class GatewayInboundMixin(
     async def _hm_cmd_init(self, event, source, _quick_key):
         # /init builds the prompt first: the ack wording depends on whether AGENTS.md exists.
         from hermes_cli.init_command import build_init_prompt_for_cwd
+        from gateway.session_context_refs import _inbound_workspace
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
 
         try:
             # The SESSION's active directory, not this process's launch dir: the desktop app
             # launches the backend from the home directory, so a bare os.getcwd() scanned and
             # updated the HOME's AGENTS.md instead of the workspace attached to the session.
-            _init_prompt = build_init_prompt_for_cwd(
+            _, terminal_policy = _inbound_workspace(self, source)
+            _init_prompt = await asyncio.to_thread(
+                build_init_prompt_for_cwd,
                 extra=event.get_command_args().strip(),
                 session_key=_quick_key or self._session_key_for_source(source),
+                terminal_policy=terminal_policy,
             )
+        except SshWorkspaceFsError as exc:
+            return True, str(exc)
         except Exception:
             return True, t("gateway.init.start_failed")
         _ack = (

@@ -37,6 +37,84 @@ _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
 
 
+def _staged_artifact_candidates(event_payload, task, board):
+    import re
+
+    from gateway.platforms.base import BasePlatformAdapter
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    from gateway.platforms.base import validate_media_delivery_path
+
+    if task is None:
+        return []
+    payload = event_payload if isinstance(event_payload, dict) else {}
+    declared = set(kb._cleaned_artifact_paths(payload))
+    prose = "\n".join(value for value in (payload.get("summary"), task.result) if isinstance(value, str))
+    with kb.pin_first_board_resolution():
+        task_dir = kb.task_attachments_dir(task.id, board=board).absolute()
+        try:
+            if task_dir.is_symlink():
+                return []
+            directory = task_dir.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return []
+        with kbc.connect_closing(board=board) as conn:
+            attachments = kb.list_attachments(conn, task.id)
+    owned_paths = [attachment.stored_path for attachment in attachments
+                   if Path(attachment.stored_path).parent in (task_dir, directory)]
+    if owned_paths and prose:
+        alternatives = "|".join(re.escape(path) for path in sorted(owned_paths, key=len, reverse=True))
+        declared.update(re.findall(r"(?<![/\w.:])(" + alternatives + r")(?=$|[\s.,;:!?\]\)'\"\x60])", prose))
+    candidates = {}
+    for attachment in attachments:
+        stored = attachment.stored_path
+        path = Path(stored)
+        if stored not in declared or path.parent not in (task_dir, directory):
+            continue
+        try:
+            if path.resolve(strict=True) != directory / path.name:
+                continue
+        except (OSError, RuntimeError):
+            continue
+        expected = str(directory / path.name)
+        if validate_media_delivery_path(expected, literal=True) == expected:
+            candidates[expected] = None
+    return list(candidates)
+
+
+def _artifact_candidates(adapter, event_payload, task, board):
+    from hermes_cli.kanban_db_workspace import _managed_workspace_unavailable
+
+    if _managed_workspace_unavailable():
+        return _staged_artifact_candidates(event_payload, task, board)
+    return _legacy_artifact_candidates(adapter, event_payload, task)
+
+
+def _legacy_artifact_candidates(adapter, event_payload, task):
+    raw_paths: list[str] = []
+    prose_paths: list[str] = []
+    if isinstance(event_payload, dict):
+        raw = event_payload.get("artifacts")
+        if isinstance(raw, (list, tuple)):
+            raw_paths += [item for item in raw if isinstance(item, str)]
+        summary = event_payload.get("summary")
+        if isinstance(summary, str) and summary:
+            prose_paths += adapter.extract_local_files(summary)[0]
+    if task is not None and getattr(task, "result", None):
+        prose_paths += adapter.extract_local_files(str(task.result))[0]
+    # A staged copy and the scratch original it was copied from are the
+    # same deliverable; on a review handoff the original still exists, so
+    # prose mentions of it must not upload the file a second time.
+    staged_names = {os.path.basename(p) for p in raw_paths}
+    raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
+    candidates: list[str] = []
+    for path in raw_paths:
+        expanded = os.path.expanduser(path) if path else ""
+        if expanded and expanded not in candidates and os.path.isfile(expanded):
+            candidates.append(expanded)
+    from gateway.platforms.base import BasePlatformAdapter
+    return BasePlatformAdapter.filter_local_delivery_paths(candidates)
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -149,7 +227,9 @@ class GatewayKanbanWatchersMixin:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
-    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
+    async def _deliver_kanban_artifacts(
+        self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task, board=None,
+    ) -> None:
         """Upload artifact files referenced by a completed kanban task.
 
         Sources, in priority order: ``event_payload['artifacts']``,
@@ -157,32 +237,7 @@ class GatewayKanbanWatchersMixin:
         deduplicated, missing files are skipped (may be mentioned for
         reference only), and upload errors are logged, never raised.
         """
-        raw_paths: list[str] = []
-        prose_paths: list[str] = []
-        if isinstance(event_payload, dict):
-            raw = event_payload.get("artifacts")
-            if isinstance(raw, (list, tuple)):
-                raw_paths += [item for item in raw if isinstance(item, str)]
-            summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
-                prose_paths += adapter.extract_local_files(summary)[0]
-        if task is not None and getattr(task, "result", None):
-            prose_paths += adapter.extract_local_files(str(task.result))[0]
-        # A staged copy and the scratch original it was copied from are the
-        # same deliverable; on a review handoff the original still exists, so
-        # prose mentions of it must not upload the file a second time.
-        staged_names = {os.path.basename(p) for p in raw_paths}
-        raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
-        candidates: list[str] = []
-        for path in raw_paths:
-            expanded = os.path.expanduser(path) if path else ""
-            if expanded and expanded not in candidates and os.path.isfile(expanded):
-                candidates.append(expanded)
-        if not candidates:
-            return
-
-        from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        candidates = await asyncio.to_thread(_artifact_candidates, adapter, event_payload, task, board)
         if not candidates:
             return
 

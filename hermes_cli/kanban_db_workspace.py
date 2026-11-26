@@ -333,7 +333,9 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
 
 
 def _scratch_workspace(conn: sqlite3.Connection, task_id: str) -> Optional[Path]:
-    """Expanded ``workspace_path`` when the task uses a scratch workspace, else ``None``."""
+    """Expanded path of a local scratch workspace, if the task uses one."""
+    if _managed_workspace_unavailable():
+        return None
     row = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
@@ -359,12 +361,25 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+def _managed_workspace_unavailable() -> bool:
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    return uses_managed_executor()
+
+
+def _require_local_workspace() -> None:
+    if _managed_workspace_unavailable():
+        raise ValueError("Kanban workers are unavailable for SSH executor workspaces.")
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` is intentionally preserved."""
+    if _managed_workspace_unavailable():
+        return
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
@@ -503,6 +518,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
 
     See #33774.
     """
+    if _managed_workspace_unavailable():
+        return
     try:
         parents = conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id = ?",
@@ -718,6 +735,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
+    _require_local_workspace()
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -798,6 +816,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     kind = task.workspace_kind or "scratch"
     if kind == "worktree":
         return _resolve_worktree_workspace(task, board=board)[0]
+    _require_local_workspace()
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":

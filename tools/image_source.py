@@ -79,6 +79,11 @@ async def resolve_image_source(
     # Everything else is a filesystem path — including bare relative names like "pic.png"
     # (a path-shape gate here regressed them once).
     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from tools.environments.sandbox_scope import hosted_scope
+    if hosted_scope() is None and uses_managed_executor():
+        image, _ = await asyncio.to_thread(read_managed_media_path, candidate, permitted=permitted)
+        return image
     p = Path(os.path.expanduser(candidate))
     host_target = _permitted_host_read_target(p, ctx)
     # Local backend only: under a sandbox a miss must still reach the in-container read, so the
@@ -98,6 +103,46 @@ async def resolve_image_source(
         # Any path was host-readable, so a miss means the file doesn't exist.
         raise SourceNotFound(f"media file not found: '{p}'", src=s, origin="file")
     return await _resolve_container_fallback(p, ctx, s, permitted)
+
+
+def read_managed_media_path(path: str, *, permitted: tuple = ("image",), session_id: str = "") -> tuple[ResolvedImage, str]:
+    """Read media from the selected SSH workspace or the current profile's staging."""
+    from pathlib import PurePosixPath
+    from posixpath import join, normpath
+    from agent.ssh_context_references import reference_workspace
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    if path.startswith("staged:"):
+        from agent.ssh_staged_references import resolve_staged_reference
+        from tools.approval_context import get_current_tool_session_id
+
+        staged = resolve_staged_reference(path, session_id or get_current_tool_session_id())
+        if staged is None:
+            raise SourceNotFound("The staged media is unavailable.", src=path, origin="file")
+        _guard_credential_read(staged, path)
+        try:
+            data = _read_host_bytes_bounded(staged, path, _MAX_INGEST_BYTES)
+        except OSError as exc:
+            raise SourceNotFound("The staged media is unavailable.", src=path, origin="file") from exc
+        return _finalize(data, "", "file", path, permitted), path
+    if path.startswith("~"):
+        raise SourceUnsafe("Use a path within the selected SSH workspace.", src=path, origin="container")
+    try:
+        workspace = reference_workspace(None)
+        if workspace is None:
+            raise SshWorkspaceFsError("ECONN", "The SSH executor workspace is unavailable.")
+        requested = normpath(join(workspace.cwd, str(PurePosixPath(path))))
+        resolved, _, payload = workspace.backend.reference_path(
+            requested, (workspace.cwd,), kind="regular", limit=_MAX_INGEST_BYTES, complete=True)
+        data = base64.b64decode(payload[1], validate=True)
+    except SshWorkspaceFsError as exc:
+        error_type = SourceTooLarge if exc.code == "EFBIG" else SourceNotFound
+        raise error_type(str(exc), src=path, origin="container") from exc
+    except (ValueError, TypeError, IndexError) as exc:
+        raise NotAnImage("The SSH executor returned invalid media data.", src=path, origin="container") from exc
+    if len(data) > _MAX_INGEST_BYTES:
+        raise SourceTooLarge("media exceeds size limit", src=path, origin="container")
+    return _finalize(data, "", "container", path, permitted), resolved
 
 
 def _read_host_bytes_bounded(path: Path, src: str, cap: int) -> bytes:

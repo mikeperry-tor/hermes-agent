@@ -10,7 +10,7 @@ import subprocess
 import threading
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.environments.ssh import SSHEnvironment
@@ -33,6 +33,7 @@ class _SshFsConfig:
     cwd: str
     timeout: int
     ssh_config: str = ""
+    fresh_connections: bool = False
 
 
 # ``_CACHE_LOCK`` guards only the dicts and is never held across a dial or cleanup, so one
@@ -95,6 +96,22 @@ class SshWorkspaceFs:
                 timeout=timeout or self._env.timeout,
             )
 
+    def sync_skill_files(self) -> None:
+        """Refresh executor copies of profile-approved skill files."""
+        from tools.credential_files import iter_skills_files
+
+        base = self.normalize("~") + "/.hermes"
+        pairs = [(entry["host_path"], entry["container_path"]) for entry in iter_skills_files(container_base=base)]
+        if pairs:
+            with self._lock:
+                self._env._ssh_bulk_upload(pairs)
+
+    def run_skill_shell(self, command: str, cwd: str, timeout: int) -> dict:
+        """Run a skill snippet without re-homing the session's shell."""
+        launcher = f"timeout {timeout}s bash -c {shlex.quote(command)}"
+        with self._lock:
+            return self._env.execute(launcher, cwd=cwd, timeout=timeout + 10, bounded_capture=True)
+
     @staticmethod
     def _error_code(output: str, fallback: str = "EIO") -> str:
         marker = "__HERMES_FS_ERROR__:"
@@ -140,6 +157,13 @@ done
 
         entries.sort(key=lambda item: (not item["isDirectory"], item["name"].lower(), item["name"]))
         return {"entries": entries}
+
+    def list_project_directory(self, path, roots, hidden_names):
+        from hermes_cli.ssh_project_probe import list_project_directory
+        from tools.file_operations import ShellFileOperations
+
+        with self._lock:
+            return list_project_directory(ShellFileOperations(self._env), path, roots, hidden_names)
 
     def read_bytes(
         self,
@@ -187,6 +211,7 @@ printf '__HERMES_FS_SIZE__:%s\\n' "$size"
         target = self.normalize(path)
         command = f"""
 p={shlex.quote(target)}
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then printf '__HERMES_FS_ERROR__:ENOENT\\n'; exit 44; fi
 target=$(realpath "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null) || {{ printf '__HERMES_FS_ERROR__:ENOENT\\n'; exit 44; }}
 if [ ! -f "$target" ]; then printf '__HERMES_FS_ERROR__:ENOTREG\\n'; exit 45; fi
 size=$(stat -c %s "$target" 2>/dev/null || stat -f %z "$target" 2>/dev/null) || {{ printf '__HERMES_FS_ERROR__:EACCES\\n'; exit 46; }}
@@ -211,6 +236,10 @@ printf '__HERMES_FS_SIZE__:%s\\n' "$size"
         if self.normalize(resolved) != resolved:
             raise SshWorkspaceFsError("EINVAL", "Invalid path")
         return resolved, size
+
+    def ssh_command(self) -> list[str]:
+        """Return the OpenSSH invocation for the adapter's execution endpoint."""
+        return self._env._build_ssh_command(["-T", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"])
 
     def stream_file(
         self, path: str, chunk_size: int = 64 * 1024, *, offset: int = 0, length: int | None = None,
@@ -243,6 +272,77 @@ printf '__HERMES_FS_SIZE__:%s\\n' "$size"
                 process.terminate()
             process.wait()
 
+    def mkdir(self, path: str, *, roots: tuple[str, ...] | None) -> str:
+        """Create one directory below its existing executor parent."""
+        import json
+
+        from tools.file_operations import ShellFileOperations
+        from tools.file_operations_ssh_path import SSH_PATH_STATE
+        from tools.file_operations_ssh_write import SSH_WRITE
+        from tools.file_tools_ssh_writes import executor_write_policy
+
+        target = self.normalize(path)
+        if target == "/" or target.startswith("//"):
+            raise SshWorkspaceFsError("EINVAL")
+        policy = executor_write_policy(roots or (), managed=roots is not None)
+        snippet = SSH_PATH_STATE + SSH_WRITE + f"\nprint(json.dumps(mkdir_checked({target!r}, {policy!r})))\n"
+        with self._lock:
+            try:
+                reply = json.loads(ShellFileOperations(self._env)._framed_ssh_file_output(snippet))
+            except (OSError, ValueError) as exc:
+                raise SshWorkspaceFsError("ECONN") from exc
+        if not isinstance(reply, dict):
+            raise SshWorkspaceFsError("EIO")
+        code = reply.get("error")
+        if isinstance(code, str) and code in {"EWRITE", "EWRITETYPE", "EEXIST", "EIO"}:
+            message = reply.get("message")
+            raise SshWorkspaceFsError(code, message if isinstance(message, str) else None)
+        if reply != {"path": target}:
+            raise SshWorkspaceFsError("EIO")
+        return target
+
+    def write_managed_text(
+        self, path: str, content: str, *, roots: tuple[str, ...],
+        is_sensitive: Callable[[str], bool], max_bytes: int,
+    ) -> tuple[str, int]:
+        """Publish an authenticated editor save through the SSH workspace transport."""
+        from tools.file_operations import ShellFileOperations
+        from tools.file_operations_ssh_write import (
+            SSHWriteConflict, SSHWriteFileTypeError, inspect_ssh_write, publish_ssh_file, ssh_write_snapshot,
+        )
+        from tools.file_tools_ssh_writes import executor_write_policy
+
+        target = self.normalize(path)
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_bytes:
+            raise SshWorkspaceFsError("EFBIG")
+        ops = ShellFileOperations(self._env)
+        policy = executor_write_policy(roots, managed=True)
+        with self._lock:
+            try:
+                inspected = inspect_ssh_write(ops, target, policy)
+            except SSHWriteFileTypeError as exc:
+                raise SshWorkspaceFsError("EWRITETYPE", str(exc)) from None
+            except PermissionError as exc:
+                raise SshWorkspaceFsError("EWRITE", str(exc)) from None
+            except (OSError, ValueError) as exc:
+                raise SshWorkspaceFsError("EIO") from exc
+            paths = (target, inspected.entry, inspected.destination.path, *inspected.intermediate_links)
+            if inspected.approvals or any(is_sensitive(candidate) for candidate in paths):
+                raise SshWorkspaceFsError("EWRITE", "Access to sensitive files is not allowed")
+            try:
+                expected = ssh_write_snapshot(ops, inspected.destination)
+                result = publish_ssh_file(ops, target, inspected, expected, encoded, policy, create_parents=False)
+            except SSHWriteConflict as exc:
+                raise SshWorkspaceFsError("ESTALE") from exc
+            except PermissionError as exc:
+                raise SshWorkspaceFsError("EWRITE", str(exc)) from None
+            except (OSError, ValueError) as exc:
+                raise SshWorkspaceFsError("EIO") from exc
+        if result.error:
+            raise SshWorkspaceFsError(result._error_code or "EIO", result.error)
+        return target, result.bytes_written
+
     def write_text(self, path: str, content: str, *, max_bytes: int) -> tuple[str, int]:
         target = self.normalize(path)
         encoded_size = len(content.encode("utf-8"))
@@ -266,6 +366,64 @@ cat > "$tmp" && mv -f "$tmp" "$target"
         if result.get("returncode") != 0 or result.get("stdin_error"):
             raise SshWorkspaceFsError(self._error_code(result.get("output", "")))
         return target, encoded_size
+
+    def inspect_projects(self, paths, roots, *, git_timeout: float | None = None) -> dict[str, dict]:
+        """Inspect candidate project directories using this adapter's SSH connection."""
+        from hermes_cli.ssh_project_probe import inspect_projects
+        from tools.file_operations import ShellFileOperations
+
+        with self._lock:
+            return inspect_projects(ShellFileOperations(self._env), paths, roots, git_timeout=git_timeout)
+
+    def reference_path(self, path: str, roots: tuple[str, ...], *, kind: str,
+                       start: int | None = None, end: int | None = None, limit: int,
+                       recursive: bool = False, prefix: str = "", include_hidden: bool = False, complete: bool = False):
+        """Inspect and read a scoped reference using the verified executor entry."""
+        from agent.file_safety import get_read_block_error
+        from hermes_cli.ssh_project_probe import _under_roots
+        from tools.file_operations import ShellFileOperations
+
+        if not _under_roots(path, roots):
+            raise SshWorkspaceFsError("EINVAL", "The path is outside the selected SSH workspace.")
+        if get_read_block_error(path, ssh_path=True):
+            raise SshWorkspaceFsError("EACCES", "The SSH workspace path cannot be attached.")
+        operations = ShellFileOperations(self._env)
+        with self._lock:
+            try:
+                state = operations.inspect_ssh_path(path, protect_read=True)
+                if (not _under_roots(state.path, roots) or state.read_denied or state.secret_file
+                        or get_read_block_error(state.path, ssh_path=True)):
+                    raise SshWorkspaceFsError("EACCES", "The SSH workspace path cannot be attached.")
+                if state.kind == "absent":
+                    raise SshWorkspaceFsError("ENOENT", "The executor entry is unavailable.")
+                if state.kind != kind or state.metadata is None:
+                    raise SshWorkspaceFsError("ENOTREG" if kind == "regular" else "ENOTDIR",
+                                              "The executor entry has the wrong file type.")
+                if complete and state.metadata[2] > limit:
+                    raise SshWorkspaceFsError("EFBIG", "The executor file exceeds the read limit.")
+                args = (state.path, state.metadata)
+                if kind == "directory":
+                    payload = operations._ssh_file_value(
+                        f"reference_directory{(*args, limit, recursive, prefix, include_hidden)!r}")
+                else:
+                    payload = operations._ssh_file_value(f"read_reference_window{(*args, start, end, limit)!r}")
+            except (OSError, ValueError) as exc:
+                raise SshWorkspaceFsError("EIO", "Could not read the SSH workspace reference.") from exc
+        return state.path, state.metadata[2], payload
+
+    def reference_git(self, cwd: str, roots: tuple[str, ...], arguments: list[str], limit: int) -> str:
+        from hermes_cli.ssh_project_git import git_reference
+        from tools.file_operations import ShellFileOperations
+
+        with self._lock:
+            return git_reference(ShellFileOperations(self._env), cwd, roots, arguments, limit)
+
+    def discover_projects(self, roots, scan_roots, exclusions, *, git_timeout: float):
+        from hermes_cli.ssh_project_probe import discover_projects
+        from tools.file_operations import ShellFileOperations
+
+        with self._lock:
+            return discover_projects(ShellFileOperations(self._env), roots, scan_roots, exclusions, git_timeout=git_timeout)
 
     def git_root(self, path: str) -> str | None:
         target = self.normalize(path)
@@ -291,7 +449,9 @@ exit 1
         return (result.get("output") or "").strip() if result.get("returncode") == 0 else ""
 
 
-def get_ssh_workspace_fs(profile_key: str, terminal_config: dict[str, Any]) -> SshWorkspaceFs | None:
+def get_ssh_workspace_fs(
+    profile_key: str, terminal_config: dict[str, Any], *, fresh_connections: bool = False,
+) -> SshWorkspaceFs | None:
     """Return a cached adapter when this profile selects the SSH backend."""
     if str(terminal_config.get("backend") or "local").strip().lower() != "ssh":
         return None
@@ -304,6 +464,7 @@ def get_ssh_workspace_fs(profile_key: str, terminal_config: dict[str, Any]) -> S
         cwd=str(terminal_config.get("cwd") or "~").strip() or "~",
         timeout=int(terminal_config.get("timeout") or 180),
         ssh_config=str(terminal_config.get("ssh_config") or ""),
+        fresh_connections=fresh_connections,
     )
     if not config.host or not config.user:
         raise SshWorkspaceFsError("ECONN", "SSH host and user are required")
@@ -330,6 +491,8 @@ def get_ssh_workspace_fs(profile_key: str, terminal_config: dict[str, Any]) -> S
                     key_path=config.key_path,
                     sync_files=False,
                     ssh_config=config.ssh_config,
+                    fresh_connections=config.fresh_connections,
+                    **({"file_transport": True} if config.fresh_connections else {}),
                 )
         except Exception as exc:
             raise SshWorkspaceFsError("ECONN", "Could not connect to the SSH workspace") from exc

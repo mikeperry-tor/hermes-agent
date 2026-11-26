@@ -2,7 +2,7 @@
  "counts": {
   "http": {
    "keep-host-wide": 1,
-   "undecided": 353
+   "undecided": 354
   },
   "rpc": {
    "authority": 114,
@@ -241,6 +241,7 @@
   {"current_path": "hermes_cli.web_routers.files:issue_file_ticket; surface: browser_files", "decision": "undecided", "handler": "POST /api/files/ticket", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.files:upload_managed_file", "decision": "undecided", "handler": "POST /api/files/upload", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.files:upload_managed_file_stream", "decision": "undecided", "handler": "POST /api/files/upload-stream", "kind": "http", "ref": ""},
+  {"current_path": "hermes_cli.web_routers.files:fs_mkdir", "decision": "undecided", "handler": "POST /api/fs/mkdir", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.files:fs_write_text", "decision": "undecided", "handler": "POST /api/fs/write-text", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.gateway_connections:save_connection; surface: gateway_connections", "decision": "undecided", "handler": "POST /api/gateway-connections", "kind": "http", "ref": ""},
   {"current_path": "hermes_cli.web_routers.gateway_connections:set_last_used; surface: gateway_connections", "decision": "undecided", "handler": "POST /api/gateway-connections/last-used", "kind": "http", "ref": ""},

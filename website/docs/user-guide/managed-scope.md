@@ -119,6 +119,29 @@ When the managed `config.yaml` pins a non-empty `terminal.backend`, a profile
 them and passes the keys as environment) loads as absent with a warning; without
 that pin the read error still stops Hermes.
 
+When the managed SSH configuration sets `terminal.ssh_workspace_roots`,
+supply a list of absolute directories on the executor. Structured model
+edits and the dashboard editor accept files under those roots. Hermes
+checks symlinks and the applied roots on the executor before publishing.
+The dashboard project picker's **New folder** creates one folder on the
+active profile's executor under an existing directory in those roots.
+Choose a parent without symlink components.
+
+The dashboard discovers Git repositories on the executor under the applied
+roots. To narrow discovery, use absolute executor paths in
+`desktop.repo_scan_roots` and `desktop.repo_scan_exclude_paths`. The scan skips
+hidden folders and `node_modules` and visits three levels below each root.
+Projects can also contain manually registered non-Git folders. Saved chats
+remain available when their folder is removed.
+
+Shared edits use a Linux executor with Python 3.11 or later and the POSIX ACL
+library. Replacement preserves executable bits and effective access when the
+filesystem can represent the same access on the new file. For example, grant
+the SSH user the same read, write, and execute permissions as the owner when
+both users edit a host-owned executable. If access cannot be preserved,
+Hermes leaves the original file in place. New files inherit the containing
+directory's default ACL.
+
 ## Seeing what's managed
 
 ```bash

@@ -388,6 +388,13 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
     return "\n" in pattern or bool(_REGEX_NEWLINE_ESCAPE_RE.search(pattern))
 
 
+def split_search_roots(path: str) -> list[str]:
+    """Separate a missing path into the roots it may name."""
+    if "," in path:
+        return [part.strip() for part in path.split(",") if part.strip()]
+    return path.split()
+
+
 def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     return bool(error) and "literal \"\\n\" is not allowed" in error and "--multiline" in error
@@ -818,10 +825,7 @@ class SearchMixin:
         Commas explicitly delimit paths (internal spaces preserved); without commas
         split on whitespace. Search every existing part, merge, and note skipped
         parts. None when it doesn't look like a multi-path string."""
-        if "," in path:
-            parts = [part.strip() for part in path.split(",") if part.strip()]
-        else:
-            parts = path.split()
+        parts = split_search_roots(path)
         if len(parts) < 2:
             return None
         existing, missing = [], []

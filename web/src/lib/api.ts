@@ -2014,7 +2014,7 @@ export interface ChatWorkspaceProject {
   name: string;
   primary_path: string | null;
   archived: boolean;
-  folders: Array<{ path: string; label: string | null; is_primary: boolean }>;
+  folders: Array<{ path: string; label: string | null; is_primary: boolean; workspace_available?: boolean }>;
 }
 
 export interface ChatWorkspaceRepo {

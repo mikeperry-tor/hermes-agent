@@ -110,22 +110,39 @@ class SSHEnvironment(BaseEnvironment):
     # they stay out of the remote snapshot under multiplex.
     _profile_scoped_passthrough = True
     _passwordless_sudo_probe_supported = True
+
+    def matches_terminal_endpoint(self, terminal: dict) -> bool:
+        """Check whether a cached connection uses the selected terminal endpoint."""
+        return (
+            self.host == terminal["TERMINAL_SSH_HOST"]
+            and self.user == terminal["TERMINAL_SSH_USER"]
+            and str(self.port) == terminal["TERMINAL_SSH_PORT"]
+            and self.key_path == terminal["TERMINAL_SSH_KEY"]
+            and self._ssh_config_options == tuple(ssh_config_options(terminal["TERMINAL_SSH_CONFIG"]))
+        )
     # cleanup() only closes the ControlMaster sockets: a nohup'd background job keeps running on
     # the host and the next execute() reconnects, so its poller still collects the real exit.
     cleanup_stops_processes = False
     _ssh_config_options: tuple[str, ...] = ()
+    _fresh_connections = False
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = "",
                  probe_only: bool = False, sync_files: bool = True, persistent: bool = True,
-                 ssh_config: str = ""):
+                 ssh_config: str = "", fresh_connections: bool = False,
+                 file_transport: bool = False):
         from tools.terminal_tool_config import coerce_ssh_remote_cwd
 
         # cwd may be a raw terminal.cwd naming a directory on the machine running Hermes; coercion is
         # idempotent, so callers that already coerced are unaffected.
-        super().__init__(cwd=coerce_ssh_remote_cwd(cwd, "ssh"), timeout=timeout, persist_env=persistent)
+        ssh_cwd = cwd if file_transport else coerce_ssh_remote_cwd(cwd, "ssh")
+        super().__init__(cwd=ssh_cwd, timeout=timeout, persist_env=persistent and not file_transport)
+        self._file_transport = file_transport
+        if file_transport:
+            self._profile_scoped_passthrough = False
         self.host, self.user, self.port, self.key_path = host, user, port, key_path
         self._ssh_config_options = tuple(ssh_config_options(ssh_config))
+        self._fresh_connections = fresh_connections
         self.control_dir, self._owns_control_dir = _open_control_dir()
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
         # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
@@ -150,12 +167,21 @@ class SSHEnvironment(BaseEnvironment):
             return
         self._remote_home_detected = False
         self._remote_home = self._detect_remote_home()
+        if file_transport:
+            self._prefer_nonlogin = True
+            return
         if sync_files:
+            from hermes_cli.main_resume_args import uses_managed_executor
+
+            base = f"{self._remote_home}/.hermes"
+            skill_roots = (tuple(f"{base}/{part}" for part in ("skills", "external_skills", "project_skills"))
+                           if uses_managed_executor() else ())
             self._ensure_remote_dirs()
             self._sync_manager = FileSyncManager(
-                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                get_files_fn=lambda: iter_sync_files(base),
                 upload_fn=self._scp_upload, delete_fn=self._ssh_delete,
-                bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download)
+                bulk_upload_fn=self._ssh_bulk_upload, bulk_download_fn=self._ssh_bulk_download,
+                upload_only_remote_roots=skill_roots)
             self._sync_manager.sync(force=True)
         self.init_session()
 
@@ -185,7 +211,9 @@ class SSHEnvironment(BaseEnvironment):
     def _build_ssh_command(self, extra_args: list | None = None, send_env: Iterable[str] = ()) -> list:
         send_env = tuple(sorted(send_env))
         cmd = ["ssh", *self._ssh_config_options]
-        if _SSH_MULTIPLEX:
+        if self._fresh_connections:
+            cmd.extend(["-S", "none"])
+        elif _SSH_MULTIPLEX:
             cmd.extend(["-o", f"ControlPath={self._control_socket_for(send_env)}",
                         "-o", "ControlMaster=auto", "-o", "ControlPersist=300"])
         if not self._ssh_config_options:
@@ -243,7 +271,9 @@ class SSHEnvironment(BaseEnvironment):
         """Upload a single file via scp over ControlMaster."""
         self._run_ssh(f"mkdir -p {shlex.quote(str(Path(remote_path).parent))}", timeout=10)
         scp_cmd = ["scp", *self._ssh_config_options]
-        if _SSH_MULTIPLEX:
+        if self._fresh_connections:
+            scp_cmd.extend(["-o", "ControlPath=none"])
+        elif _SSH_MULTIPLEX:
             scp_cmd.extend(["-o", f"ControlPath={self.control_socket}"])
         scp_cmd += self._target_flags("-P") + [host_path, f"{self.user}@{self.host}:{remote_path}"]
         result = run_capture(scp_cmd, timeout=30)
@@ -327,7 +357,9 @@ class SSHEnvironment(BaseEnvironment):
         # "socket ignored" and some builds exit 2, which failed every sync-back and left a
         # multi-GB temp tar behind on each retry. Exclude them up front.
         ssh_cmd = self._build_ssh_command() + [
-            f"tar cf - --exclude='*.sock' -C / {shlex.quote(rel_base)}"]
+            f"tar cf - --exclude='*.sock' "
+            f"--exclude={shlex.quote(rel_base + '/bot-desktop/browser-profile')} "
+            f"-C / {shlex.quote(rel_base)}"]
         with open(dest, "wb") as f:
             result = subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.PIPE, timeout=120, check=False)
         if result.returncode != 0:
@@ -357,6 +389,8 @@ class SSHEnvironment(BaseEnvironment):
         client's env carries the values, so secrets never enter the remote ``bash -c`` argv. The
         remote sshd must ``AcceptEnv`` them (#14091). Profile-scoped names missing from the active
         scope are unset remotely so a shared host cannot serve another profile's value."""
+        if self._file_transport:
+            return _popen_bash(self._build_ssh_command() + bash_argv(shlex.quote(cmd_string), False), stdin_data)
         values, unset_names = resolve_passthrough_env(hermes_env_loader=load_hermes_env_vars)
         cmd = self._build_ssh_command(send_env=values) + bash_argv(shlex.quote(prepend_unset(cmd_string, unset_names)), login)
         client_env = client_env_with(values)
@@ -375,6 +409,8 @@ class SSHEnvironment(BaseEnvironment):
         if self._sync_manager:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
+        if self._fresh_connections:
+            return
         for socket in self._control_sockets():
             if not socket.exists():
                 continue

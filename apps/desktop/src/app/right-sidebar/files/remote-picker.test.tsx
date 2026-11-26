@@ -8,7 +8,7 @@ import { RemoteFolderPicker } from './remote-picker'
 // A tiny backend filesystem: the picker reads it through readDesktopDir and
 // grows it through createRemoteDir, the same two calls it makes for real.
 const dirs = vi.hoisted(() => new Set<string>())
-const picker = vi.hoisted(() => ({ current: null as DesktopFsRemotePicker | null }))
+const picker = vi.hoisted(() => ({ current: null as DesktopFsRemotePicker | null, connectionKey: 'primary' }))
 
 const createRemoteDir = vi.hoisted(() =>
   vi.fn(async (path: string) => {
@@ -20,6 +20,7 @@ const createRemoteDir = vi.hoisted(() =>
 
 vi.mock('@/lib/desktop-fs', () => ({
   createRemoteDir,
+  desktopFsPickerKey: () => picker.connectionKey,
   readDesktopDir: async (path: string) => {
     const prefix = path === '/' ? '/' : `${path}/`
 
@@ -45,6 +46,7 @@ function openPicker(defaultPath: string) {
 }
 
 beforeEach(() => {
+  picker.connectionKey = 'primary'
   dirs.clear()
   dirs.add('/home')
   dirs.add('/home/me')
@@ -55,6 +57,43 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('RemoteFolderPicker', () => {
+  it('cancels folder creation if the active connection changes after listing', async () => {
+    render(<RemoteFolderPicker />)
+    const selection = openPicker('/home/me')
+
+    await screen.findByText('existing')
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    const input = screen.getByRole('textbox', { name: 'Folder name' })
+    fireEvent.change(input, { target: { value: 'new-folder' } })
+    picker.connectionKey = 'secondary'
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await expect(selection).resolves.toEqual([])
+    expect(createRemoteDir).not.toHaveBeenCalled()
+  })
+
+  it('keeps an earlier create reply out of a reopened picker', async () => {
+    render(<RemoteFolderPicker />)
+    const first = openPicker('/home/me')
+    let finish = (_path: string) => {}
+    createRemoteDir.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+
+    await screen.findByText('existing')
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+    const input = screen.getByRole('textbox', { name: 'Folder name' })
+    fireEvent.change(input, { target: { value: 'old-path' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(createRemoteDir).toHaveBeenCalledWith('/home/me/old-path'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await expect(first).resolves.toEqual([])
+    const reopened = openPicker('/home/me/existing')
+    await act(async () => finish('/home/me/old-path'))
+    fireEvent.click(screen.getByRole('button', { name: 'Select folder' }))
+
+    await expect(reopened).resolves.toEqual(['/home/me/existing'])
+  })
+
   it('creates a folder on the backend under the current path and selects it', async () => {
     render(<RemoteFolderPicker />)
     const selection = openPicker('/home/me')

@@ -498,16 +498,7 @@ def _dispatch_quick(rid, params, session, name, arg):
 
 @contextlib.contextmanager
 def _session_home_scope(session, cwd: str | None = None, profile: str | None = None):
-    """Bind HERMES_HOME and the logical cwd to the session for the block.
-
-    Skill/bundle/quick-command resolution is home-keyed (``skills.external_dirs``, ``skill-bundles/``,
-    ``quick_commands`` all live in the profile's config/home); nothing upstream of these RPC handlers
-    binds it, so an unscoped call resolves against the launch profile (#110695). Project-local skills
-    are cwd-keyed (``find_project_root`` reads the session-bound cwd first): these RPCs run on the socket
-    thread with no session context, where the terminal scope resolves a placeholder ``terminal.cwd`` to
-    ``$HOME`` and no project skill ever registers or dispatches (#114359). ``cwd`` overrides the session
-    record (a session-less catalog request binds the workspace a new session would be seeded with).
-    ``profile`` scopes a session-less call (a Desktop draft names its rail-selected profile) (#124651)."""
+    """Scope skills and commands to the current chat or draft's profile and workspace."""
     hc = _tools_mod("hermes_constants")
     rc = _tools_mod("agent.runtime_cwd")
     profile_home = session.get("profile_home") if session else None
@@ -516,9 +507,17 @@ def _session_home_scope(session, cwd: str | None = None, profile: str | None = N
     cwd = cwd or (str(session.get("cwd") or "") if session else "")
     token = hc.set_hermes_home_override(profile_home) if profile_home else None
     cwd_token = rc.set_session_cwd(cwd) if cwd else None
+    terminal_token = None
     try:
+        from tui_gateway.session_workdir import bind_sidecar_project
+
+        terminal_token = bind_sidecar_project(cwd, session)
         yield
     finally:
+        if terminal_token is not None:
+            from tools.terminal_scope import reset_terminal_scope
+
+            reset_terminal_scope(terminal_token)
         if cwd_token is not None:
             rc.reset_session_cwd(cwd_token)
         if token is not None:
@@ -663,9 +662,17 @@ def _cmd_init(rid, params, session, name, arg):
     backend from the home directory, so a process-cwd fallback scans and updates the HOME's
     AGENTS.md instead of the workspace attached to the session."""
     from hermes_cli.init_command import build_init_prompt_for_cwd
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
     from tools.terminal_tool import get_session_cwd
 
     skey = session.get("session_key") if session else None
+    if uses_managed_executor():
+        try:
+            prompt = build_init_prompt_for_cwd(extra=arg, cwd=session.get("cwd") if session else None, session_key=skey)
+        except SshWorkspaceFsError as exc:
+            return _err(rid, 4004, str(exc))
+        return _ok(rid, {"type": "send", "message": prompt})
     cwd = None
     with contextlib.suppress(Exception):  # no record → the builder's ladder decides
         cwd = get_session_cwd(skey) if skey else None
@@ -1124,14 +1131,16 @@ def _(rid, params: dict) -> dict:
 
 @_rpc("rollback.list", live_session=True, fail_code=5020)
 def _(rid, params: dict, session) -> dict:
-    def go(mgr, cwd):
+    def go(mgr, cwd, refusal):
         if not mgr.enabled:
             return _ok(rid, {"enabled": False, "checkpoints": []})
+        if refusal:
+            return _err(rid, 5020, refusal)
         # The TUI renders ``message``; the manager calls it ``reason``.
         rows = [{"hash": c.get("hash", ""), "timestamp": c.get("timestamp", ""), "message": c.get("reason", "")}
                 for c in mgr.list_checkpoints(cwd)]
         return _ok(rid, {"enabled": True, "checkpoints": rows})
-    return _with_checkpoints(session, go)
+    return _with_checkpoints(session, go, allow_host_listing=True)
 
 
 @_rpc("rollback.restore", live_session=True, fail_code=5021)
@@ -1147,9 +1156,9 @@ def _(rid, params: dict, session) -> dict:
     if not file_path and session.get("running"):
         return _err(rid, 4009, busy_message("rollback restore", bool(session.get("_manual_compress_active"))))
 
-    def go(mgr, cwd):
-        if reason := _container_checkpoint_refusal(session, mgr, cwd):
-            return {"success": False, "error": reason}
+    def go(mgr, cwd, refusal):
+        if refusal:
+            return {"success": False, "error": refusal}
         # A whole-tree restore keeps the user's hand-edits unless ``all`` (main's --all), as on the owner.
         commit = _resolve_checkpoint_hash(mgr, cwd, target)
         taken = _tools_mod("agent.checkpoints.undo_hint").checkpoint_taken_at(cwd, commit)
@@ -1180,10 +1189,9 @@ def _(rid, params: dict, session) -> dict:
     if not (target := params.get("hash", "")):
         return _err(rid, 4014, "hash required")
 
-    def go(mgr, cwd):
-        # Host tree vs host checkpoint is not this session's diff either (same refusal as /rollback diff).
-        if reason := _container_checkpoint_refusal(session, mgr, cwd):
-            return _err(rid, 5022, reason)
+    def go(mgr, cwd, refusal):
+        if refusal:
+            return _err(rid, 5022, refusal)
         r = mgr.diff(cwd, _resolve_checkpoint_hash(mgr, cwd, target))
         raw = r.get("diff", "")[:4000]
         payload = {"stat": r.get("stat", ""), "diff": raw}
@@ -1191,22 +1199,6 @@ def _(rid, params: dict, session) -> dict:
             payload["rendered"] = rendered
         return _ok(rid, payload)
     return _with_checkpoints(session, go)
-
-
-def _container_checkpoint_refusal(session, mgr, cwd) -> str | None:
-    """Why host checkpoints are off limits for a container-backed session, else ``None``.
-
-    Classifies with the identity and scopes a turn binds (prompt_turn.py): the session key is the
-    tool-call task id, the session context drives the terminal registry lookup, and the profile
-    scope supplies the terminal policy; otherwise a cached launch-profile environment or the launch
-    config would answer for another profile's session."""
-    task_id = session.get("session_key") or "default"
-    tokens = _set_session_context(task_id, cwd=cwd)
-    try:
-        with _session_profile_runtime_scope(session):
-            return mgr.unsupported_backend_reason(task_id)
-    finally:
-        _clear_session_context(tokens)
 
 
 @method("browser.manage")

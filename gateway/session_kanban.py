@@ -85,6 +85,10 @@ def kanban_launch_policy(task, cwd, config, private=None):
 async def run_task(connection, params):
     if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
         raise AuthorityRefusal('permission_denied')
+    from hermes_cli.kanban_db_workspace import _managed_workspace_unavailable
+
+    if await asyncio.to_thread(_managed_workspace_unavailable):
+        raise AuthorityRefusal('workspace_unavailable', detail='Kanban workers are unavailable for SSH executor workspaces.')
     from gateway.run import _load_gateway_config
     from gateway.session_local import create_local_session
     from gateway.session_contract import Submission
@@ -173,6 +177,9 @@ def bind_worker_context(frame):
         return
     if frame['policy']['source'] != 'kanban':
         raise ValueError('invalid_kanban_policy')
+    from hermes_cli.kanban_db_workspace import _require_local_workspace
+
+    _require_local_workspace()
     env = {'HERMES_KANBAN_TASK': context['task_id'], 'HERMES_KANBAN_BOARD': context['board'],
         'HERMES_KANBAN_DB': context['db'], 'HERMES_KANBAN_RUN_ID': str(context['run_id']),
         'HERMES_KANBAN_CLAIM_LOCK': context['claim_lock'], 'HERMES_KANBAN_WORKSPACE': context['workspace'],

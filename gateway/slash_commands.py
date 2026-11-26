@@ -12,6 +12,7 @@ import inspect
 import logging
 import os
 import re
+import json
 import shlex
 import sys
 import time
@@ -749,16 +750,14 @@ class GatewaySlashCommandsMixin(
         mgr = self._checkpoint_manager(event.source)
         if mgr is None:
             return t("gateway.rollback.not_enabled")
-        cwd = self._terminal_cwd()
         # --all / --force: classic full restore, overwriting user edits too.
         tokens = event.get_command_args().strip().split()
         restore_all = any(tok.lower() in ("--all", "--force") for tok in tokens)
         arg = " ".join(tok for tok in tokens if tok.lower() not in ("--all", "--force"))
-        # Container-backed session: host checkpoints belong to another tree, so a restore is
-        # refused; the bare listing stays visible, prefixed with the reason (same as the CLI).
         reason = mgr.unsupported_backend_reason()
-        if reason and arg:
+        if reason and (arg or mgr.unsupported_backend_reason(allow_host_listing=True)):
             return reason
+        cwd = self._terminal_cwd()
         checkpoints = mgr.list_checkpoints(cwd)
         if not arg:
             listing = format_checkpoint_list(checkpoints, cwd)
@@ -786,12 +785,21 @@ class GatewaySlashCommandsMixin(
     async def _handle_diff_command(self, event: MessageEvent) -> str:
         """Handle /diff — show git changes in the working directory.  Diff body is truncated hard
         here (chat is not a pager); platform senders clamp further."""
-        args = [a.lower() for a in event.get_command_args().strip().split()]
-        stat_only = bool({"--stat", "stat"} & set(args))
+        try:
+            args = shlex.split(event.get_command_args())
+        except ValueError as exc:
+            return t("gateway.diff.failed", error=str(exc))
+        stat_only = False
         mode = "working"
-        for low in args:
-            mode = _DIFF_MODE_BY_ARG.get(low, mode)
-        cwd = self._terminal_cwd()
+        paths = []
+        for arg in args:
+            low = arg.lower()
+            if low in ("--stat", "stat"):
+                stat_only = True
+            elif low in _DIFF_MODE_BY_ARG or low == "working":
+                mode = _DIFF_MODE_BY_ARG.get(low, "working")
+            else:
+                paths.append(arg)
         if mode == "session":
             # Cumulative checkpoint-baseline diff.
             mgr = self._checkpoint_manager(event.source)
@@ -799,10 +807,19 @@ class GatewaySlashCommandsMixin(
                 return t("gateway.diff.not_enabled")
             if reason := mgr.unsupported_backend_reason():  # host baseline is not this session's tree
                 return reason
-            result = await asyncio.to_thread(mgr.session_diff, cwd)
+            result = await asyncio.to_thread(mgr.session_diff, self._terminal_cwd())
         else:
-            from tools.working_diff import collect_working_diff
-            result = await asyncio.to_thread(collect_working_diff, cwd, mode)
+            from hermes_cli.main_resume_args import uses_managed_executor
+            if uses_managed_executor():
+                from gateway.session_policy import policy_for_source
+                from tools.working_diff import collect_executor_working_diff
+                policy = policy_for_source(self, event.source)
+                terminal = json.loads(policy.terminal_json) if policy is not None else None
+                result = await asyncio.to_thread(collect_executor_working_diff, None, mode, paths or None,
+                                                 terminal_policy=terminal)
+            else:
+                from tools.working_diff import collect_working_diff
+                result = await asyncio.to_thread(collect_working_diff, self._terminal_cwd(), mode)
         if not result.get("success"):
             return t("gateway.diff.failed", error=result.get("error") or t("gateway.diff.err_default"))
         return self._render_diff_result(result, stat_only)

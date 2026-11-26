@@ -16,6 +16,7 @@ export interface SidebarSessionGroup {
   label: string
   path: null | string
   sessions: SessionInfo[]
+  workspace_available?: boolean
   // Profile color for the ALL-profiles view; absent for workspace groups.
   color?: null | string
   // True when this group is a repo's main checkout (vs a linked worktree).
@@ -47,6 +48,7 @@ export interface SidebarWorkspaceTree {
   label: string
   path: null | string
   groups: SidebarSessionGroup[]
+  workspace_available?: boolean
   sessionCount: number
 }
 
@@ -58,6 +60,7 @@ export interface SidebarProjectTree {
   color?: null | string
   icon?: null | string
   archived?: boolean
+  workspace_available?: boolean
   // A git repo root promoted automatically (not a user-created projects.db row).
   // Deletable = dismissable.
   isAuto?: boolean

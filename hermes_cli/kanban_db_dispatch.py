@@ -1993,14 +1993,11 @@ def dispatch_once(
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
-    """Run one dispatcher tick under the board's single-writer lock.
+    """Run one tick per board. A competing tick returns ``skipped_locked=True``."""
+    from hermes_cli.kanban_db_workspace import _require_local_workspace
 
-    Wraps :func:`_dispatch_once_locked` in the non-blocking :func:`_dispatch_tick_lock`
-    so two dispatchers on one ``kanban.db`` never race a write tick on WAL
-    frames. The loser returns an empty ``DispatchResult`` with
-    ``skipped_locked=True`` and writes nothing; the lock is keyed on the
-    resolved DB path so unrelated boards tick in parallel.
-    """
+    _require_local_workspace()
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,

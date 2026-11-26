@@ -994,6 +994,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     """Return False when the persisted runtime-identity lines are stale."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        # A saved prompt may describe the old checkout after a share is remapped.
+        return False
     # Model/provider identity, then cwd drift.  A cwd change is a real content change (context
     # files, the workspace snapshot and the coding posture are all resolved from it), so it
     # still rebuilds; the runtime surface does not (agent/surface_switch.py).

@@ -579,8 +579,8 @@ def _validate_child_output_schema(
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
-        from tools.delegate_tool_routes import child_profile_scope
-        with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+        from tools.delegate_tool_workspace import child_turn_scope
+        with child_turn_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
             _retry_result = child.run_conversation(
                 user_message=append_output_contract(build_retry_message(_schema_errors), _output_schema),
                 task_id=child_task_id,
@@ -757,7 +757,7 @@ def _is_image_url(ref: str) -> bool:
     return ref.startswith(("http://", "https://", "data:image/"))
 
 
-def _build_child_goal_message(goal: str, images: list[str], child) -> Any:
+def _build_child_goal_message(goal: str, images: list[str], child, *, session_id="") -> Any:
     """The child's first user message when a task forwards ``images``.
 
     Routing reuses the inbound-image policy (``agent.image_routing``, honouring ``agent.image_input_mode``): a
@@ -780,6 +780,10 @@ def _build_child_goal_message(goal: str, images: list[str], child) -> Any:
             str(getattr(child, "provider", "") or ""), str(getattr(child, "model", "") or ""), cfg,
             requested_provider=str(getattr(child, "requested_provider", "") or ""),
         )
+        from tools.delegate_tool_workspace import ChildProject, managed_child_images
+        if isinstance(getattr(child, "_delegate_executor_project", None), ChildProject):
+            return managed_child_images(goal, paths, urls, data_urls, native=mode == "native",
+                                        session_id=session_id)
         if mode == "native":
             parts, skipped = build_native_content_parts(goal, paths, urls)
             if skipped:
@@ -889,28 +893,36 @@ class _ChildRun:
         # The parent's record is read in the parent's scope; the child's is written in the child's (cwd records
         # are keyed by the active profile, and a profile-routed child looks its own up as that profile).
         from tools.delegate_tool_routes import child_profile_scope
-        # action='continue': the child picks up where it stopped (its last cwd, its own worktree), not the parent's.
-        resumed = getattr(self.child, "_delegate_continue_workspace", None)
-        resumed = resumed if isinstance(resumed, dict) else None
-        with _quiet("Child cwd seed failed: %s"):
-            from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
-            parent_cwd = get_session_cwd(self.parent_task_id)
-            with child_profile_scope(self.child):
-                record_session_cwd(self.child_task_id, resumed["cwd"] if resumed else parent_cwd)
-            register_container_alias(self.child_task_id, self.parent_task_id)
+        from tools.delegate_tool_workspace import ChildProject, child_turn_scope
+        from tools.terminal_tool import get_session_cwd, record_session_cwd, register_container_alias
 
-        if resumed is not None:
-            self.worktree_info = resumed.get("worktree")
+        project = getattr(self.child, "_delegate_executor_project", None)
+        if isinstance(project, ChildProject):
+            with child_turn_scope(self.child):
+                record_session_cwd(self.child_task_id, project.cwd)
+            register_container_alias(self.child_task_id, self.parent_task_id)
         else:
-            self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
-        if self.worktree_info is not None and resumed is None:
-            with _quiet("worktree cwd seed failed: %s"), child_profile_scope(self.child):
-                from tools.terminal_tool import record_session_cwd as _rsc
-                _rsc(self.child_task_id, self.worktree_info["path"])
-            # The child's context is already built; carry the isolation contract on
-            # the goal message instead (same turn, no system-prompt mutation).
-            from tools.subagent_worktree import build_worktree_context_note
-            self.goal = self.goal + build_worktree_context_note(self.worktree_info)
+            # action='continue': the child picks up where it stopped (its last cwd, its own worktree), not the parent's.
+            resumed = getattr(self.child, "_delegate_continue_workspace", None)
+            resumed = resumed if isinstance(resumed, dict) else None
+            with _quiet("Child cwd seed failed: %s"):
+                parent_cwd = get_session_cwd(self.parent_task_id)
+                with child_profile_scope(self.child):
+                    record_session_cwd(self.child_task_id, resumed["cwd"] if resumed else parent_cwd)
+                register_container_alias(self.child_task_id, self.parent_task_id)
+
+            if resumed is not None:
+                self.worktree_info = resumed.get("worktree")
+            else:
+                self.worktree_info = _create_isolated_worktree(self.parent_agent, self.parent_task_id, self.subagent_id)
+            if self.worktree_info is not None and resumed is None:
+                with _quiet("worktree cwd seed failed: %s"), child_profile_scope(self.child):
+                    from tools.terminal_tool import record_session_cwd as _rsc
+                    _rsc(self.child_task_id, self.worktree_info["path"])
+                # The child's context is already built; carry the isolation contract on
+                # the goal message instead (same turn, no system-prompt mutation).
+                from tools.subagent_worktree import build_worktree_context_note
+                self.goal = self.goal + build_worktree_context_note(self.worktree_info)
         self.wall_start = time.time()
         self.parent_reads_snapshot = list(file_state.known_reads(self.parent_task_id)) if self.parent_task_id else []
         with _quiet("Durable subagent record failed: %s"):
@@ -1006,14 +1018,16 @@ class _ChildRun:
         from tools.delegate_tool_progress import child_task_message
         _brief = child_task_message(self.goal, getattr(child, "_delegate_context", None))
         task_text = self.goal if resume else _brief
-        user_message: Any = _build_child_goal_message(task_text, _images, child) if _images else task_text
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            from tools.delegate_tool_routes import child_profile_scope
+            from tools.delegate_tool_workspace import child_turn_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
-            with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with child_turn_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                user_message = (_build_child_goal_message(
+                    task_text, _images, child, session_id=getattr(self.parent_agent, "session_id", ""))
+                    if _images else task_text)
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,
                 )

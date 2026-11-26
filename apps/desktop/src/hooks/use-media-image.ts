@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { useComposerScope } from '@/app/chat/composer/scope'
 import {
   gatewayImageProxyDataUrl,
@@ -30,6 +31,10 @@ export function useMediaImage(
   { preservePendingFrame = false }: { preservePendingFrame?: boolean } = {}
 ) {
   const connection = useStore($connection)
+  const view = useSessionView()
+  const storedId = useStore(view.$storedId)
+  const runtimeId = useStore(view.$runtimeId)
+  const sessionId = storedId || runtimeId || undefined
   const scope = useComposerScope()
   const connectionId = scope.connectionId || connection?.connectionId
   const profile = scope.profile ?? connection?.profile
@@ -39,7 +44,7 @@ export function useMediaImage(
     [scope.connectionId, scope.profile, connectionId, profile]
   )
 
-  const key = mediaImageKey(path, connection, owner)
+  const key = mediaImageKey(path, connection, owner, sessionId)
   const ownerKey = mediaImageKey('', connection, owner)
 
   const initialState = () => {
@@ -111,7 +116,7 @@ export function useMediaImage(
     let cancelled = false
 
     if (path && !isInlineMediaSrc(path)) {
-      void resolveMediaDisplaySrc(path, owner).then(
+      void resolveMediaDisplaySrc(path, owner, sessionId).then(
         src => {
           if (!cancelled) {
             if (!src) {
@@ -133,7 +138,7 @@ export function useMediaImage(
     return () => {
       cancelled = true
     }
-  }, [key, path, owner])
+  }, [key, path, owner, sessionId])
 
   const onLoad = (image: HTMLImageElement) => {
     rememberMediaImageDimensions(key, image.naturalWidth, image.naturalHeight)

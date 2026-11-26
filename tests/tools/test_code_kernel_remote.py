@@ -80,11 +80,11 @@ def _cell(status="ok", stdout="", execution_count=1, **kw):
 
 
 def _run(env, code="print(1)", *, task="t1", reset=False, timeout=10,
-         tools=frozenset({"read_file"})):
+         tools=frozenset({"read_file"}), project_cwd=None):
     return execute_in_remote_kernel(
         code, env=env, env_type="ssh", task_env_id=task,
         sandbox_tools=tools, timeout=timeout,
-        max_tool_calls=5, reset=reset,
+        max_tool_calls=5, reset=reset, project_cwd=project_cwd,
     )
 
 
@@ -334,6 +334,23 @@ class TestDispatchIntegration(unittest.TestCase):
         self.assertIn("kernel says hi", result["output"])
         self.assertEqual(result["kernel"]["execution_count"], 3)
 
+    def test_connection_loss_during_submission_does_not_replay_cell(self):
+        from tools.code_execution_tool import _execute_remote
+
+        env = ScriptedEnv([
+            ("command -v python3", lambda c: {"output": "OK\n", "returncode": 0}),
+        ])
+        with (
+            patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")),
+            patch("tools.code_kernel_remote.execute_in_remote_kernel",
+                  side_effect=ConnectionError("SSH disconnected while publishing the request")),
+            patch("tools.code_execution_tool._run_remote_per_call") as per_call,
+        ):
+            result = json.loads(_execute_remote("print()", "t", ["read_file"]))
+
+        self.assertEqual(result["status"], "error")
+        per_call.assert_not_called()
+
     def test_execute_remote_falls_open_to_per_call(self):
         from tools.code_execution_tool import _execute_remote
         from unittest.mock import MagicMock
@@ -452,6 +469,54 @@ class TestRemotePerCallSpillE2E(RemoteKernelBase):
         self.assertNotIn("\x1b[", body)
         self.assertEqual(os.stat(spill).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(os.path.dirname(spill)).st_mode & 0o777, 0o700)
+
+
+@pytest.mark.platforms("posix")
+def test_project_kernel_and_per_call_start_in_selected_directory(tmp_path):
+    from tools.environments.local import LocalEnvironment
+    from tools.code_execution_tool import _run_remote_per_call
+
+    first = tmp_path / "first ' project $`"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "marker").write_text("first")
+    (second / "marker").write_text("second")
+    env = LocalEnvironment(cwd="/", timeout=60)
+    source = (
+        "from pathlib import Path\n"
+        "state = globals().get('state', 0) + 1\n"
+        "Path('created').write_text(str(state))\n"
+        "print(Path('marker').read_text(), state)\n"
+    )
+    try:
+        for cwd, task, expected in (
+            (first, "one", "first 1"),
+            (first, "one", "first 2"),
+            (first, "two", "first 1"),
+            (second, "one", "second 1"),
+            (first, "one", "first 1"),
+        ):
+            result = _run(env, source, task=task, project_cwd=str(cwd))
+            assert result["status"] == "success", result
+            assert result["stdout"].strip() == expected
+        assert (first / "created").read_text() == (second / "created").read_text() == "1"
+
+        def per_call(code, cwd):
+            return json.loads(_run_remote_per_call(
+                env, "ssh", code, "one", frozenset(), timeout=10, max_tool_calls=5,
+                exec_start=time.monotonic(), project_cwd=cwd,
+            ))
+
+        result = per_call(source, str(second))
+        assert result["status"] == "success", result
+        assert result["output"].strip() == "second 1"
+        result = per_call("import os; print(os.getcwd())", None)
+        assert result["status"] == "success", result
+        assert "/hermes_exec_" in result["output"]
+    finally:
+        shutdown_all_remote_kernels()
+        env.cleanup()
 
 
 if __name__ == "__main__":

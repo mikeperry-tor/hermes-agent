@@ -16,7 +16,7 @@ from persistence.authority.vocabulary import LEGACY_LOCAL_SOURCES
 from persistence.core.errors import AuthorityRefusal
 from persistence.core.identity import SessionId
 from session_rules.legacy_local import not_client_labels
-from session_rules.local_create import same_create_retry
+from session_rules.local_create import same_create_credentials, same_create_retry
 
 from ..gateway._local_lineage import hand_off_conversations, moved_receipts
 from ._runtime import _epoch, _json
@@ -45,10 +45,13 @@ def commit_local_session(holder, *, epoch, receipt, client_request, created_sour
                 same = all(saved[k] == receipt[k] for k in (
                     'profile_id', 'principal_id', 'request_id', 'session_id', 'route'))
                 same = same and same_create_retry(saved['policy'], receipt['policy']['request_json'], request)
+                credentials = same and same_create_credentials(saved['policy'], receipt['policy'])
             except (ValueError, TypeError, KeyError) as exc:
                 raise AuthorityRefusal('storage_unavailable') from exc
             if not same:
                 raise AuthorityRefusal('invalid_params')
+            if not credentials:
+                raise AuthorityRefusal('admission_conflict')
             return saved, False
         from ..conversation._store.retirement import RETIRED_PREFIX
         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + sid,)).fetchone():
@@ -92,9 +95,12 @@ def _row_cwd(policy):
     else the execution cwd. Row metadata only (workspace grouping, ``-c``, cwd restore); the
     frozen policy's ``cwd`` / ``TERMINAL_CWD`` stay where the session's tools run."""
     try:
+        terminal = json.loads(policy.get('terminal_json') or '{}')
         request = json.loads(policy.get('request_json') or '{}')
     except (TypeError, ValueError):
-        request = {}
+        return policy['cwd']
+    if isinstance(terminal, dict) and terminal.get('TERMINAL_SSH_PROJECT_SELECTED') in ('0', '1'):
+        return policy['cwd']
     value = request.get('row_cwd') if isinstance(request, dict) else None
     return policy['cwd'] if not isinstance(value, str) else (value or None)
 

@@ -1660,14 +1660,13 @@ def _activate_job_record(job: dict[str, Any]) -> None:
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
-    """Workdir -> absolute path, or None when empty. ``~`` expands; relative paths are rejected
-    (cron runs detached from any cwd); must be an existing dir now but is deliberately NOT
-    re-checked at run time (scheduler falls back with a warning). ValueError when invalid."""
-    if workdir is None:
-        return None
-    raw = str(workdir).strip()
+    """Resolve an explicit workdir on the backend that owns the job."""
+    from cron.executor_workspace import executor_workdir
+    raw = str(workdir or "").strip()
     if not raw:
         return None
+    if project := executor_workdir(raw):
+        return project[0]
     expanded = Path(raw).expanduser()
     if not expanded.is_absolute():
         raise ValueError(
@@ -1736,7 +1735,6 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
     "enabled_toolsets": _normalize_enabled_toolsets,
-    "workdir": lambda v: None if v in {None, "", False} else _normalize_workdir(v),
     "monitor_script": _normalize_job_optional_text,
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
@@ -1845,8 +1843,8 @@ def create_job(
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
     # Reject gateway-lifecycle commands (respawn loops) here, not just in the CLI: covers the tool.
-    from cron.lifecycle_guard import check_gateway_lifecycle
-    check_gateway_lifecycle(prompt_text, f["script"])
+    from cron.lifecycle_guard import check_job_gateway_lifecycle
+    check_job_gateway_lifecycle(prompt_text, f["script"], f["monitor_script"], workdir=f["workdir"])
 
     label_source = (
         prompt_text
@@ -2089,6 +2087,18 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
     bad_fields = _IMMUTABLE_JOB_FIELDS.intersection(updates or {})
     if bad_fields:
         raise ValueError(f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}")
+    if "workdir" in updates:
+        if get_job(job_id) is None:
+            return None
+        updates = {**updates, "workdir": _normalize_workdir(updates["workdir"])}
+
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if {"script", "monitor_script", "workdir", "prompt"}.intersection(updates) and uses_managed_executor():
+        if current := get_job(job_id):
+            from cron.lifecycle_guard import check_job_gateway_lifecycle
+            merged = {**current, **updates}
+            check_job_gateway_lifecycle(merged.get("prompt"), merged.get("script"), merged.get("monitor_script"),
+                                        workdir=merged.get("workdir"))
 
     def apply(jobs, i, job):
         _rederive_repeat_for_schedule_change(job, updates)

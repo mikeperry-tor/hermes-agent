@@ -1558,8 +1558,7 @@ export function PreviewPane({
               onClose={onClose}
               onSelectRendered={canRenderHtmlFile ? () => selectRenderMode('preview') : undefined}
               reloadKey={localReloadKey}
-              sessionId={sessionId}
-              target={target}
+              {...{ sessionId, tabId, target }}
             />
           )}
           {isBlankPage && (

@@ -96,7 +96,8 @@ async def test_at_reference_reaches_preprocessor_with_real_context_length(
 
     captured: dict = {}
 
-    async def _fake_preprocess(message, *, cwd, context_length, url_fetcher=None, allowed_root=None):
+    async def _fake_preprocess(message, *, cwd, context_length, url_fetcher=None, allowed_root=None,
+                               terminal_policy=None):
         captured["message"] = message
         captured["cwd"] = cwd
         captured["context_length"] = context_length
