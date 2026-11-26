@@ -1695,13 +1695,13 @@ _HERMES_HOME_PREFIXES = ("$HERMES_HOME/", "${HERMES_HOME}/")
 _HOME_PREFIXES = ("$HOME/", "${HOME}/")
 
 
-def _is_secret_file_arg(arg: str) -> bool:
+def _is_secret_file_arg(arg: str, *, ssh_path: bool = False) -> bool:
     """``.env``-style, shell rc or credential-store basename (``.netrc``, ``.pgpass``, ...)
     anywhere; ``credentials`` / ``config`` only under ``.aws`` (the bare names are too generic), and
     ``config.yaml`` only under a ``.hermes`` directory, ``$HERMES_HOME``, or the resolved
     Hermes home (never arbitrary YAML). The resolved-home arm is what covers native Windows,
     where the home directory is ``%LOCALAPPDATA%\\hermes`` and carries no ``.hermes`` segment."""
-    path = arg.strip("\"'").replace("\\", "/")
+    path = arg if ssh_path else arg.strip("\"'").replace("\\", "/")
     hermes_home = False
     for prefix in _HERMES_HOME_PREFIXES:
         if path.startswith(prefix):
@@ -1712,7 +1712,7 @@ def _is_secret_file_arg(arg: str) -> bool:
         if path.startswith(prefix):
             path = path[len(prefix):]
             break
-    if "$" in path:
+    if "$" in path and not ssh_path:
         return False
     parts = [part.lower() for part in path.split("/") if part]
     if not parts:
@@ -1725,7 +1725,7 @@ def _is_secret_file_arg(arg: str) -> bool:
     # writes under ``backups/config/`` — same contents, same secrets.
     if parts[-1] != "config.yaml" and not parts[-1].startswith(("config.yaml.good.", "config.yaml.corrupt.")):
         return False
-    return hermes_home or ".hermes" in parts[:-1] or _is_under_hermes_home(path)
+    return hermes_home or ".hermes" in parts[:-1] or (not ssh_path and _is_under_hermes_home(path))
 
 
 def _command_reads_secret_file(command: str | None) -> bool:

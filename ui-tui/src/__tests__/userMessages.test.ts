@@ -136,6 +136,15 @@ describe('describeRpcError', () => {
     expect(describeRpcError(new JsonRpcGatewayError('hash required', { code: 4014 }))).toBe('hash required')
   })
 
+  it('shows why a workspace cannot use filesystem checkpoints', () => {
+    const detail = 'Filesystem checkpoints and rollback are unavailable for terminal.backend=ssh.'
+    const error = new JsonRpcGatewayError('unsupported_terminal_backend', {
+      code: 4001, data: { detail, field: 'checkpoint' }
+    })
+
+    expect(describeRpcError(error)).toBe(detail)
+  })
+
   it('does not treat every 4001 as a stale session: the backend reuses the code for other refusals', () => {
     for (const raw of ['no active session to retry', 'slug and api_key are required', 'session ownership changed']) {
       expect(describeRpcError(new JsonRpcGatewayError(raw, { code: 4001 }))).toBe(raw)

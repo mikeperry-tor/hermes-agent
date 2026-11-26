@@ -562,6 +562,10 @@ TERMINAL_SSH_USER=ubuntu
 
 **How it works:** Connects at init time with `BatchMode=yes` and `StrictHostKeyChecking=accept-new`, then captures the remote login shell's environment once into a snapshot file. Every command runs as a fresh `bash -c` that sources that snapshot, `cd`s to the tracked working directory, and runs your command.
 
+`read_file` uses Python 3 on the POSIX SSH target to resolve paths, check
+protected files, and read the inspected file. If the file tool cannot inspect
+a path, verify that `python3` is on the SSH user's `PATH` and can access it.
+
 **Skill / config env passthrough:** variables a skill declares in `required_environment_variables`, or that you list under `terminal.env_passthrough`, are forwarded with OpenSSH `SendEnv` — the names go on the `ssh` command line and the values travel in the client's environment, never in the remote command text. The remote `sshd` must accept them; add to `/etc/ssh/sshd_config` on the server and reload sshd:
 
 ```
@@ -1478,7 +1482,7 @@ agent:
   coding_instructions: ""      # Standing project-wide coding rules appended to the coding brief
 ```
 
-`verify_on_stop` accepts `true` (on everywhere), `false` (off — the default), or `"auto"` (legacy surface-aware behavior: on for interactive coding surfaces — CLI, TUI, desktop — and programmatic callers; off for messaging surfaces like Telegram/Discord where the verification narrative reads as chat noise). Off is the default everywhere: fresh installs ship `false` and the config migration turned it off on existing installs, so enabling it is an explicit opt-in. The `HERMES_VERIFY_ON_STOP` env var overrides the config value when set.
+`verify_on_stop` accepts `true` (on for supported sessions), `false` (off by default), or `"auto"` (on for interactive coding surfaces and programmatic callers, and off for messaging surfaces such as Telegram and Discord). The `HERMES_VERIFY_ON_STOP` env var overrides the config value. SSH sessions skip this guard because it reads project facts from the local filesystem.
 
 The evidence that feeds this guard (which test/lint/build commands ran, which files were edited since) lives in `~/.hermes/verification_evidence.db`. That ledger is only written or created while the guard is enabled; with `verify_on_stop: false` nothing is recorded and an existing file can be deleted freely.
 

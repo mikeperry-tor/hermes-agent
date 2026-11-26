@@ -38,8 +38,10 @@ def _verify_on_stop_nudge(agent) -> Optional[str]:
         from agent.verification_stop import (
             build_verify_on_stop_nudge, verify_on_stop_enabled
         )
+        from tools.file_tools_paths import uses_ssh_for_task
 
-        if verify_on_stop_enabled():
+        task_id = getattr(agent, "_current_task_id", None) or getattr(agent, "session_id", None) or "default"
+        if verify_on_stop_enabled() and not uses_ssh_for_task(task_id):
             return build_verify_on_stop_nudge(
                 session_id=getattr(agent, "session_id", None),
                 changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),

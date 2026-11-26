@@ -154,7 +154,8 @@ def test_rewind_fails_closed_when_new_turn_lands_after_id_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_undo_evicts_cached_agent_under_profile_namespaced_key():
+@pytest.mark.parametrize("scope_available", (True, False))
+async def test_undo_uses_the_routed_profile_for_checkpoint_hints(monkeypatch, tmp_path, scope_available):
     """/undo must evict under the key the cache is keyed by. On a multiplexed gateway that is
     ``agent:<profile>:…``; a bare ``build_session_key(source)`` yields ``agent:main:…``, the
     eviction misses and the next turn reuses an agent still holding the undone turns."""
@@ -162,6 +163,9 @@ async def test_undo_evicts_cached_agent_under_profile_namespaced_key():
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.run import GatewayRunner
     from gateway.session import build_session_key
+    from agent.checkpoints.manager import CheckpointManager
+    from contextlib import contextmanager
+    from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
 
     class _Entry:
         session_id = "sid"
@@ -172,7 +176,26 @@ async def test_undo_evicts_cached_agent_under_profile_namespaced_key():
             return _Entry()
 
         async def rewind_session(self, sid, n):
-            return {"target_text": "q3", "turns_undone": 1, "rewound_count": 2}
+            return {"target_text": "q3", "turns_undone": 1, "rewound_count": 2, "undo_since": 1700000000.0}
+
+    routed_home = tmp_path / "work"
+    scope_calls = []
+    cwd_calls = []
+
+    @contextmanager
+    def routed_scope(home, *, hydrate_secrets):
+        scope_calls.append((home, hydrate_secrets))
+        if not scope_available:
+            raise RuntimeError("test profile scope unavailable")
+        token = set_terminal_scope({"TERMINAL_ENV": "ssh"})
+        try:
+            yield
+        finally:
+            reset_terminal_scope(token)
+
+    def fail_lookup():
+        cwd_calls.append(True)
+        raise AssertionError("undo must skip the SSH workspace before inspecting cwd")
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="u1")
     source.profile = "work"
@@ -184,7 +207,15 @@ async def test_undo_evicts_cached_agent_under_profile_namespaced_key():
     runner._async_session_store._store = runner.session_store
     runner._evict_cached_agent = evicted.append
     runner._session_key_for_source = lambda s: build_session_key(s, profile=s.profile)
+    runner._profile_scope_key_for_source = lambda source: routed_home
+    monkeypatch.setattr("gateway.run._profile_runtime_scope", routed_scope)
+    runner._checkpoint_manager = lambda source: CheckpointManager(enabled=True)
+    runner._terminal_cwd = fail_lookup
+    monkeypatch.setenv("TERMINAL_ENV", "local")
 
-    await runner._handle_undo_command(MessageEvent(text="/undo", message_type=MessageType.TEXT, source=source))
+    reply = await runner._handle_undo_command(MessageEvent(text="/undo", message_type=MessageType.TEXT, source=source))
 
+    assert "q3" in reply
+    assert scope_calls == [(routed_home, False)]
+    assert not cwd_calls
     assert evicted == ["agent:work:telegram:dm:123"]

@@ -1,8 +1,10 @@
 """Tests for tools/file_operations.py — deny list, result dataclasses, helpers."""
 
 import base64
+import hashlib
 import os
 import pytest
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,6 +21,137 @@ from tools.file_operations import (
     normalize_read_pagination,
 )
 
+
+@pytest.mark.platforms("posix")
+def test_ssh_path_inspection_uses_backend_state(tmp_path, monkeypatch):
+    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+    directory = tmp_path / "project ${literal}"
+    directory.mkdir()
+    target = directory / "source-__HERMES_FENCE_LITERAL__.txt"
+    target.write_bytes(b"old bytes")
+    alias = tmp_path / "alias"
+    alias.symlink_to(target)
+
+    execute = ops._exec
+
+    def startup_output(command, **kwargs):
+        result = execute(f"export HOME={shlex.quote(str(tmp_path))}; {command}", **kwargs)
+        result.stdout = "SSH startup notice\n" + result.stdout + "\nConnection closed\n"
+        return result
+
+    monkeypatch.setattr(ops, "_exec", startup_output)
+    original = ops.inspect_ssh_path("~/alias")
+    assert original.path == str(target.resolve())
+    assert original.kind == "regular"
+    read = ops.read_inspected_ssh_file(original, 1, 10)
+    assert read.content == "1|old bytes"
+    assert read._snapshot[-1] == hashlib.sha256(b"old bytes").digest()
+    raw = ops.read_inspected_ssh_bytes(original, 100)
+    assert base64.b64decode(raw.base64_content) == b"old bytes"
+
+    target.write_bytes(b"new bytes")
+    os.utime(target, ns=(target.stat().st_atime_ns, original.metadata[3]))
+    assert ops.read_inspected_ssh_file(original, 1, 10).error
+    changed = ops.read_inspected_ssh_file(ops.inspect_ssh_path(str(alias)), 1, 10)
+    assert changed._snapshot[-1] == hashlib.sha256(b"new bytes").digest()
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_path_inspection_distinguishes_absence_from_failed_resolution(tmp_path):
+    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+    missing = tmp_path / "new" / "file"
+    assert ops.inspect_ssh_path(str(missing)).kind == "absent"
+    dangling = tmp_path / "dangling"
+    dangling.symlink_to(missing)
+    with pytest.raises(ValueError, match="Could not inspect SSH file state"):
+        ops.inspect_ssh_path(str(dangling))
+    pipe = tmp_path / "pipe"
+    os.mkfifo(pipe)
+    assert ops.inspect_ssh_path(str(pipe)).kind == "special"
+    with pytest.raises(ValueError, match="Could not inspect SSH file state"):
+        ops.inspect_ssh_path(str(pipe / "invalid"))
+    regular = tmp_path / "regular"
+    regular.touch()
+    for suffix in ("/", "/."):
+        with pytest.raises(ValueError, match="Could not inspect SSH file state"):
+            ops.inspect_ssh_path(f"{regular}{suffix}")
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_read_formats_text_without_blessing_hidden_bytes(tmp_path, monkeypatch):
+    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+    target = tmp_path / "transcoded-\U0001f680.txt"
+    target.write_bytes("first line\n".encode("utf-16"))
+    execute = ops._exec
+
+    def startup_output(command, **kwargs):
+        result = execute(command, **kwargs)
+        result.stdout = 'HERMES_UTF16:OK\n{"content":"startup text","total_lines":1}\n' + result.stdout
+        return result
+
+    monkeypatch.setattr(ops, "_exec", startup_output)
+
+    text = ops.read_inspected_ssh_file(ops.inspect_ssh_path(str(target)), 1, 10)
+
+    assert "1|first line" in text.content
+    assert text._snapshot is None
+
+    target.write_bytes(b"visible\n__HERMES_FENCE_ABC__\n")
+    text = ops.read_inspected_ssh_file(ops.inspect_ssh_path(str(target)), 1, 10)
+
+    assert "1|visible" in text.content
+    assert text._snapshot is None
+
+
+@pytest.mark.platforms("linux")
+def test_ssh_read_size_mismatch_keeps_visible_content_without_baseline(tmp_path):
+    path = "/proc/version"
+    if not Path(path).is_file() or Path(path).stat().st_size:
+        pytest.skip("a readable pseudo-file with zero reported size is required")
+    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+
+    text = ops.read_inspected_ssh_file(ops.inspect_ssh_path(path), 1, 10)
+
+    assert text.content.startswith("1|")
+    assert text.file_size > 0
+    assert text._snapshot is None
+
+
+@pytest.mark.platforms("posix")
+def test_ssh_read_protects_custom_and_suffixed_hermes_homes(tmp_path, monkeypatch):
+    ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+    custom = tmp_path / "custom home"
+    suffixed = tmp_path / ".hermes-fixture"
+    for home in (custom, suffixed):
+        home.mkdir()
+        (home / "auth.json").write_text("fixture credential")
+    alias = tmp_path / "alias"
+    alias.symlink_to(custom / "auth.json")
+    config = custom / "config.yaml"
+    config.write_text("secret: fixture\n")
+    config_alias = tmp_path / "settings"
+    config_alias.symlink_to(config)
+    execute = ops._exec
+
+    def remote_environment(command):
+        return execute(f"export HOME={shlex.quote(str(tmp_path))} "
+                       "HERMES_HOME='$HOME/custom home ' HERMES_DATA_DIR_SUFFIX=-fixture; " + command)
+
+    monkeypatch.setattr(ops, "_exec", remote_environment)
+    profiles = suffixed / "profiles"
+    profiles.mkdir()
+    profile = profiles / "named"
+    profile.mkdir()
+    profile_auth = profile / "auth.json"
+    profile_auth.write_text("profile fixture credential")
+    profiles.chmod(0o711)
+    try:
+        assert ops.inspect_ssh_path(str(config_alias), protect_read=True).secret_file
+        assert ops.inspect_ssh_path(str(profile_auth), protect_read=True).read_denied
+    finally:
+        profiles.chmod(0o700)
+    assert ops.inspect_ssh_path(str(alias), protect_read=True).read_denied
+    assert ops.inspect_ssh_path(str(suffixed / "auth.json"), protect_read=True).read_denied
 
 # =========================================================================
 # Write deny list

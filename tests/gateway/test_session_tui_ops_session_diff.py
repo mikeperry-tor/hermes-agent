@@ -76,6 +76,36 @@ def test_fit_frame_never_turns_a_cut_over_budget_line_into_a_fitting_one():
     assert _fit_frame('ab\ncdefgh', 5) == 'ab'
 
 
+@pytest.mark.platforms("linux")
+def test_ssh_session_refuses_checkpoint_commands_for_a_matching_host_checkout(tmp_path):
+    with owner(tmp_path, {'terminal': {'backend': 'ssh'}}) as (home, _peer, desc):
+        work = tmp_path / 'work'
+        work.mkdir()
+        note = work / 'a.txt'
+        note.write_text('original\n')
+        _checkpoint(home, work, 'host snapshot')
+        note.write_text('host edit\n')
+
+        async def probe():
+            async with websocket(home, desc) as ws:
+                session = await rpc(ws, 'session.create', request_id='ssh', source='tui', toolsets=[],
+                                    cwd=str(work), checkpoints=True)
+                sid = session['result']['session_id']
+                for method, params in [('rollback.list', {}), ('rollback.diff', {'hash': 'no-such-hash'})]:
+                    refused = await _git_rpc(ws, method, session_id=sid, **params)
+                    assert refused['error']['message'] == 'unsupported_terminal_backend', refused
+                    assert refused['error']['data']['field'] == 'checkpoint', refused
+                    assert 'terminal.backend=ssh' in refused['error']['data']['detail'], refused
+                result = (await _git_rpc(ws, 'rollback.session_diff', session_id=sid))['result']
+                assert result['enabled'] and not result['success'] and 'terminal.backend=ssh' in result['error']
+                for params in ({'all': True}, {'file_path': 'a.txt'}):
+                    result = (await _git_rpc(ws, 'rollback.restore', session_id=sid, hash='1', **params))['result']
+                    assert not result['success'] and 'terminal.backend=ssh' in result['error'], result
+                assert note.read_text() == 'host edit\n'
+
+        asyncio.run(probe())
+
+
 def test_fit_frame_cuts_only_at_a_newline():
     """A carriage return, form feed or U+2028 inside a diff line is not a line end: the cut never lands on one."""
     for sep in ('\r', '\x0c', '\u2028'):
