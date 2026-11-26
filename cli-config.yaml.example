@@ -478,6 +478,7 @@ terminal:
 #   ssh_user: "myuser"
 #   ssh_port: 22
 #   ssh_key: "~/.ssh/id_rsa"  # Optional - uses ssh-agent if not specified
+#   ssh_config: "/etc/hermes/executor-ssh.conf"  # Optional absolute path on the Hermes host
 
 # -----------------------------------------------------------------------------
 # OPTION 3: Docker container
@@ -638,12 +639,23 @@ browser:
   # executable_path: ""
   # user_data_dir: ""
   # chromium_args: ["--lang=de"]
+  # Require Chromium's OS sandbox and refuse --no-sandbox bypass flags.
+  # require_sandbox: false
+  # Python with browser-harness installed inside the terminal executor.
+  # executor_python: "python3"
+  # Persistent executor-side workspace root (empty = ~/.hermes/browser-use there).
+  # executor_workspace: ""
 
   # With a cloud provider (Browserbase, Browser Use, ...), LAN/localhost URLs
   # open in a local Chromium sidecar on this host instead. The sidecar ignores
   # security.allow_private_urls (like the plain local Chromium, it reaches what
   # the terminal reaches); set false to refuse private URLs instead.
   # auto_local_for_private_urls: true
+
+# Managed config.yaml only: require Bot Desktop, computer_use, and browser_exec
+# to run on the configured terminal executor (Docker or SSH).
+# bot_desktop:
+#   executor_only: true
 
 # =============================================================================
 # Context references

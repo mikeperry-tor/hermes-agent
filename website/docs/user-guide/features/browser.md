@@ -148,6 +148,7 @@ that device.
 browser:
   executable_path: ""     # Chromium binary to launch instead of the packaged one
   user_data_dir: ""       # persistent profile directory; "" = fresh profile per session
+  require_sandbox: false   # true: never launch Chromium with sandbox bypass flags
   chromium_args: []       # extra Chromium command-line flags, e.g. ["--lang=de-DE"]
   headed: false           # true = visible window
   command_timeout: 30     # Chromium launch timeout floor (seconds)
@@ -663,6 +664,80 @@ wait_for_load()
 print(js("[...document.querySelectorAll('article h2 a')].map(a => a.textContent.replace(/\\s+/g, ' ').trim())"))
 """)
 ```
+
+## Requiring Chromium sandboxing
+
+Set `browser.require_sandbox: true` to require Chromium's OS sandbox for both
+agent launches and the Bot Desktop Browser icon (including inside terminal
+sandboxes). When `false` (the default), existing host and container launch
+behavior is unchanged.
+
+When `browser.require_sandbox: true`:
+
+- Hermes omits `--no-sandbox` bypass flags, never retries with sandbox bypass,
+  and rejects conflicting flags in `browser.chromium_args`.
+- The environment must run Chromium as an unprivileged user with working OS
+  sandbox support (for example user namespaces in Linux containers); fix launch
+  failures in that environment before retrying.
+- Only new browser launches are affected — stop any already-running browser or
+  desktop before enabling it.
+- External CDP endpoints and cloud browser providers are outside this setting's
+  control.
+
+
+## Execution in terminal sandboxes
+
+When Chromium runs inside a Docker or SSH terminal sandbox, `browser_exec`
+prefers the executor's `browser-harness` over running Python on the gateway:
+
+- **Interpreter & workspace:** Set `browser.executor_python` (default `python3`)
+  to a Python environment with `browser-harness` installed inside the executor.
+  Each task gets a scratch directory under the desktop user's
+  `~/.hermes/browser-use`, or under `browser.executor_workspace` when set to an
+  absolute path inside the executor (close active browser sessions before
+  changing it).
+- **Fallback:** When `bot_desktop.executor_only` is not enabled and the sandbox
+  does not have `browser-harness` installed, `browser_exec` falls back to the
+  gateway's harness over the forwarded CDP connection. Connection failures
+  report an error instead of falling back. Local, real-profile, external CDP,
+  and cloud sessions keep their normal paths.
+- **Screenshots & sessions:** Print the path returned by `capture_screenshot()`
+  on its own line (spaces and workspace-relative paths work); Hermes fetches the
+  image from the executor. Named sessions run separate daemons and tabs while
+  sharing the desktop browser's cookies and downloads. Concurrent commands on
+  different endpoints for the same task are rejected until the active command
+  finishes.
+- **Lifecycle & human control:** Vault page reads and writes honor the
+  human-control lease (including named and hybrid sessions). Closing a session
+  closes its stream and asks its daemon to exit; Chromium stays up while any
+  session is using it, and dock-launched browsers keep their own lifecycle.
+  Hermes never automatically replays failed or interrupted actions.
+
+### Requiring executor-only placement
+
+In managed deployments (`/etc/hermes/config.yaml`), set
+`bot_desktop.executor_only: true` alongside a pinned Docker or SSH terminal
+backend to require all Bot Desktop, `computer_use`, `browser_exec`, vault page
+actions, and screen viewers to stay on the terminal executor:
+
+- **What is enforced:** Hermes ignores ambient CDP, cloud, real-profile, and
+  alternate-engine settings, and rejects `/browser connect`, explicit
+  real-profile requests, direct `browser_cdp`/`browser_dialog` calls, gateway
+  sign-in export, and gateway-side package installs. An unsupported terminal
+  backend, unreachable executor, or invalid managed config fails closed.
+  Website and URL safety checks still apply.
+- **Discovery & ownership:** Discovery probes the desktop and `browser-harness`
+  in the executor without starting the screen. Hermes records the container or
+  SSH target in `sandbox.json` before launching a detached screen; viewers,
+  thumbnails, CUA, and browser actions bind to that recorded owner. Stop the
+  desktop before changing terminal settings (or before upgrading from an older
+  version that does not record SSH target identity).
+- **Executor image setup:** Pre-install Chromium, desktop dependencies, and the
+  pinned `browser-harness` in the executor image. Point `browser.executor_python`
+  at that Python, set `browser.require_sandbox: true` to require Chromium's OS
+  sandbox, and set `browser.executor_workspace` if you mount a dedicated
+  workspace. Hermes sends its native runner script to that interpreter and never
+  installs packages into a running executor.
 
 ## Limitations
 

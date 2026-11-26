@@ -40,7 +40,7 @@ from hermes_cli.cli_session_switch import (
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL, discover_local_cdp_url, find_free_debug_port, is_browser_debug_ready,
     launch_chrome_debug, local_port_in_use, manual_chrome_debug_command)
-from hermes_cli.cli_browser_gateway import _normalize_cdp_url
+from hermes_cli.cli_browser_gateway import local_browser_cdp_url
 from hermes_cli.cli_commands_handoff import CLIHandoffMixin, _db_unavailable_line
 
 
@@ -281,7 +281,7 @@ def _launch_default_cdp_browser(port: int):
 def _browser_connect(cli, cdp_url: str) -> None:
     """/browser connect [url] — validate the CDP URL, find or launch a debug browser, then
     point the browser tools at it (BROWSER_CDP_URL) and tell the model."""
-    normalized = _normalize_cdp_url(cdp_url)
+    normalized = local_browser_cdp_url(cdp_url)
     if normalized is None:
         return
     cdp_url, port = normalized

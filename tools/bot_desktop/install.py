@@ -80,6 +80,17 @@ def release(key: str) -> None:
         fh.close()  # closing drops the flock
 
 
+def placement_refusal() -> Optional[str]:
+    from tools.bot_desktop import placement
+
+    where = placement.resolve()
+    if where.where == placement.REFUSED:
+        return where.reason
+    if where.where == placement.TERMINAL:
+        return "Install desktop dependencies in the terminal executor image; the gateway installer is unavailable"
+    return None
+
+
 def install_packages(*, ask_password: Callable[[], str], on_line: Callable[[str], None],
                      timeout_seconds: float = 900.0, claimed: bool = False) -> int:
     """Run the package install; returns the process exit code (0 = success, ``-1`` = cancelled,
@@ -87,6 +98,8 @@ def install_packages(*, ask_password: Callable[[], str], on_line: Callable[[str]
     ``claimed=True``: the caller already holds the slot via :func:`claim`; it is released here either way."""
     key = hermes_home_key() if claimed else None
     try:
+        if refusal := placement_refusal():
+            raise RuntimeError(refusal)
         if not runtime.is_supported_host():
             raise RuntimeError("Bot Desktop runs on Linux gateway hosts only")
         cmd = runtime.install_command()

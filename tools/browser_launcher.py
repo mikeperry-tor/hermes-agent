@@ -227,6 +227,15 @@ def _configured_chromium_args() -> list[str]:
     return chromium_args()
 
 
+def chromium_sandbox_required() -> bool:
+    """Opt-in sandbox requirement; default retains native host/container launch behavior."""
+    from tools.browser_session_cloud import browser_section
+    value = browser_section().get("require_sandbox", False)
+    if not isinstance(value, bool):
+        raise ValueError("browser.require_sandbox must be a boolean")
+    return value
+
+
 def build_chromium_argv(executable: str, user_data_dir: str, *, packaged: bool, headed: bool,
                         sandbox_bypass: bool, extra_args=()) -> list[str]:
     """The launch argv (pure in its inputs + host sandbox facts + ``browser.chromium_args``).
@@ -242,7 +251,13 @@ def build_chromium_argv(executable: str, user_data_dir: str, *, packaged: bool, 
     if not headed:
         argv.append("--headless=new")
     configured = _configured_chromium_args()
-    if sandbox_bypass and needs_chromium_sandbox_bypass():
+    required = chromium_sandbox_required()
+    if required and any(str(arg).split("=", 1)[0] in {"--no-sandbox", "--disable-setuid-sandbox",
+                                                      "--disable-seccomp-filter-sandbox", "--disable-namespace-sandbox",
+                                                      "--disable-gpu-sandbox"}
+                        for arg in (*extra_args, *configured)):
+        raise ValueError("browser.require_sandbox conflicts with Chromium sandbox bypass flags")
+    if sandbox_bypass and not required and needs_chromium_sandbox_bypass():
         argv += [flag for flag in CHROMIUM_SANDBOX_BYPASS_ARGS if flag not in configured]
     argv += [str(a) for a in extra_args]
     argv += configured
@@ -759,20 +774,20 @@ def _terminate(pid: Optional[int], start_time: Optional[int], proc: Optional[sub
             proc.kill()
 
 
-def stop_browser(key: str) -> None:
+def stop_browser(key: str, *, expected_cdp_url: Optional[str] = None) -> None:
     """Let go of ``key``'s browser. A throwaway one this process launched is stopped. A shared-profile one is
     stopped only by its LAST holder across Hermes processes (:func:`_last_holder_out`); one a human started is
     never stopped. Holds ``key``'s launch lock: a relaunch of ``key`` waits for this stop instead of
     registering a replacement on the dir it is about to delete."""
     with _key_lock(key):
-        _stop_locked(key)
+        _stop_locked(key, expected_cdp_url)
 
 
-def _stop_locked(key: str) -> None:
+def _stop_locked(key: str, expected_cdp_url: Optional[str]) -> None:
     with _lock:
         browser = _browsers.get(key)
         proc = _procs.get(key)
-    if browser is None:
+    if browser is None or (expected_cdp_url is not None and browser.cdp_url != expected_cdp_url):
         return
     record = None if browser.ephemeral else _record_path(browser)
     if record is None:

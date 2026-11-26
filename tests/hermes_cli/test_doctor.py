@@ -306,6 +306,59 @@ class TestDoctorToolAvailabilityOverrides:
 
 
 
+@pytest.mark.parametrize(
+    ("explicit_config", "configured_port", "expected_port"),
+    (
+        (True, None, "22"),
+        (True, " 2200 ", "2200"),
+        (True, "", None),
+        (True, "invalid", None),
+        (False, None, None),
+        (False, "2200", "2200"),
+    ),
+)
+def test_doctor_ssh_port(monkeypatch, tmp_path, explicit_config, configured_port, expected_port):
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "fixture.invalid")
+    monkeypatch.setenv("TERMINAL_SSH_USER", "runner")
+    monkeypatch.delenv("TERMINAL_SSH_KEY", raising=False)
+    monkeypatch.delenv("TERMINAL_SSH_PORT", raising=False)
+    monkeypatch.delenv("TERMINAL_SSH_CONFIG", raising=False)
+    config = tmp_path / "ssh_config"
+    if explicit_config:
+        config.write_text("Host fixture.invalid\n    Port 2222\n", encoding="utf-8")
+        monkeypatch.setenv("TERMINAL_SSH_CONFIG", str(config))
+    if configured_port is not None:
+        monkeypatch.setenv("TERMINAL_SSH_PORT", configured_port)
+
+    commands = []
+
+    def run_probe(command, **_kwargs):
+        commands.append(command)
+        return True
+
+    monkeypatch.setattr(doctor_tools, "_run_ok", run_probe)
+    issues = []
+    doctor_tools._check_ssh_backend(issues)
+
+    if explicit_config and expected_port is None:
+        assert issues == ["TERMINAL_SSH_PORT must be an integer."]
+        assert not commands
+        return
+
+    assert not issues
+    command, = commands
+    if expected_port is None:
+        assert "-p" not in command
+    else:
+        assert "-p" in command
+        assert command[command.index("-p") + 1] == expected_port
+    if explicit_config:
+        assert command[command.index("-F") + 1] == str(config)
+        assert "StrictHostKeyChecking=yes" in command
+    else:
+        assert "-F" not in command
+
+
 def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
     monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")

@@ -25,6 +25,12 @@ from tools.environments.base import BaseEnvironment
 logger = logging.getLogger(__name__)
 
 
+def docker_exec_prefix(executable: str, container: str, *, user: Optional[str], interactive: bool) -> list[str]:
+    # A removed creation-time cwd cannot block inspection of a live container.
+    return [executable, "exec", "-w", "/", *(["-i"] if interactive else []),
+            *(["-u", user] if user else []), container]
+
+
 def exec_prefix(env: BaseEnvironment, *, user: Optional[str] = None, interactive: bool = True) -> Optional[list[str]]:
     """Local argv that runs its remainder inside ``env``, or None for backends without one.
 
@@ -38,14 +44,7 @@ def exec_prefix(env: BaseEnvironment, *, user: Optional[str] = None, interactive
         container = getattr(env, "_container_id", None)
         if not container:
             return None
-        # From "/", not the container's creation-time -w: if that directory was deleted the OCI
-        # runtime refuses the exec outright (the same guard as DockerEnvironment._run_bash).
-        argv = [env._docker_exe, "exec", "-w", "/"]
-        if interactive:
-            argv.append("-i")
-        if user:
-            argv += ["-u", user]
-        return argv + [container]
+        return docker_exec_prefix(env._docker_exe, container, user=user, interactive=interactive)
     if isinstance(env, SSHEnvironment):
         return env._build_ssh_command()
     return _plugin_exec_prefix(env, user=user, interactive=interactive)

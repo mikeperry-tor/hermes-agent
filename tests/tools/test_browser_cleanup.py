@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -42,7 +42,7 @@ class TestBrowserCleanup:
 
         assert "task-1" not in bs._active_sessions
         assert "task-1" not in bs._session_last_activity
-        mock_stop.assert_called_once_with("task-1")
+        mock_stop.assert_called_once_with("task-1", expected_cdp_url=None)
 
 
     def test_emergency_cleanup_clears_all_tracking_state(self):
@@ -121,7 +121,7 @@ class TestInactivityJanitorMultiplex:
 
         seen = {}
 
-        def fake_stop(launcher_key):
+        def fake_stop(launcher_key, **_kwargs):
             seen["home"] = str(get_hermes_home())
             seen["key"] = secret_scope.get_secret("BROWSER_USE_API_KEY")
 
@@ -203,6 +203,15 @@ def _attached_browser(key: str, cdp_url: str) -> launcher.LaunchedBrowser:
 class TestSharedBrowserSessions:
     """Several cache keys share one browser (Bot Desktop profile, browser.user_data_dir, real profile)."""
 
+    def test_host_session_release_keeps_successor_on_the_same_key(self, isolated_sessions):
+        key = "profile:/shared"
+        current = _attached_browser(key, "ws://127.0.0.1:1234/devtools/browser/new")
+        launcher._browsers[key] = current
+        stale = {"features": {"local": True}, "launcher_key": key,
+                 "cdp_url": "ws://127.0.0.1:1234/devtools/browser/old"}
+        lifecycle.release_session_backend("old-task", stale)
+        assert launcher.get_browser(key) is current
+
     def test_a_key_left_on_a_relaunched_shared_browser_rebuilds_on_the_live_endpoint(self, monkeypatch,
                                                                                     isolated_sessions):
         key = "profile:/shared"
@@ -229,7 +238,7 @@ class _FakeSandbox:
     def __init__(self):
         self.running = None
         self.killed = []
-        self.probes = 0  # liveness execs (the /dev/tcp check)
+        self.probes = 0  # DevTools identity checks
         self.probe_failure = None  # "exit-255" (docker/ssh transport error) or "timeout"
         self.forward_failures = 0  # connections through the port forward that never reached Chromium
         self.browser_id = "abc"  # a relaunch on the same port gets a new /devtools/browser/<id>
@@ -244,30 +253,44 @@ class _FakeSandbox:
             raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
         if argv[0] in self.timeouts:
             raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+        if argv[:3] == ["bash", "-c", _recover_script()]:
+            return _Completed(4)
         if "setsid" in cmd:
             self.running = 4242
             self.launches += 1
             return _Completed(0, b"4242 777\n")  # pid, start time
-        if argv[0] == "cat" and not self.port_published:
-            return _Completed(1)
-        if "/dev/tcp" in cmd:
+        if "hermes-sandbox-browser-owner" in argv:
+            return _Completed(0 if int(argv[4]) == self.running else 4)
+        if _devtools_probe(argv):
             self.probes += 1
+            if self.running and "port-wait" in self.timeouts:
+                raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
             if self.probe_failure == "exit-255":
                 return _Completed(255)
             if self.probe_failure == "timeout":
                 raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
-        if "/dev/tcp" in cmd or argv[0] == "cat":
             found = f"9222\n/devtools/browser/{self.browser_id}\n".encode()
-            answer = _Completed(0, found) if self.running else _Completed(3)
-            if "/dev/tcp" in cmd and self.probe_barrier is not None:  # answered, then held until the rival probes
+            answer = _Completed(0, found) if self.running and self.port_published else _Completed(3)
+            if self.probe_barrier is not None:  # answered, then held until the rival probes
                 with contextlib.suppress(threading.BrokenBarrierError):
                     self.probe_barrier.wait(timeout=1.0)
             return answer
-        if _stop_target(argv) is not None:
-            self.killed.append(_stop_target(argv))
+        if (target := _stop_target(argv)) is not None:
+            if target != self.running:
+                return _Completed(4)
+            self.killed.append(target)
             self.running = None
             return _Completed(0)
         return _Completed(1)
+
+
+def _devtools_probe(argv):
+    return argv[:2] == ["python3", "-c"] and "/json/version" in argv[2]
+
+
+def _recover_script():
+    from tools.browser_session_sandbox import _RECOVER_LAUNCH
+    return _RECOVER_LAUNCH
 
 
 def _stop_target(argv):
@@ -288,15 +311,19 @@ def fake_sandbox(monkeypatch, isolated_sessions):
     from tools.bot_desktop import runtime, sandbox_host
     from tools.environments import streams
     sandbox, env = _FakeSandbox(), object()
+    monkeypatch.setattr(bs, "_pending_sandbox_attachments", {}, raising=False)
     monkeypatch.setattr(browser_session_sandbox, "_launched", {}, raising=False)
     monkeypatch.setattr(browser_session_sandbox, "_confirmed", {}, raising=False)
+    monkeypatch.setattr(browser_session_sandbox, "_retiring", {}, raising=False)
     monkeypatch.setattr(streams, "run_in", sandbox.run_in)
     monkeypatch.setattr(streams, "forward_port", lambda env, port, user=None: 50000 + port)
     monkeypatch.setattr(streams, "forward_failures", lambda env, port: sandbox.forward_failures, raising=False)
     monkeypatch.setattr(streams, "sandbox_temp_dir", lambda env: "/tmp")  # no-tmp: ok — sandbox-side path
     monkeypatch.setattr(runtime, "_sandbox_env", lambda create=False: env)
+    monkeypatch.setattr(runtime, "_owned_sandbox_env", lambda reattach=True: env)
+    monkeypatch.setattr(runtime, "tool_sandbox", lambda reattach=True: (env, {"DISPLAY": ":5"}))
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":5"})
-    monkeypatch.setattr(sandbox_host, "_user_for", lambda env: "hermes")
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda env, **_kw: "hermes")
     monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda env: "/home/hermes/.bot-browser")
     monkeypatch.setattr(sandbox_host, "chromium_executable", lambda env: "/usr/bin/chromium")
     return sandbox
@@ -317,6 +344,191 @@ class TestSandboxSharedBrowser:
         lifecycle.cleanup_single_session("task-B")
         assert fake_sandbox.killed == [4242]
 
+    def test_new_attachment_keeps_the_existing_launch_alive_until_publication(
+            self, fake_sandbox, isolated_sessions, monkeypatch):
+        from tools.browser_session_sandbox import create_sandbox_session
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+
+        def attach_while_tearing_down(key, _force):
+            pending = create_sandbox_session(key)
+            assert pending["cdp_url"] == first["cdp_url"]
+            lifecycle.cleanup_single_session("task-A")
+            assert fake_sandbox.killed == []
+            return pending
+
+        monkeypatch.setattr(bs, "_create_session_for_key", attach_while_tearing_down)
+        second = bs.get_session_info("task-B")
+        assert bs._active_sessions["task-B"] is second
+        lifecycle.cleanup_single_session("task-B")
+        assert fake_sandbox.killed == [4242]
+
+    def test_refuses_a_new_attachment_while_the_retired_endpoint_still_listens(
+            self, fake_sandbox, isolated_sessions, monkeypatch):
+        from tools import browser_session_sandbox as sandbox
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: sandbox.create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+        from tools.environments import streams
+        signal = Mock()
+        run = streams.run_in
+
+        def delayed_stop(env, argv, **kwargs):
+            if "hermes-sandbox-browser-stop" in argv and fake_sandbox.running is not None:
+                signal(argv)
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return run(env, argv, **kwargs)
+
+        monkeypatch.setattr(streams, "run_in", delayed_stop)
+        lifecycle.cleanup_single_session("task-A")
+        with pytest.raises(RuntimeError, match="still shutting down"):
+            bs.get_session_info("task-B")
+        assert "task-B" not in bs._active_sessions
+        assert signal.call_count == 2
+        assert all(tuple(call.args[0][-3:-1]) == tuple(map(str, first["sandbox_launch"]))
+                   for call in signal.call_args_list)
+
+        fake_sandbox.running = None
+        fake_sandbox.browser_id = "successor"
+        replacement = bs.get_session_info("task-B")
+        assert replacement["cdp_url"] != first["cdp_url"]
+
+    @pytest.mark.parametrize("failed_after_discovery", [False, True])
+    def test_failed_start_retires_owned_chromium_before_retry(
+            self, fake_sandbox, isolated_sessions, monkeypatch, failed_after_discovery):
+        from tools import browser_session_sandbox as sandbox
+        from tools.environments import streams
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: sandbox.create_sandbox_session(key))
+        signal = Mock()
+        run = streams.run_in
+
+        def delayed_stop(env, argv, **kwargs):
+            if _stop_target(argv) == fake_sandbox.running and fake_sandbox.running is not None:
+                signal(argv)
+                return _Completed(0)
+            return run(env, argv, **kwargs)
+
+        monkeypatch.setattr(streams, "run_in", delayed_stop)
+        with monkeypatch.context() as startup:
+            def unavailable(*_args, **_kwargs):
+                raise RuntimeError("synthetic startup failure")
+
+            if failed_after_discovery:
+                startup.setattr(streams, "forward_port", unavailable)
+            else:
+                startup.setattr(sandbox, "_wait_for_port", unavailable)
+            with pytest.raises(RuntimeError, match="synthetic startup failure"):
+                bs.get_session_info("task-A")
+
+        with pytest.raises(RuntimeError, match="still shutting down"):
+            bs.get_session_info("task-B")
+        assert not bs._active_sessions
+        assert fake_sandbox.launches == 1
+        assert signal.call_count == 2
+        assert all(_stop_target(call.args[0]) == 4242 for call in signal.call_args_list)
+
+        fake_sandbox.running = None
+        fake_sandbox.browser_id = "replacement"
+        assert bs.get_session_info("task-B")["cdp_url"].endswith("/replacement")
+        assert fake_sandbox.launches == 2
+
+    @pytest.mark.parametrize("missing_endpoint", [True, False])
+    def test_unusable_endpoint_does_not_lose_the_existing_profile_owner(
+            self, fake_sandbox, monkeypatch, missing_endpoint):
+        from tools import browser_session_sandbox as sandbox
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: sandbox.create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+        launch = sandbox._launched[first["launcher_key"]]
+        fake_sandbox.port_published = not missing_endpoint
+        fake_sandbox.browser_id = "different-endpoint"
+        with monkeypatch.context() as failed_start:
+            failed_start.setattr(sandbox, "_wait_for_port", Mock(side_effect=RuntimeError("contender lost singleton")))
+            with pytest.raises(RuntimeError, match="still owns the profile"):
+                bs.get_session_info("task-B")
+        assert "task-B" not in bs._active_sessions
+        assert sandbox._launched[first["launcher_key"]] is launch
+        assert fake_sandbox.launches == 1 and fake_sandbox.killed == []
+
+        lifecycle.cleanup_single_session("task-A")
+        assert fake_sandbox.killed == [launch.pid]
+        fake_sandbox.port_published = True
+        fake_sandbox.browser_id = "successor"
+        assert bs.get_session_info("task-B")["cdp_url"].endswith("/successor")
+        assert fake_sandbox.launches == 2
+
+    def test_changed_endpoint_cannot_discard_an_unfinished_retirement(self, fake_sandbox, monkeypatch):
+        from tools import browser_session_sandbox as sandbox
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: sandbox.create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+        launch = sandbox._launched[first["launcher_key"]]
+        fake_sandbox.browser_id = "different-endpoint"
+        fake_sandbox.timeouts.add("kill")
+        lifecycle.cleanup_single_session("task-A")
+
+        with pytest.raises(RuntimeError, match="still shutting down"):
+            bs.get_session_info("task-B")
+        assert "task-B" not in bs._active_sessions
+        assert first["launcher_key"] in sandbox._retiring
+        assert fake_sandbox.running == launch.pid and fake_sandbox.killed == []
+
+        fake_sandbox.timeouts.remove("kill")
+        with pytest.raises(RuntimeError, match="still shutting down"):
+            bs.get_session_info("task-B")
+        assert fake_sandbox.killed == [launch.pid]
+
+        fake_sandbox.running = 4343
+        replacement = bs.get_session_info("task-B")
+        assert replacement["cdp_url"].endswith("/different-endpoint")
+        assert "sandbox_launch" not in replacement
+        assert fake_sandbox.running == 4343 and fake_sandbox.killed == [launch.pid]
+
+    def test_closing_an_independent_replacement_does_not_retire_it(
+            self, fake_sandbox, isolated_sessions, monkeypatch):
+        from tools import browser_session_sandbox as sandbox
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: sandbox.create_sandbox_session(key))
+        first = bs.get_session_info("task-A")
+        fake_sandbox.running = 4343
+        fake_sandbox.browser_id = "dock-replacement"
+
+        dock = bs.get_session_info("task-B")
+        assert dock["launcher_key"] == first["launcher_key"]
+        lifecycle.cleanup_single_session("task-A")
+        lifecycle.cleanup_single_session("task-B")
+        again = bs.get_session_info("task-C")
+
+        assert dock["cdp_url"] == again["cdp_url"]
+        assert "sandbox_launch" not in dock and "sandbox_launch" not in again
+        assert fake_sandbox.running == 4343 and not fake_sandbox.killed
+        assert fake_sandbox.launches == 1
+
+    def test_first_discovery_does_not_claim_the_dock_browser_that_won_the_profile(
+            self, fake_sandbox, isolated_sessions, monkeypatch):
+        from tools import browser_session_sandbox as sandbox
+
+        monkeypatch.setattr(bs, "_create_session_for_key", lambda key, _force: sandbox.create_sandbox_session(key))
+        native_wait = sandbox._wait_for_port
+
+        def dock_wins(env, user, profile):
+            # The dock claimed the singleton before the managed browser finished booting.
+            fake_sandbox.running = 4343
+            fake_sandbox.browser_id = "dock-first"
+            return native_wait(env, user, profile)
+
+        monkeypatch.setattr(sandbox, "_wait_for_port", dock_wins)
+        first = bs.get_session_info("task-A")
+        lifecycle.cleanup_single_session("task-A")
+        again = bs.get_session_info("task-B")
+
+        assert again["cdp_url"] == first["cdp_url"]
+        assert "sandbox_launch" not in first and "sandbox_launch" not in again
+        assert fake_sandbox.running == 4343 and not fake_sandbox.killed
+        assert fake_sandbox.launches == 1
+
     def test_a_sandbox_session_is_dead_once_its_chromium_is_gone(self, fake_sandbox):
         from tools.browser_session_sandbox import create_sandbox_session
         info = create_sandbox_session("task-A")
@@ -325,6 +537,30 @@ class TestSandboxSharedBrowser:
         fake_sandbox.running = None  # crashed inside the sandbox
         fake_sandbox.forward_failures += 1  # the harness's next connection through the forward fails
         assert bs._backend_dead(info) is True
+
+    def test_release_cannot_signal_a_successor_launch_on_the_same_key(self, fake_sandbox, monkeypatch):
+        from tools import browser_session_sandbox as sandbox
+
+        old = sandbox.create_sandbox_session("old-task")
+        key = old["launcher_key"]
+        original_stop = sandbox.stop_sandbox_browser
+        successor = None
+
+        def replace_after_session_check(record):
+            nonlocal successor
+            env, _pid, _start, udd, _path = sandbox._launched[key]
+            fake_sandbox.running = 4343
+            fake_sandbox.browser_id = "new-browser"
+            sandbox._launched[key] = sandbox._Launch(env, 4343, "778", udd, "/devtools/browser/new-browser")
+            successor = sandbox.create_sandbox_session("new-task")
+            original_stop(record)
+
+        monkeypatch.setattr(sandbox, "stop_sandbox_browser", replace_after_session_check)
+        lifecycle.release_session_backend("old-task", old)
+        assert fake_sandbox.running == 4343 and fake_sandbox.killed == []
+        assert successor is not None
+        original_stop(successor)
+        assert fake_sandbox.killed == [4343]
 
     def test_a_failed_or_timed_out_liveness_exec_keeps_the_live_browser(self, fake_sandbox, isolated_sessions,
                                                                       monkeypatch):
@@ -392,7 +628,7 @@ class TestSandboxBrowserOwnership:
     def test_a_timed_out_port_wait_is_a_readiness_failure(self, fake_sandbox, monkeypatch):
         from tools import browser_session_sandbox
         from tools.browser_session_sandbox import create_sandbox_session
-        fake_sandbox.timeouts.add("cat")
+        fake_sandbox.timeouts.add("port-wait")
         monkeypatch.setattr(browser_session_sandbox, "_LAUNCH_TIMEOUT_S", 0.01)
         with pytest.raises(RuntimeError, match="did not expose a DevTools endpoint"):
             create_sandbox_session("task-A")
@@ -436,11 +672,15 @@ class _FakeContainers:
 
     def run_in(self, env, argv, **kw):
         cmd = " ".join(argv)
+        if argv[:3] == ["bash", "-c", _recover_script()]:
+            return _Completed(4)
         if "setsid" in cmd:
             self._next_pid += 1
             self.running.setdefault(env, self._next_pid)
             return _Completed(0, f"{self._next_pid} 777\n".encode())
-        if "/dev/tcp" in cmd or argv[0] == "cat":
+        if "hermes-sandbox-browser-owner" in argv:
+            return _Completed(0 if int(argv[4]) == self.running.get(env) else 4)
+        if _devtools_probe(argv):
             pid = self.running.get(env)
             return _Completed(0, f"9222\n/devtools/browser/{pid}\n".encode()) if pid else _Completed(3)
         if _stop_target(argv) is not None:
@@ -458,6 +698,8 @@ def fake_containers(monkeypatch, isolated_sessions):
     from tools.bot_desktop import runtime, sandbox_host
     from tools.environments import streams
     containers = _FakeContainers()
+    monkeypatch.setattr(bs, "_pending_sandbox_attachments", {}, raising=False)
+    monkeypatch.setattr(browser_session_sandbox, "_retiring", {}, raising=False)
     monkeypatch.setattr(browser_session_sandbox, "_launched", {}, raising=False)
     monkeypatch.setattr(browser_session_sandbox, "_confirmed", {}, raising=False)
     monkeypatch.setattr(streams, "run_in", containers.run_in)
@@ -465,8 +707,10 @@ def fake_containers(monkeypatch, isolated_sessions):
     monkeypatch.setattr(streams, "forward_failures", lambda env, port: 0, raising=False)
     monkeypatch.setattr(streams, "sandbox_temp_dir", lambda env: "/tmp")  # no-tmp: ok — sandbox-side path
     monkeypatch.setattr(runtime, "_sandbox_env", lambda create=False: containers.current)
+    monkeypatch.setattr(runtime, "_owned_sandbox_env", lambda reattach=True: containers.current)
+    monkeypatch.setattr(runtime, "tool_sandbox", lambda reattach=True: (containers.current, {"DISPLAY": ":5"}))
     monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":5"})
-    monkeypatch.setattr(sandbox_host, "_user_for", lambda env: "hermes")
+    monkeypatch.setattr(sandbox_host, "_user_for", lambda env, **_kw: "hermes")
     monkeypatch.setattr(sandbox_host, "browser_profile_dir", lambda env: "/home/hermes/.bot-browser")
     monkeypatch.setattr(sandbox_host, "chromium_executable", lambda env: "/usr/bin/chromium")
     return containers
@@ -509,3 +753,22 @@ class TestSandboxBrowserPerContainer:
         assert fake_containers.killed == [(first, pids[first])]
         lifecycle.cleanup_single_session("s2")
         assert fake_containers.killed == [(first, pids[first]), (second, pids[second])]
+
+
+def test_sandbox_chromium_preserves_repeated_arg_values(monkeypatch):
+    from tools import browser_session_cloud, browser_session_sandbox
+    from tools.environments import streams
+
+    commands = []
+    monkeypatch.setattr(
+        streams,
+        "run_in",
+        lambda _env, argv, **_kw: (commands.append(argv), subprocess.CompletedProcess(argv, 0, b"4242 999\n", b""))[1],
+    )
+    monkeypatch.setattr(
+        browser_session_cloud,
+        "browser_section",
+        lambda: {"chromium_args": ["--window-position", "0", "--window-size", "0"]},
+    )
+    assert browser_session_sandbox._start_chromium(object(), None, "/usr/bin/chromium", "/tmp/p", {"DISPLAY": ":5"}) == (4242, "999")
+    assert "--window-position 0 --window-size 0" in commands[-1][-1]

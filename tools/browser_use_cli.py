@@ -43,6 +43,7 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # Set on the env dict by the CDP resolvers when the resolved browser is EXCLUSIVE to this named session
 # (per-name provider / named BU cloud / Lightpanda). Popped before the subprocess launches — never exported.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
+_EXECUTOR_BROWSER_SENTINEL = "_HERMES_BU_EXECUTOR_BROWSER"
 # Internal route provenance: this exec resolved to a browser on the Bot Desktop display and must use
 # the same human-control lease fence as the built-in browser tools. Popped before launching the CLI.
 _BOT_DESKTOP_BROWSER_SENTINEL = "_HERMES_BU_BOT_DESKTOP_BROWSER"
@@ -62,33 +63,24 @@ _OWN_TAB_PREAMBLE = """\
 def _hermes_ensure_own_tab():
     import os as _os, tempfile as _tf
     _name = _os.environ.get("BU_NAME", "default")
-    try:
-        # Key the marker by the daemon's pid so a daemon restart (which
-        # re-attaches to the first shared page) re-pins automatically,
-        # while agent-driven tab switches mid-session are left alone.
-        from browser_harness import _ipc as _bipc
-        _dpid = _bipc.pid_path(_name).read_text().strip() or "0"
-    except Exception:
-        _dpid = "0"
+    from browser_harness import _ipc as _bipc
+    # Use the harness's live identity check; a synthetic marker would survive
+    # daemon replacement and skip this session's tab initialization.
+    _dpid = _bipc.identify(_name)
+    if _dpid is None:
+        raise RuntimeError("Could not identify this named browser session's daemon")
     _uid = _os.getuid() if hasattr(_os, "getuid") else 0
     _marker = _os.path.join(
         _tf.gettempdir(), "hermes-bu-owntab-%s-%s-%s" % (_uid, _name, _dpid)
     )
     if _os.path.exists(_marker):
         return
-    try:
-        # Force a fresh target: new_tab() would REUSE a blank current tab,
-        # which is exactly the tab a sibling daemon may also hold.
-        _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
-        if _tid:
-            switch_tab(_tid)
-    except Exception:
-        pass  # best-effort: worst case is pre-fix behavior
-    try:
-        # Shared temp root + predictable name: never truncate through a planted symlink.
-        _os.close(_os.open(_marker, _os.O_WRONLY | _os.O_CREAT | getattr(_os, "O_NOFOLLOW", 0), 0o600))
-    except OSError:
-        pass
+    # Setup must succeed before model code can act on a shared browser.
+    _tid = cdp("Target.createTarget", url="about:blank").get("targetId")
+    if not _tid:
+        raise RuntimeError("Could not create this named browser session's tab")
+    switch_tab(_tid)
+    _os.close(_os.open(_marker, _os.O_WRONLY | _os.O_CREAT | getattr(_os, "O_NOFOLLOW", 0), 0o600))
 _hermes_ensure_own_tab()
 del _hermes_ensure_own_tab
 """
@@ -154,7 +146,7 @@ class _CodeUrlVerdict(NamedTuple):
     local_sidecar: bool
 
 
-def _code_url_verdict(code: str) -> _CodeUrlVerdict:
+def _code_url_verdict(code: str, *, force_local: bool = False) -> _CodeUrlVerdict:
     """One pass over the code's URL literals: the blocking error, if any, and whether the call must run on
     the hybrid LOCAL sidecar. Each URL's routing predicate is evaluated ONCE and feeds both answers: it
     resolves DNS unmemoised, so a rebinding host evaluated twice could relax the private-address floor and
@@ -162,7 +154,7 @@ def _code_url_verdict(code: str) -> _CodeUrlVerdict:
     from tools.browser_url_policy import evaluate_url_safety, hybrid_routes_locally
     local_sidecar = False
     for url in _URL_RE.findall(code or ""):
-        routes_local = hybrid_routes_locally(url)
+        routes_local = force_local or hybrid_routes_locally(url)
         local_sidecar = local_sidecar or routes_local
         err = evaluate_url_safety(url, auto_local=routes_local)
         if err:
@@ -264,8 +256,37 @@ def _find_cli() -> Optional[list[str]]:
 
 
 def browser_exec_available() -> bool:
-    """check_fn: browser-harness is importable (a core dependency). Never launches or opens sockets."""
-    return _find_cli() is not None
+    """Check the harness on an active desktop executor or in Hermes's local venv."""
+    from tools.bot_desktop import placement
+    from tools.browser_lightpanda import using_lightpanda_engine
+    from tools.browser_session_cdp import get_cdp_override_raw
+    from tools.browser_session_cloud import get_cloud_provider
+
+    try:
+        if placement.executor_only():
+            from tools.browser_use_executor import available
+            return available(require_ready=True)
+    except RuntimeError:
+        return False
+
+    gateway = _find_cli() is not None
+    if _has_cdp_env(os.environ) or get_cdp_override_raw() or using_lightpanda_engine():
+        return gateway
+    where = placement.resolve().where
+    if where == placement.GATEWAY:
+        return gateway
+    # A cloud or consented real-profile route can still use the gateway
+    # installation. A terminal Chromium route does not depend on browser.headed.
+    if gateway and (_real_profile_consented() or _quiet(get_cloud_provider, None) is not None):
+        return True
+    if where != placement.TERMINAL:
+        return False
+    if gateway:
+        return True
+    # Without a gateway harness, an unstarted executor can still be discovered
+    # so the first call can start its desktop; check the remote dependency once running.
+    from tools.browser_use_executor import available
+    return available()
 
 
 def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
@@ -350,15 +371,38 @@ def _export_real_profile_note(env: dict, key: str) -> None:
         env.setdefault(_REAL_PROFILE_FALLBACK_SENTINEL, note)
 
 
-def _mark_local_browser(env: dict, session: dict, key: str) -> None:
+def _sandbox_executor_ready() -> bool:
+    """Whether the active sandbox browser has an in-sandbox ``browser-harness`` to run ``browser_exec``.
+
+    Stock sandbox images (such as ``nousresearch/hermes-sandbox:desktop``) run Chromium inside the
+    sandbox without preinstalling ``browser-harness``; when absent and ``executor_only`` is false,
+    the gateway host drives that Chromium over the forwarded ``BU_CDP_WS`` tunnel.
+    """
+    from tools.bot_desktop import placement, runtime
+    from tools.browser_use_executor import probe_harness
+
+    env = runtime._owned_sandbox_env(reattach=False) or placement.terminal_environment(create=False)
+    if env is None:
+        raise RuntimeError("The terminal executor owning this browser is unavailable")
+    return probe_harness(env)
+
+
+def _mark_local_browser(env: dict, session: dict, key: str) -> Optional[str]:
     """Flags for a LOCAL session browser: it runs on the Bot Desktop display (lease fence), and unless a
     persistent profile / the real-profile browser is shared by every key, it is exclusive to this key (no
     own-tab preamble: nothing to share a tab with)."""
     features = session.get("features") or {}
+    if features.get("sandbox"):
+        try:
+            if _sandbox_executor_ready():
+                env[_EXECUTOR_BROWSER_SENTINEL] = key
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return "Could not inspect browser-harness on the terminal executor. Check the executor and retry."
     env[_BOT_DESKTOP_BROWSER_SENTINEL] = "lightpanda" if features.get("lightpanda") else "local"
     if not session.get("shared_profile") and not features.get("real_profile"):
         env[_PRIVATE_BROWSER_SENTINEL] = "1"
     _export_real_profile_note(env, key)
+    return None
 
 
 def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = "",
@@ -382,9 +426,7 @@ def _resolve_local_cdp(env: dict, task_id: Optional[str], session_name: str = ""
         fail = lambda e: (f"The local browser could not be started: {e} "
                           "Run `hermes tools` → Browser Automation to (re)install Chromium, or switch backends.")
     err = _export_session_cdp(env, _session_info, key, fail, "The local browser session returned no CDP endpoint.")
-    if err is None:
-        _mark_local_browser(env, session, key)
-    return err
+    return err if err is not None else _mark_local_browser(env, session, key)
 
 
 def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = "",
@@ -455,9 +497,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
         # browser for this key; it already carries its CDP URL.
         logger.warning("browser_exec: %s failed (%s); using local Chromium for this session",
                        provider_name, session.get("fallback_reason"))
-        if err is None:
-            _mark_local_browser(env, session, key)
-        return err
+        return err if err is not None else _mark_local_browser(env, session, key)
     if err is None:
         from tools.browser_use_shot import ACTIVATE_ALWAYS
         env[_CLOUD_BROWSER_SENTINEL] = ACTIVATE_ALWAYS  # the provider's own session: the harness connects only there
@@ -468,6 +508,16 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     return err
 
 
+def _selects_real_profile(force_local: bool) -> bool:
+    from tools.browser_session_cloud import get_cloud_provider
+
+    # Only auto-upgrade genuinely local routes. A provider lookup failure also stays on its own route.
+    return _real_profile_consented() and (
+        force_local or (_quiet(get_cloud_provider, object()) is None
+                        and not is_legacy_browser_use_cloud_config(_read_browser_cfg()))
+    )
+
+
 def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     """Point the harness at the user's real-profile copy-browser (a SNAPSHOT of their default Chromium
     profile, hermes_cli.browser_connect) when consented. Two ways in: the effective backend is already local
@@ -475,17 +525,10 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     ``local`` arg) → the user's browser even under a cloud backend. Operator overrides (BU_CDP_* env,
     /browser connect, ``browser.cdp_url``) own the session either way. A launch error is returned;
     ``_route_backend`` then falls back to the normal backend and reports it, never silently."""
-    if not _real_profile_consented() or _has_cdp_env(env):
-        return None
     from tools.browser_session_cdp import get_cdp_override_raw
-    from tools.browser_session_cloud import get_cloud_provider
     from tools.browser_session_real_profile import real_profile_cdp
-    if _quiet(get_cdp_override_raw, ""):
-        return None
-    # Only auto-upgrade genuinely-local attaches; any cloud path (provider, provider lookup failure, or
-    # legacy BU cloud config) stays on its backend unless the model passes local=true.
-    if not force_local and (_quiet(get_cloud_provider, object()) is not None
-                            or is_legacy_browser_use_cloud_config(_read_browser_cfg())):
+
+    if _has_cdp_env(env) or not _selects_real_profile(force_local) or _quiet(get_cdp_override_raw, ""):
         return None
     cdp, err = real_profile_cdp()
     if cdp and not err:
@@ -494,21 +537,33 @@ def _resolve_real_profile_cdp(env: dict, force_local: bool) -> Optional[str]:
     return err or None
 
 
-def _attach_vault_supervisor(env: dict, task_id: Optional[str]) -> None:
-    """Attach the per-task CDP supervisor to the browser this exec drives so ``browser_vault`` fill has
-    a secret-capable WebSocket (never argv) into the SAME browser. Only CDP-routed backends expose an
-    endpoint; BU direct-cloud (BU_AUTOSPAWN) does not, and the vault tools report ``supervisor_required``."""
-    cdp = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
-    if not cdp:
-        return
+def _attach_vault_supervisor(cdp_url, task_id, *, admission, local_browser):
+    from tools.browser_session_cdp import get_dialog_policy_config
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY, SupervisorEndpointConflict
+
     try:
-        from tools.browser_session_cdp import get_dialog_policy_config, resolve_cdp_override
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY
         policy, timeout_s = get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id or "default", cdp_url=resolve_cdp_override(cdp),
-                                         dialog_policy=policy, dialog_timeout_s=timeout_s)
+        return SUPERVISOR_REGISTRY.get_or_start(
+            task_id=task_id, cdp_url=cdp_url, dialog_policy=policy, dialog_timeout_s=timeout_s,
+            admission=admission, local_browser=local_browser)
+    except SupervisorEndpointConflict:
+        raise
     except Exception as exc:
         logger.debug("browser_exec: CDP supervisor attach failed (non-fatal): %s", exc)
+
+
+@contextlib.contextmanager
+def _supervise_browser_command(cdp, task_id, *, admission=contextlib.nullcontext, local_browser=False):
+    """Keep the task's vault endpoint bound throughout a command, including slow startup."""
+    if not cdp:
+        yield None  # Direct Browser Use cloud has no CDP endpoint for the vault.
+        return
+    from tools.browser_session_cdp import resolve_cdp_override
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+    endpoint, task = resolve_cdp_override(cdp), task_id or "default"
+    with SUPERVISOR_REGISTRY.reserve_endpoint(task, endpoint):
+        yield _attach_vault_supervisor(endpoint, task, admission=admission, local_browser=local_browser)
 
 
 def _record_driven_tab(env: dict, task_id: Optional[str]) -> None:
@@ -632,6 +687,8 @@ def stop_harness_daemons(home_key: Optional[str] = None) -> None:
     """Stop every harness daemon this process drove (only ``home_key``'s when given), through the
     harness's own identity-checked ``--reload``; the next browser_exec respawns one on the endpoint
     it resolves then."""
+    from tools.browser_use_executor import close
+    close(home_key=home_key)
     with _driven_daemons_lock:
         daemons = sorted(key for key, home in _driven_daemons.items() if home_key in (None, home))
         for key in daemons:
@@ -780,15 +837,48 @@ def _no_code_error(code: str) -> Optional[str]:
     return None
 
 
+def _needs_gateway_harness(env: dict, local: bool, local_sidecar: bool) -> bool:
+    """Classify routes that can provision a gateway-side harness destination."""
+    from tools.bot_desktop import placement
+    from tools.browser_lightpanda import using_lightpanda_engine
+    from tools.browser_session_cdp import get_cdp_override_raw
+    from tools.browser_session_cloud import get_cloud_provider
+
+    return (local or _has_cdp_env(env) or bool(get_cdp_override_raw()) or _selects_real_profile(local)
+            or using_lightpanda_engine() or placement.resolve().where != placement.TERMINAL
+            or (not local_sidecar and _quiet(get_cloud_provider, None) is not None))
+
+
+def _execute_required_browser(code: str, session: str, timeout_s: int, task_id: Optional[str], local: bool):
+    from tools.registry import tool_error
+
+    if local:
+        return tool_error("The deployment requires a browser in the terminal executor")
+    if session and not _SESSION_RE.fullmatch(session):
+        return tool_error("Invalid session name: use 1-64 letters, digits, dashes or underscores")
+    if blocked := _code_url_verdict(code, force_local=True).blocked:
+        return tool_error(blocked)
+    from tools.browser_use_executor import execute
+    _exec_local_engine.set("local")
+    return execute(_backend_cache_key(task_id, session), code, session, timeout_s, task_id)
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
-    from agent.redact import redact_sensitive_text
     from tools.hosted_tool_policy import tool_refusal
     from tools.registry import tool_error, tool_result
     # A direct (non-dispatch) entry meets the same allowlist, before any setup.
     if refusal := tool_refusal("browser_exec") or _no_code_error(code):
         return tool_error(refusal)
+
+    from tools.bot_desktop.placement import executor_only
+    try:
+        required = executor_only()
+    except RuntimeError as exc:
+        return tool_error(str(exc))
+    if required:
+        return _execute_required_browser(code, session, timeout_s, task_id, local)
 
     # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
     # evaluation could relax the floor and still pick the cloud for a rebinding host.
@@ -800,17 +890,17 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     route_key = _backend_cache_key(task_id, session)
     local_sidecar = verdict.local_sidecar if _URL_RE.search(code) else _exec_route_is_sidecar.get(route_key, False)
 
-    cmd = _find_cli()
-    if not cmd:
-        return tool_error("browser-harness is missing from Hermes's Python environment. "
-                          "Run `hermes update` to re-sync it.")
-
     env = _base_subprocess_env()
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
                               "dashes, or underscores (e.g. 'r7k2').")
         env["BU_NAME"] = session
+    needs_gateway = _needs_gateway_harness(env, bool(local), local_sidecar)
+    cmd = _find_cli() if needs_gateway else None
+    missing_harness = "browser-harness is missing from Hermes's Python environment. Run `hermes update` to re-sync it."
+    if cmd is None and needs_gateway:
+        return tool_error(missing_harness)
     env, route_err, local_sidecar, generation = _route_exec_current(
         env, session, task_id, bool(local), local_sidecar, route_key)
     if route_err:
@@ -821,6 +911,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     local_engine = env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None)
     bot_desktop_browser = bool(local_engine)
     _exec_local_engine.set(local_engine)  # only local browsers carry the sentinel
+
+    if executor_key := env.pop(_EXECUTOR_BROWSER_SENTINEL, None):
+        from tools.browser_use_executor import execute
+        return execute(executor_key, code, session, timeout_s, task_id)
+    cmd = cmd or _find_cli()
+    if not cmd:
+        return tool_error(missing_harness)
+
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
     # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
@@ -844,8 +942,13 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
 
+    cdp_url = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+
     def dispatch() -> dict[str, Any]:
-        _attach_vault_supervisor(env, task_id)
+        with _supervise_browser_command(cdp_url, task_id, local_browser=bot_desktop_browser):
+            return run_cli()
+
+    def run_cli():
         with _driven_daemons_lock:
             daemon = daemon_identity(env)
             _driven_daemons[daemon] = hermes_home_key()
@@ -867,19 +970,27 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             owning.cancel(wait=5)  # an in-flight check finishes before the post-call one runs
             _record_driven_tab(env, task_id)  # only a call that ran: the supervisor is this call's browser's
 
-    if bot_desktop_browser:
-        from tools.browser_session import run_fenced
-        dispatched = run_fenced({"features": {"local": True}}, dispatch)
-    else:
-        dispatched = dispatch()
+    from tools.browser_supervisor import SupervisorEndpointConflict
+    try:
+        if bot_desktop_browser:
+            from tools.browser_session import run_fenced
+            dispatched = run_fenced({"features": {"local": True}}, dispatch)
+        else:
+            dispatched = dispatch()
+    except SupervisorEndpointConflict as exc:
+        return tool_error(str(exc))
     _reload_if_republished(env, generation)
     _own_harness_daemon(env)
     if "proc" not in dispatched:
         if "error_result" in dispatched:
             return dispatched["error_result"]
         return tool_result(dispatched)
-    proc = dispatched["proc"]
+    return _exec_result(dispatched["proc"], workspace, session, route_key, started)
 
+
+def _exec_result(proc, workspace, session, route_key, started):
+    from agent.redact import redact_sensitive_text
+    from tools.registry import tool_result
     # browser_vault fill registers injected values with this forced model-egress
     # boundary. Preserve raw stdout only for screenshot-path detection below.
     result = {
@@ -969,10 +1080,10 @@ _HELPERS_DIGEST = (
 )
 
 
-def _description_header() -> str:
+def _description_header(*, executor_chromium: bool = False) -> str:
     """Header tailored to whether screenshots ride back natively in this tool's results."""
-    if _lazy_call("tools.browser_lightpanda", "lightpanda_engine_status", (False, ""),
-                  "lightpanda engine status unavailable")[0]:  # no screenshots, whatever the model sees
+    if not executor_chromium and _lazy_call("tools.browser_lightpanda", "lightpanda_engine_status", (False, ""),
+                                           "lightpanda engine status unavailable")[0]:
         return _HEADER_BASE + _HEADER_LIGHTPANDA
     if _lazy_call("tools.vision_tools", "_should_use_native_vision_fast_path", False, ""):
         return _HEADER_BASE + _HEADER_VISION
@@ -980,6 +1091,10 @@ def _description_header() -> str:
 
 
 def _dynamic_schema_overrides() -> dict:
+    from tools.bot_desktop.placement import executor_only
+
+    if executor_only():
+        return {"description": _description_header(executor_chromium=True) + _HELPERS_DIGEST}
     overrides: dict = {"description": _description_header() + _HELPERS_DIGEST}
     # ``local`` exists ONLY when the user consented to real-profile browsing — everyone
     # else's schema carries zero extra surface. The caller memoizes on config.yaml mtime,
