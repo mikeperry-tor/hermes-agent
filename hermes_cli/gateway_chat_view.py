@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import suppress
 import logging
+import signal
 import sys
 import uuid
 
@@ -86,6 +87,35 @@ def lost_admission(snapshot, admission_id):
     if lost is None:
         raise GatewayClientError("No unknown (lost) admission with that id; resume to refresh")
     return lost
+
+
+async def _interactive_executor_shell(selected, command, cwd, timeout):
+    from hermes_cli.managed_operator_shell import run_executor_async
+
+    task = asyncio.create_task(run_executor_async(
+        selected, command, cwd, timeout=timeout, emit=lambda line: print(line, flush=True),
+    ))
+    interrupted = False
+
+    def interrupt(_signum, _frame):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            task.cancel()
+
+    previous = signal.signal(signal.SIGINT, interrupt)
+    try:
+        result = await task
+    except asyncio.CancelledError:
+        if not interrupted:
+            raise
+        print("!: interrupted", file=sys.stderr)
+        return 130
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+    return result.returncode
 
 
 class GatewayChatView:
@@ -363,6 +393,40 @@ class GatewayChatView:
                         await self._recover(admission, sid)
         return receipt
 
+    async def shell_line(self, text):
+        from hermes_cli.bang_shell import DEFAULT_TIMEOUT, USAGE_HINT, check_bang_approval, parse_bang_command, run_bang_command
+        from hermes_cli.managed_operator_shell import OperatorShellUnavailable, owner_shell_cwd, placement
+
+        try:
+            selected = placement()
+            if selected is None:
+                return False
+            command = parse_bang_command(text)
+            if not command:
+                print(USAGE_HINT, flush=True)
+                return True
+            approval = check_bang_approval(command)
+            if not approval.get("approved"):
+                print(approval.get("message") or approval.get("description") or "Command denied.", file=sys.stderr)
+                return True
+            owner = await self.client.rpc("shell.cwd", session_id=self.session_id)
+            cwd = owner_shell_cwd(selected, owner)
+            if selected.mode == "gateway":
+                previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+                try:
+                    code = run_bang_command(command, cwd=cwd, strict_cwd=True)
+                finally:
+                    signal.signal(signal.SIGINT, previous)
+            else:
+                code = await _interactive_executor_shell(selected, command, cwd, DEFAULT_TIMEOUT)
+            if code:
+                print(f"! exited {code}", file=sys.stderr)
+        except OperatorShellUnavailable as exc:
+            print(f"!: {exc}", file=sys.stderr)
+        except TimeoutError:
+            print(f"!: command timed out after {DEFAULT_TIMEOUT}s", file=sys.stderr)
+        return True
+
     async def command(self, text):
         command, _, rest = text.partition(" ")
         if command in {"/quit", "/exit", "/detach"}:
@@ -532,6 +596,17 @@ class GatewayChatView:
         failure = None if outcome in ("completed", "cancelled") else (result.get("error") or outcome or "failed")
         _write_usage_file(self.usage_file, result, failure=failure)
 
+    async def _dispatch_prompt_line(self, text) -> bool:
+        if text.startswith("/"):
+            return await self.command(text)
+        if text.startswith("!") and await self.shell_line(text):
+            return True
+        # Same scrollback shape as the in-process CLI: the typed prompt line is
+        # erased on submit and the message lands as a `●` preview row.
+        print(f"\n{'─' * 40}\n● {text}", flush=True)
+        await self.submit(text)
+        return True
+
     async def run(self, query=None, *, oneshot=False):
         self.quiet = self.quiet or oneshot
         self.finite = oneshot
@@ -611,14 +686,8 @@ class GatewayChatView:
                         text = (await self._read_line(prompt, prompt_symbol)).strip()
                         if not text:
                             continue
-                        if text.startswith("/"):
-                            if not await self.command(text):
-                                return 0
-                        else:
-                            # Same scrollback shape as the in-process CLI: the typed prompt line is
-                            # erased on submit and the message lands as a `●` preview row.
-                            print(f"\n{'─' * 40}\n● {text}", flush=True)
-                            await self.submit(text)
+                        if not await self._dispatch_prompt_line(text):
+                            return 0
                     except KeyboardInterrupt:
                         print("Use /stop to interrupt execution, /quit to detach.")
                     except EOFError:

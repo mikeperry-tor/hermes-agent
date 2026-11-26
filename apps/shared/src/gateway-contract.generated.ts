@@ -4845,6 +4845,19 @@ export interface CanonicalShellExecParams {
   command: string
   profile?: string | null
 }
+export interface ShellCwdParams {
+  session_id: string
+  profile?: string | null
+  executor?: boolean
+}
+export interface ShellCwdResult {
+  environment: 'executor' | 'gateway'
+  cwd: string | null
+}
+export interface ShellCancelParams {
+  session_id: string
+  profile?: string | null
+}
 export interface PromptReceiptParams {
   session_id: string
   admission_id: string
@@ -7298,7 +7311,11 @@ export interface CanonicalRpcMethods {
   'session.steer': { params: CanonicalCorrectionParams; result: CanonicalCorrectionResult }
   /** One page of a stored conversation's display rows across its compression lineage (live rows and rows a compaction archived, each logical message once, and each compaction handoff as a `row_kind: 'compaction'` row at its position), from the oldest or the newest. Never attaches the caller. A page holds at most `limit` (1-500) rows, compaction rows included, plus up to 64 tool results of the call at its edge, and at most 2 MiB of JSON, cut between tool groups (a single larger row keeps only its role, kind, time, ids and the head of its text, and carries `truncated`). Oldest order: read on until a page is empty, then poll with the same `next_cursor` for the rows written since; `reset: true` means the rows the cursor covered changed shape, so the reply starts again from the first page. Latest order: read on until `next_cursor` is null; its cursor stays valid across later compactions and turns. A rotated lineage past `sessions.max_resume_messages` pages only its current segment (a cursor from before it crossed, or a latest-order cursor from before a compaction rotated that segment, answers `reset: true`). With `subagent_id`: a delegated child of the session (running: through the parent's roster; finished: through its stored row, when its ancestry reaches this conversation); a foreign or unknown child is `available: false`. Refusals: invalid_params (a cursor issued for another session, child or order, or not by this read), not_found, permission_denied, profile_mismatch. */
   'session.transcript': { params: StoredTranscriptParams; result: StoredTranscriptResult }
-  /** Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one safe command for a local session, in its frozen launch cwd (``gateway/session_shell.py``). */
+  /** Cancel pending shell commands that this WebSocket submitted for the session. */
+  'shell.cancel': { params: ShellCancelParams; result: EmptyResult }
+  /** Read the session owner's directory for a managed local operator shell. */
+  'shell.cwd': { params: ShellCwdParams; result: ShellCwdResult }
+  /** Run one approved shell command for a local session with the owner's terminal placement. */
   'shell.exec': { params: CanonicalShellExecParams; result: ShellExecResult }
   /** Adopt a registered execution after verifying the live producer claim. */
   'worker.adopt': { params: WorkerScopeParams; result: WorkerExecution }
@@ -7359,6 +7376,8 @@ export const CANONICAL_RPC_METHODS = [
   'session.stats',
   'session.steer',
   'session.transcript',
+  'shell.cancel',
+  'shell.cwd',
   'shell.exec',
   'worker.adopt',
   'worker.persist',

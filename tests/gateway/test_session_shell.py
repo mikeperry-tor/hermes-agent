@@ -34,6 +34,8 @@ def test_shell_exec_runs_in_the_session_cwd_behind_the_safety_gates(tmp_path):
     assert ran['stderr'] == 'key=', receipt
     assert receipt['dangerous'].get('message') == 'dangerous_command', receipt
     assert receipt['sessionless'] == 4001, receipt
+    assert receipt['cancellation']['cancel']['result'] == {}
+    assert receipt['cancellation']['long-command']['error']['message'] == 'command_interrupted'
 
 
 @pytest.mark.asyncio
@@ -74,3 +76,64 @@ async def test_shell_exec_refusal_names_a_sandboxed_terminal_backend(tmp_path, m
         terminal['TERMINAL_ENV'] = 'local'
         ran = await call()
         assert ran.get('result', {}).get('stdout', '').strip() == 'ran', ran
+
+
+@pytest.mark.asyncio
+async def test_managed_code_shell_uses_owning_route_and_requires_native_operator(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from gateway import session_local, session_policy, session_shell
+    from hermes_cli.managed_operator_shell import Placement
+    from persistence.core.errors import AuthorityRefusal
+    from tools.terminal_tool import clear_session_cwd, record_session_cwd
+
+    managed = Placement('executor', {})
+    monkeypatch.setattr(session_shell, 'placement', lambda: managed)
+    monkeypatch.setattr(session_local, 'authorize_local_source', lambda runner, source: True)
+    monkeypatch.setattr(session_policy, 'policy_for_source', lambda runner, source: SimpleNamespace(
+        cwd='/owner-cwd', terminal_json='{"TERMINAL_ENV":"ssh"}'))
+    monkeypatch.setattr('gateway.session_busy_controls.authorize', lambda *args: None)
+    calls = []
+
+    async def run(placement, cmd, cwd, *, timeout):
+        calls.append((placement, cmd, cwd, timeout))
+        return subprocess.CompletedProcess([], 4, 'stdout', 'stderr')
+
+    monkeypatch.setattr(session_shell, 'run_executor_async', run)
+    authority = SimpleNamespace(sessions={'stored-id': SimpleNamespace(source=object(), route='actual-route')},
+                                runner=object(), profile_id=str(tmp_path), _require_admission_open=lambda: None)
+    actor = SimpleNamespace(capabilities={'session:operator'})
+    connection = SimpleNamespace(authority=authority, actor=actor, native_owner=False)
+    params = {'session_id': 'stored-id', 'command': 'pwd'}
+    ref = SimpleNamespace(session_id='stored-id')
+    record_session_cwd('stored-id', '/wrong')
+    record_session_cwd('actual-route', '/literal ${name}')
+    try:
+        with pytest.raises(AuthorityRefusal, match='permission_denied'):
+            await session_shell.shell_exec(connection, ref, params)
+        assert calls == []
+        connection.native_owner = True
+        result = await session_shell.shell_exec(connection, ref, params)
+        managed = Placement('gateway', {})
+        assert await session_shell.shell_cwd(connection, ref, {}) == {'environment': 'gateway', 'cwd': '/owner-cwd'}
+        assert await session_shell.shell_cwd(connection, ref, {'executor': True}) == {
+            'environment': 'gateway', 'cwd': '/literal ${name}'}
+        monkeypatch.setattr('tools.file_tools_paths.managed_ssh_workspace_roots', lambda: ('/workspace',), raising=False)
+        assert await session_shell.shell_cwd(connection, ref, {}) == {
+            'environment': 'gateway', 'cwd': str(tmp_path)}
+        local = await session_shell.shell_exec(connection, ref, params)
+        assert local['stdout'].strip() == str(tmp_path.resolve())
+        def unavailable_roots():
+            raise ValueError('managed executor roots are unavailable')
+
+        monkeypatch.setattr('tools.file_tools_paths.managed_ssh_workspace_roots', unavailable_roots, raising=False)
+        assert await session_shell.shell_cwd(connection, ref, {}) == {
+            'environment': 'gateway', 'cwd': str(tmp_path)}
+        assert (await session_shell.shell_exec(connection, ref, params))['stdout'].strip() == str(tmp_path.resolve())
+        with pytest.raises(AuthorityRefusal, match='invalid_params'):
+            await session_shell.shell_cwd(connection, ref, {'executor': 'true'})
+    finally:
+        clear_session_cwd('stored-id')
+        clear_session_cwd('actual-route')
+    assert calls == [(Placement('executor', {}), 'pwd', '/literal ${name}', session_shell.TIMEOUT_SECONDS)]
+    assert result == {'code': 4, 'stdout': 'stdout', 'stderr': 'stderr'}

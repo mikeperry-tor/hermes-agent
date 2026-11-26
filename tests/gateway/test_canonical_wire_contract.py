@@ -27,7 +27,7 @@ def test_every_canonical_verb_has_a_declared_contract(owner):
     ``CANONICAL_METHODS`` declaration, so it is rendered into the generated TypeScript and
     OpenRPC; and no canonical declaration outlives its handler."""
     connection, _ = owner
-    served = set(connection.handlers()) | set(GROUP_METHODS) | {'profiles.list'}
+    served = set(connection.handlers()) | set(GROUP_METHODS) | {'profiles.list', 'shell.cancel'}
     assert sorted(served - set(METHODS) - set(CANONICAL_METHODS)) == []
     assert sorted(set(CANONICAL_METHODS) - served) == []
 
