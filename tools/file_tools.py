@@ -425,7 +425,7 @@ def _special_file_kind(path) -> str | None:
 
 
 def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str,
-                             file_ops: ShellFileOperations, *, ssh_state: SSHPathState | None = None,
+                             file_ops: ShellFileOperations | None = None, *, ssh_state: SSHPathState | None = None,
                              ssh_secret_file: bool = False) -> str | None:
     """Render an extractable document (.docx/.xlsx/.pdf/...) as paginated text.
 
@@ -448,6 +448,8 @@ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task
     wrapped, wrap_width = False, 0
     if not (archived or is_extractable_document(str(_resolved))):
         return None
+    if file_ops is None:
+        file_ops = _get_file_ops(task_id)
     if archived and (sync_manager := getattr(getattr(file_ops, "env", None), "_sync_manager", None)) is not None:
         # A file-synced sandbox gets new cache files on its next (rate-limited) sync; an archive written since
         # must be there before this read, or the model is told it expired.
