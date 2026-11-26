@@ -419,6 +419,10 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     if not script or not script.strip():
         return None
 
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return None  # Job creation and edits validate both scripts on the executor.
+
     from hermes_constants import get_hermes_home
     raw = script.strip()
     scripts_dir = get_hermes_home() / "scripts"

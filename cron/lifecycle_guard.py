@@ -1092,9 +1092,14 @@ def _expand_candidate_path(candidate: str) -> Optional[Path]:
         return None
 
 
-def _resolved_or_nothing(candidate: str, cwd: Optional[str]) -> Iterator[Path]:
+def _resolved_or_nothing(candidate: str, cwd: Optional[str], remote_home: Optional[str] = None) -> Iterator[Path]:
     """Yield *candidate* anchored on *cwd* (or the process cwd) when it is a real path."""
-    path = _expand_candidate_path(candidate)
+    if remote_home is None:
+        path = _expand_candidate_path(candidate)
+    elif not candidate or "\x00" in candidate or (candidate.startswith("~") and not candidate.startswith("~/")):
+        path = None
+    else:
+        path = Path(remote_home) / candidate[2:] if candidate.startswith("~/") else Path(candidate)
     if path is None:
         return
     if not path.is_absolute():
@@ -1148,7 +1153,7 @@ def _iter_option_values(segment: list[str], start: int, option: str) -> Iterator
             yield token[len(prefix):]
 
 
-def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterator[Path]:
+def _references_at(segment: list[str], index: int, cwd: Optional[str], remote_home: Optional[str]) -> Iterator[Path]:
     """Yield the scripts the token at *index* executes, if any."""
     if index >= len(segment):
         return
@@ -1157,7 +1162,7 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
 
     if executable_name in {".", "source"}:
         if len(segment) > index + 1:
-            yield from _resolved_or_nothing(segment[index + 1], cwd)
+            yield from _resolved_or_nothing(segment[index + 1], cwd, remote_home)
         return
 
     if executable_name in _SHELL_EXECUTABLES:
@@ -1178,16 +1183,16 @@ def _references_at(segment: list[str], index: int, cwd: Optional[str]) -> Iterat
                 continue
             break
         if arg_index < len(arguments) and arguments[arg_index] not in _SHELL_COMMAND_FLAGS:
-            yield from _resolved_or_nothing(arguments[arg_index], cwd)
+            yield from _resolved_or_nothing(arguments[arg_index], cwd, remote_home)
         return
 
     # A bare "/" is pathlib's division operator in Python sources, not an executable; resolving it
     # hits the filesystem root and fails the regular-file check, hard-blocking innocent .py scripts.
     if executable.strip("/") and ("/" in executable or executable.endswith((".sh", ".bash", ".zsh"))):
-        yield from _resolved_or_nothing(executable, cwd)
+        yield from _resolved_or_nothing(executable, cwd, remote_home)
 
 
-def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -> Iterator[Path]:
+def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None, remote_home: Optional[str] = None) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
     a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
@@ -1195,10 +1200,10 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
+        yield from _references_at(segment, index, cwd, remote_home)
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+            yield from _references_at(segment, peeled, cwd, remote_home)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -1246,7 +1251,8 @@ def _heredoc_write_targets(unit: str) -> Iterator[str]:
 
 
 def _collect_heredoc_written_scripts(
-    command: str, cwd: Optional[str], written: Optional[dict[Path, list[str]]],
+    command: str, cwd: Optional[str], written: Optional[dict[Path, list[str]]], *, resolve=_resolve_lenient,
+    remote_home: Optional[str] = None,
 ) -> dict[Path, list[str]]:
     """Add every body a heredoc in *command* writes to a path to *written*. The file does not exist
     yet when the guard runs, so a later ``bash P`` / ``systemd-run P`` can only be scanned through
@@ -1257,20 +1263,20 @@ def _collect_heredoc_written_scripts(
     written = {} if written is None else written
     for unit, body in iter_heredoc_bodies(command):
         for target in _heredoc_write_targets(unit):
-            for path in _resolved_or_nothing(target, cwd):
-                bodies = written.setdefault(_resolve_lenient(path), [])
+            for path in _resolved_or_nothing(target, cwd, remote_home):
+                bodies = written.setdefault(resolve(path), [])
                 if body not in bodies:
                     bodies.append(body)
     return written
 
 
-def _walk_candidates(command: str, walk_command: str, cwd: Optional[str], executed: bool) -> list[tuple[Path, bool]]:
+def _walk_candidates(command: str, walk_command: str, cwd: Optional[str], executed: bool, remote_home: Optional[str]) -> list[tuple[Path, bool]]:
     """Referenced-script candidates: executed-view paths first, then paths only mentioned in masked
     bodies. A heredoc body written to a candidate path is that script's text (see the walk); a body
     that is only written stays documentation (#88336)."""
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd, remote_home=remote_home)]
     if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd, remote_home=remote_home)]
     return candidates
 
 
@@ -1432,7 +1438,7 @@ def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
     written: Optional[dict[Path, list[str]]] = None, charge: bool = True,
-    gateway_pid: Optional[int] = None,
+    gateway_pid: Optional[int] = None, remote_only: bool = False, remote_home: Optional[str] = None,
 ) -> bool:
     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
@@ -1446,13 +1452,15 @@ def _contains_unsafe_gateway_action(
     if not budget.charge_text(command, written_body=not charge):
         return _budget_exhausted(budget, "text", depth) if executed else False
     # Before the PID check: a kill payload it rescans (`sh -c 'bash P'`) resolves P to its written body.
-    written = _collect_heredoc_written_scripts(command, cwd, written)
+    from posixpath import normpath
+    resolve = (lambda path: Path(normpath(str(path)))) if remote_only else _resolve_lenient
+    written = _collect_heredoc_written_scripts(command, cwd, written, resolve=resolve, remote_home=remote_home)
 
     def recurse(text: str, cwd: Optional[str], executed: bool, charge: bool = True) -> bool:
         return _contains_unsafe_gateway_action(
             text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
             read_remote_script=read_remote_script, executed=executed, written=written,
-            charge=charge, gateway_pid=gateway_pid,
+            charge=charge, gateway_pid=gateway_pid, remote_only=remote_only, remote_home=remote_home,
         )
 
     if _direct_lifecycle_scan(command) or (
@@ -1482,11 +1490,12 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    for script_path, candidate_executed in _walk_candidates(command, walk_command, cwd, executed):
-        if _scan_written_bodies(written.pop(_resolve_lenient(script_path), []), recurse, cwd, candidate_executed):
+    for script_path, candidate_executed in _walk_candidates(command, walk_command, cwd, executed, remote_home):
+        resolved = resolve(script_path)
+        if _scan_written_bodies(written.pop(resolved, []), recurse, cwd, candidate_executed):
             return True
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
-        if _on_cloud_path(script_path):
+        if not remote_only and _on_cloud_path(script_path):
             if candidate_executed:
                 return _refuse_unreadable(
                     budget, script_path,
@@ -1494,7 +1503,6 @@ def _contains_unsafe_gateway_action(
                     "~/Library/CloudStorage) that the guard refuses to open",
                 )
             continue
-        resolved = _resolve_lenient(script_path)
         if resolved in visited:
             continue
         if not budget.charge_path():
@@ -1504,7 +1512,8 @@ def _contains_unsafe_gateway_action(
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
-        script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+        script_text, unsafe = (None, False) if remote_only else _read_referenced_script(
+            script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
             if candidate_executed:
                 return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
@@ -1517,7 +1526,7 @@ def _contains_unsafe_gateway_action(
                     return _budget_exhausted(budget, "remote reads", depth)
                 break
             script_text, unsafe = _sanitize_remote_script_text(
-                read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
+                read_remote_script(str(resolved if remote_only else script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
                 if candidate_executed:
@@ -1530,7 +1539,8 @@ def _contains_unsafe_gateway_action(
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.
-        if recurse(script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed):
+        directory = str(resolved.parent) if remote_only else (_resolve_script_directory(str(resolved)) or cwd)
+        if recurse(script_text, directory, candidate_executed):
             return True
     return False
 
@@ -1538,7 +1548,7 @@ def _contains_unsafe_gateway_action(
 def scan_gateway_lifecycle(
     command: str, *, cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
-    gateway_pid: Optional[int] = None,
+    gateway_pid: Optional[int] = None, remote_only: bool = False, remote_home: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """``(unsafe, refusal)``: *refusal* names a non-lifecycle reason the walk failed closed (budget,
     size, device, live SQLite, cloud) so callers can tell the model; ``None`` when the verdict is a
@@ -1558,10 +1568,12 @@ def scan_gateway_lifecycle(
     try:
         unsafe = _contains_unsafe_gateway_action(
             command, cwd=cwd, depth=0, visited=set(), budget=budget,
-            read_remote_script=read_remote_script, gateway_pid=gateway_pid,
+            read_remote_script=read_remote_script, gateway_pid=gateway_pid, remote_only=remote_only, remote_home=remote_home,
         )
         return unsafe, budget.refusal if unsafe else None
-    except Exception:
+    except Exception as exc:
+        if remote_only:
+            return True, str(exc)
         logger.warning(
             "lifecycle guard referenced-script walk failed; "
             "falling back to direct-scan verdict",
@@ -1586,11 +1598,50 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     return scan_gateway_lifecycle(command, cwd=cwd, read_remote_script=read_remote_script)[0]
 
 
-def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None) -> None:
+def _check_managed_cron_lifecycle(prompt, script, workdir):
+    from cron.executor_script import managed_script_source
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    text = prompt or ""
+    if not script and not workdir:
+        if _lifecycle_command_scan_with_data_exemption(text):
+            raise GatewayLifecycleBlocked("Blocked: cron jobs cannot run gateway lifecycle commands.")
+        return
+    try:
+        primary, reference, default_cwd, remote_home = managed_script_source()
+        if script:
+            path, contents = primary(script)
+            text = f"{text}\n{contents}"
+            if Path(path).suffix == ".py":
+                if _lifecycle_command_scan_with_data_exemption(text):
+                    raise GatewayLifecycleBlocked("Blocked: cron jobs cannot run gateway lifecycle commands.")
+                return
+            default_cwd = str(Path(path).parent)
+        unsafe, refusal = scan_gateway_lifecycle(text, cwd=workdir or default_cwd,
+                                                read_remote_script=reference, remote_only=True, remote_home=remote_home)
+    except SshWorkspaceFsError as exc:
+        raise GatewayLifecycleBlocked(f"Could not inspect the cron script on the SSH executor. {exc}") from exc
+    if unsafe:
+        raise GatewayLifecycleBlocked(refusal or "Blocked: cron jobs cannot run gateway lifecycle commands.")
+
+
+def check_job_gateway_lifecycle(prompt, script, monitor_script, *, workdir=None):
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    check_gateway_lifecycle(prompt, script or monitor_script, workdir=workdir)
+    if script and monitor_script and monitor_script != script and uses_managed_executor():
+        check_gateway_lifecycle(None, monitor_script, workdir=workdir)
+
+
+def check_gateway_lifecycle(prompt: Optional[str], script: Optional[str] = None, *,
+                            workdir: Optional[str] = None) -> None:
     """Raise ``GatewayLifecycleBlocked`` if *prompt* or *script* contains a gateway-lifecycle
     command. The script is read from disk and concatenated with the prompt so a command cannot slip
     through by being split across the two. Callers let the ``ValueError``-shaped exception
     propagate."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+    if uses_managed_executor():
+        return _check_managed_cron_lifecycle(prompt, script, workdir)
     combined = prompt or ""
     python_script = False
     refusal: Optional[str] = None

@@ -20,12 +20,15 @@ def _send_media_via_adapter(
     from cron.scheduler_delivery import _note_target_error
     from cron import scheduler_script as _script
     from gateway.platforms.base import (
-        BasePlatformAdapter, should_send_media_as_audio, validate_media_delivery_path)
+        BasePlatformAdapter, _managed_media_delivery, should_send_media_as_audio, validate_media_delivery_path)
     from agent.async_utils import safe_schedule_threadsafe
     job_ref = {"id": job.get("id", "?")}
     errors: list = []
     requested = [(str(p), v) for p, v in (media_files or [])]
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if _managed_media_delivery():
+        media_files = [(checked, voice) for path, voice in media_files if (checked := validate_media_delivery_path(path))]
+    else:
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Report paths the safety filter dropped (missing file, denied prefix, strict-mode miss).
     kept = {p for p, _ in media_files}
     for raw_path, _v in requested:

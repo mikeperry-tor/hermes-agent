@@ -1452,7 +1452,11 @@ def _run_cron_cleanup_with_timeout(
 
 def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
     """Configured job workdir, or None when unset / no longer a directory (logged)."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+
     workdir = (job.get("workdir") or "").strip() or None
+    if uses_managed_executor():
+        return workdir
     if workdir and not Path(workdir).is_dir():
         logger.warning(
             "Job '%s': configured workdir %r no longer exists — running without it",
@@ -1517,7 +1521,7 @@ def _run_no_agent_job(
 
 
 def _apply_monitor_gate(
-    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str],
+    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event=None,
 ) -> tuple[Optional[tuple], Optional[str], Optional[str]]:
     """Monitor gate (hash-suppressed change detection). Must run BEFORE any agent machinery so an
     unchanged tick costs no LLM/delivery. Returns ``(early_result | None, extra_prompt,
@@ -1528,7 +1532,7 @@ def _apply_monitor_gate(
 
     if not job_has_monitor(job):
         return None, extra_prompt, None
-    _mon = check_monitor(job)
+    _mon = check_monitor(job, cancel_event)
     _mon_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, _mon_now, "monitor")
     if not _mon.ok:
@@ -2218,7 +2222,7 @@ def _prepare_job_prompt(
     if job_payload_is_empty(job):
         return _block_and_pause_job(job_id, job_name, EMPTY_PAYLOAD_ERROR), None
 
-    _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
+    _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt, cancel_event)
     if _early is not None:
         return _early, None
 
@@ -2297,13 +2301,15 @@ class _CronRunScope:
     driving the agent. Delivery reads job["origin"] / HERMES_CRON_AUTO_DELIVER_* directly.
     """
 
-    def __init__(self, job: dict, job_id: str, execution_id: Optional[str]):
+    def __init__(self, job: dict, job_id: str, execution_id: Optional[str], executor_project=None):
         from gateway.session_context import set_session_vars, _VAR_MAP
         from tools.terminal_tool import record_session_cwd
 
         self._var_map = _VAR_MAP
         # Resolve workdir BEFORE set_session_vars so it owns the _SESSION_CWD set/clear.
-        self.workdir = _resolve_job_workdir(job, job_id)
+        self.workdir = executor_project[0] if executor_project is not None else _resolve_job_workdir(job, job_id)
+        self._executor_terminal = executor_project[1] if executor_project is not None else None
+        self._terminal_token = None
         self._ctx_tokens = set_session_vars(
             platform="",
             chat_id="",
@@ -2335,6 +2341,9 @@ class _CronRunScope:
         self._spend_token = None
 
     def enter(self) -> None:
+        if self._executor_terminal is not None:
+            from agent.runtime_scope import bind_terminal_policy
+            self._terminal_token = bind_terminal_policy(self._executor_terminal, profile_home=_get_hermes_home())
         # Scope cron approval policy; exit() RESETS via token (pinning "" would suppress the legacy
         # os.environ fallback used by standalone entrypoints/tests).
         self._cron_session_token = self._cron_session_var.set("1")
@@ -2350,8 +2359,11 @@ class _CronRunScope:
     def exit(self) -> None:
         from gateway.session_context import clear_session_vars
         from tools.terminal_tool import clear_session_cwd
+        from tools.terminal_scope import reset_terminal_scope
 
         clear_session_cwd(self.task_id)
+        if self._terminal_token is not None:
+            reset_terminal_scope(self._terminal_token)
         clear_session_vars(self._ctx_tokens)  # also clears _SESSION_CWD
         if self._cron_session_token is not None:
             self._cron_session_var.reset(self._cron_session_token)
@@ -2539,6 +2551,13 @@ def run_job(
     _worker_state: dict = {}
     scope = None
     try:
+        from cron.executor_workspace import executor_workdir
+        requested_workdir = (job.get("workdir") or "").strip()
+        try:
+            executor_project = executor_workdir(requested_workdir) if requested_workdir else None
+        except ValueError as exc:
+            return False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc)
+
         early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
         if early is not None:
             return early
@@ -2546,7 +2565,7 @@ def run_job(
 
         logger.info("Running job '%s' (ID: %s)", job_name, job_id)
         logger.info("Prompt: %s", prompt[:100])
-        scope = _CronRunScope(job, job_id, execution_id)
+        scope = _CronRunScope(job, job_id, execution_id, executor_project=executor_project)
         scope.enter()
         if scope.workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, scope.workdir)
@@ -2570,6 +2589,18 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if uses_managed_executor() and not result.get("failed"):
+            from gateway.run import _collect_auto_append_media_tags
+            tags, voice = _collect_auto_append_media_tags(result.get("messages") or [])
+            from gateway.media_repair import tool_produced_media_paths
+
+            job["_delivery_producers"] = tool_produced_media_paths(tags, result.get("messages") or [])
+            from tools.terminal_tool import get_session_cwd
+
+            job["_delivery_cwd"] = get_session_cwd(scope.task_id) or scope.workdir
+            if tags and "MEDIA:" not in final_response and not _is_cron_silence_response(final_response):
+                final_response = "\n".join([final_response, *(["[[audio_as_voice]]"] if voice else []), *tags])
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
@@ -3979,6 +4010,8 @@ def _worktree_maintenance_repos() -> list[str]:
     """Repos whose ``.worktrees/`` to keep pruned: the hermes checkout, job workdir repo roots and
     every repo this profile created a worktree in (``worktree_registry``), filtered to those that
     actually have a ``.worktrees/`` dir."""
+    from cron.scheduler_worktree_maintenance import local_job_worktree_repos
+    from hermes_cli.main_resume_args import uses_managed_executor
     repos: set = set()
 
     with contextlib.suppress(Exception):
@@ -3991,23 +4024,9 @@ def _worktree_maintenance_repos() -> list[str]:
         if (install_root / ".git").exists():
             repos.add(str(install_root))
 
-    with contextlib.suppress(Exception):
-        from cron.jobs import load_jobs
-        from hermes_platform.resolver.git import resolve_usable_git
-
-        for job in load_jobs() if (git := resolve_usable_git()) else ():
-            workdir = str(job.get("workdir") or "").strip()
-            if not workdir or not Path(workdir).is_dir():
-                continue
-            try:
-                probe = subprocess.run(
-                    [git, "-C", workdir, "rev-parse", "--show-toplevel"],
-                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False)
-                if probe.returncode == 0 and probe.stdout.strip():
-                    repos.add(probe.stdout.strip())
-            except Exception:
-                continue
-
+    if not uses_managed_executor():
+        with contextlib.suppress(Exception):
+            repos.update(local_job_worktree_repos())
     return [r for r in sorted(repos) if (Path(r) / ".worktrees").is_dir()]
 
 

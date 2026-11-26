@@ -15,6 +15,8 @@ own ``cron-worktree-prune`` thread. Those threads used to fork ``git`` side by s
 
 import logging
 import os
+from pathlib import Path
+import subprocess
 import threading
 import time
 from typing import Callable, Iterable, Optional
@@ -28,6 +30,31 @@ SWEEP_WAIT_SECONDS = 120.0
 _sweep_slot = threading.Semaphore(1)
 _last_worktree_prune_at: dict[str, float] = {}  # canonical repo path -> monotonic stamp
 _lock = threading.Lock()
+
+
+def local_job_worktree_repos() -> list[str]:
+    """Find local Git roots for jobs with an explicit workdir."""
+    from cron.jobs import load_jobs
+    from hermes_platform.resolver.git import resolve_usable_git
+
+    git = resolve_usable_git()
+    if not git:
+        return []
+    repos = []
+    for job in load_jobs():
+        workdir = str(job.get("workdir") or "").strip()
+        if not workdir or not Path(workdir).is_dir():
+            continue
+        try:
+            probe = subprocess.run(
+                [git, "-C", workdir, "rev-parse", "--show-toplevel"], capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=5, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip():
+            repos.append(probe.stdout.strip())
+    return repos
 
 
 def claim_sweep_slot(wait_seconds: Optional[float] = None) -> bool:

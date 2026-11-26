@@ -1782,32 +1782,41 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
+    from gateway.platforms.base import BasePlatformAdapter, _managed_media_delivery
+    managed = _managed_media_delivery()
+    media_files, body = BasePlatformAdapter.extract_media(content) if managed else ([], content)
     if wrap_response:
         task_name = job.get("name", job["id"])
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job.get('id', '')})\n"
             f"-------------\n\n"
-            f"{content}\n\n"
+            f"{body}\n\n"
             "To stop or manage this job, send me a new message "
             f"(e.g. \"stop reminder {task_name}\")."
         )
     else:
-        delivery_content = content
+        delivery_content = body
 
-    from gateway.platforms.base import BasePlatformAdapter
     # Bridge media-policy config into the env vars the path validator reads. The gateway does this
     # at boot; standalone runs (`hermes cron run`) did not, silently dropping files. Idempotent.
     from gateway.media_policy import apply_media_policy_env
     apply_media_policy_env(user_cfg)
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    if managed:
+        cleaned_delivery_content = delivery_content
+    else:
+        media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     # Redact at this single chokepoint, BEFORE the live-adapter / standalone send lanes below.
     # Shell-job stdout/stderr is already redacted where it is captured, but an LLM cron job's
     # response text reaches delivery unscanned — so a job that surfaced a credential (echoed a
     # failing curl with an API key, summarised a config file) sent it verbatim to the chat.
     cleaned_delivery_content = _redact_cron_payload(cleaned_delivery_content, "delivery content")
     requested_media = len(media_files)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if managed:
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(
+            media_files, approved=job.get("_delivery_producers") or (), cwd=job.get("_delivery_cwd") or job.get("workdir"))
+    else:
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Policy-dropped attachments will never be sent on ANY lane — record them in run status.
     _policy_dropped = requested_media - len(media_files)
     policy_drop_errors = [
