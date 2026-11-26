@@ -12,7 +12,7 @@ import subprocess
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable
 
 from agent.file_safety import HOME_CREDENTIAL_DIRS, deny_key, deny_path_under
@@ -208,11 +208,13 @@ def parse_context_references(message: str, *, plugins: bool = True) -> list[Cont
 
 def preprocess_context_references(
     message: str, *, cwd: str | Path, context_length: int, url_fetcher: UrlFetcher = None,
-    allowed_root: str | Path | None = None,
+    allowed_root: str | Path | None = None, terminal_policy: dict | None = None,
+    attachment_session_id: str | None = None,
 ) -> ContextReferenceResult:
     """Sync wrapper; safe both without a loop (CLI) and inside a running loop (gateway)."""
     coro = preprocess_context_references_async(
-        message, cwd=cwd, context_length=context_length, url_fetcher=url_fetcher, allowed_root=allowed_root
+        message, cwd=cwd, context_length=context_length, url_fetcher=url_fetcher, allowed_root=allowed_root,
+        terminal_policy=terminal_policy, attachment_session_id=attachment_session_id,
     )
     try:
         asyncio.get_running_loop()
@@ -228,7 +230,8 @@ def preprocess_context_references(
 
 async def preprocess_context_references_async(
     message: str, *, cwd: str | Path, context_length: int, url_fetcher: UrlFetcher = None,
-    allowed_root: str | Path | None = None, plugins: bool = True,
+    allowed_root: str | Path | None = None, plugins: bool = True, terminal_policy: dict | None = None,
+    attachment_session_id: str | None = None,
 ) -> ContextReferenceResult:
     refs = parse_context_references(message, plugins=plugins)
     if not refs:
@@ -237,9 +240,17 @@ async def preprocess_context_references_async(
     if refusal := host_feature_refusal("context_references", "@-references"):
         return ContextReferenceResult(message=message, original_message=message, references=refs,
                                       warnings=[refusal], blocked=True)
-    cwd_path = Path(cwd).expanduser().resolve()
-    # Default root = cwd so @ references cannot escape the workspace unless a caller widens it.
-    allowed_root_path = Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
+    workspace, cwd_path, allowed_root_path = None, None, None
+    if any(_uses_workspace(ref) for ref in refs[:_MAX_EXPANDED_REFERENCES]):
+        from agent.ssh_context_references import reference_workspace
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+        try:
+            workspace = await asyncio.to_thread(reference_workspace, terminal_policy)
+        except SshWorkspaceFsError as exc:
+            workspace = exc
+        if workspace is None:
+            cwd_path = Path(cwd).expanduser().resolve()
+            allowed_root_path = Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
     # Expand concurrently (each ref is independent; several @url: refs would otherwise
     # serialize web_extract round-trips). gather preserves order, so warnings/blocks
     # are assembled in ref order; the token-budget check runs once afterwards.
@@ -247,7 +258,7 @@ async def preprocess_context_references_async(
     soft_limit = max(1, int(context_length * 0.25))
     tasks = (
         _expand_reference(ref, cwd_path, url_fetcher=url_fetcher, allowed_root=allowed_root_path,
-                          max_inline_tokens=hard_limit)
+                          max_inline_tokens=hard_limit, workspace=workspace, attachment_session_id=attachment_session_id)
         for ref in refs[:_MAX_EXPANDED_REFERENCES]
     )
     expanded = await asyncio.gather(*tasks)
@@ -290,11 +301,20 @@ _GIT_REFERENCE_ARGS: dict[str, Callable[[ContextReference], list[str]]] = {
 }
 
 
+def _uses_workspace(ref: ContextReference) -> bool:
+    return ref.kind in ("file", "folder") or ref.kind in _GIT_REFERENCE_ARGS
+
+
 async def _expand_reference(
-    ref: ContextReference, cwd: Path, *, url_fetcher: UrlFetcher = None, allowed_root: Path | None = None,
-    max_inline_tokens: int | None = None,
+    ref: ContextReference, cwd: Path | None, *, url_fetcher: UrlFetcher = None,
+    allowed_root: Path | None = None, max_inline_tokens: int | None = None, workspace=None,
+    attachment_session_id: str | None = None,
 ) -> Expansion:
     try:
+        if workspace is not None and _uses_workspace(ref):
+            from agent.ssh_context_references import expand_workspace_reference
+            return await asyncio.to_thread(expand_workspace_reference, ref, workspace, max_inline_tokens,
+                                           attachment_session_id)
         if ref.kind in ("file", "folder"):
             return _expand_path_reference(ref, cwd, allowed_root=allowed_root, max_inline_tokens=max_inline_tokens)
         if ref.kind in _GIT_REFERENCE_ARGS:
@@ -406,7 +426,8 @@ def _read_file_reference(
     return None, text
 
 
-def _format_file_reference(ref: ContextReference, path: Path, text: str, max_inline_tokens: int | None) -> Expansion:
+def _format_file_reference(ref: ContextReference, path: Path | PurePosixPath, text: str,
+                           max_inline_tokens: int | None, *, remote_size: int | None = None) -> Expansion:
     lang = _FENCE_LANGUAGES.get(path.suffix.lower(), "")
     text_tokens = estimate_tokens_rough(text)
     # Check BEFORE building the fenced block: an oversized file is not going to be
@@ -416,7 +437,7 @@ def _format_file_reference(ref: ContextReference, path: Path, text: str, max_inl
         # turn (#61987); the file stays readable via the agent's tools instead. The
         # block alone carries the message (same shape as the binary path) — a warning
         # would duplicate it in "--- Context Warnings ---".
-        return None, _oversized_text_reference_block(ref, path, text_tokens)
+        return None, _oversized_text_reference_block(ref, path, text_tokens, remote_size=remote_size)
     return None, f"📄 {ref.raw} ({text_tokens} tokens)\n```{lang}\n{text}\n```"
 
 
@@ -486,7 +507,11 @@ def _expand_git_reference(ref: ContextReference, cwd: Path, args: list[str], lab
         return f"{ref.raw}: git command timed out (30s)", None
     if result.returncode != 0:
         return f"{ref.raw}: {(result.stderr or '').strip() or 'git command failed'}", None
-    content = result.stdout.strip() or "(no output)"
+    return _git_reference_block(label, result.stdout)
+
+
+def _git_reference_block(label: str, stdout: str) -> Expansion:
+    content = stdout.strip() or "(no output)"
     return None, f"🧾 {label} ({estimate_tokens_rough(content)} tokens)\n```diff\n{content}\n```"
 
 
@@ -694,20 +719,26 @@ def _agent_visible_path(path: Path) -> str:
         return str(path)
 
 
-def _on_disk_reference_block(ref: ContextReference, path: Path, descriptor: str, reason: str, guidance: str) -> str:
+def _on_disk_reference_block(ref: ContextReference, path: Path | PurePosixPath, descriptor: str,
+                             reason: str, guidance: str, *, remote_size: int | None = None) -> str:
     """Shared 📎 shape: the file was not inlined, but it IS on disk where the agent's
     tools run — hand the model the path and a nudge instead of a dead-end warning."""
-    try:
-        size = format_bytes(path.stat().st_size)
-    except OSError:
-        size = "unknown size"
+    if remote_size is None:
+        try:
+            size = format_bytes(path.stat().st_size)
+        except OSError:
+            size = "unknown size"
+        visible = _agent_visible_path(path)
+    else:
+        size = format_bytes(remote_size)
+        visible = str(path)
     return (
         f"📎 {ref.raw} ({descriptor}, {size}) — {reason} "
-        f"It is available on disk at `{_agent_visible_path(path)}`. {guidance}"
+        f"It is available on disk at `{visible}`. {guidance}"
     )
 
 
-def _binary_reference_block(ref: ContextReference, path: Path) -> str:
+def _binary_reference_block(ref: ContextReference, path: Path | PurePosixPath, *, remote_size: int | None = None) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return _on_disk_reference_block(
         ref, path,
@@ -715,16 +746,19 @@ def _binary_reference_block(ref: ContextReference, path: Path) -> str:
         reason="binary file, not inlined as text.",
         guidance="Use your tools to work with it (read or convert it, extract its text, "
                  "or view/render it as needed); do not tell the user the file type is unsupported.",
+        remote_size=remote_size,
     )
 
 
-def _oversized_text_reference_block(ref: ContextReference, path: Path, text_tokens: int) -> str:
+def _oversized_text_reference_block(ref: ContextReference, path: Path | PurePosixPath, text_tokens: int,
+                                    *, remote_size: int | None = None) -> str:
     return _on_disk_reference_block(
         ref, path,
         descriptor=f"text file, approximately {text_tokens} tokens",
         reason="too large to inline safely.",
         guidance="Use read_file with a narrow line range, search_files, or terminal/code tools "
                  "to inspect only the relevant parts; do not load the entire file into context.",
+        remote_size=remote_size,
     )
 
 

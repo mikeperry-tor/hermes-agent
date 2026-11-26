@@ -66,19 +66,19 @@ def _run(args: list[str], cwd: str, timeout: int = _GIT_TIMEOUT):
     return proc.returncode, proc.stdout
 
 
-def _untracked_files(cwd: str) -> list[str]:
-    code, out = _run(["ls-files", "--others", "--exclude-standard"], cwd)
+def _untracked_files(cwd: str, run) -> list[str]:
+    code, out = run(["ls-files", "--others", "--exclude-standard"], cwd)
     return [line for line in out.splitlines() if line.strip()] if code == 0 else []
 
 
-def _untracked_diff(cwd: str, files: list[str]) -> str:
+def _untracked_diff(cwd: str, files: list[str], run) -> str:
     """Render untracked files as new-file diffs via ``git diff --no-index``."""
     chunks: list[str] = []
     for rel in files[:_MAX_UNTRACKED_FILES]:
         with suppress(subprocess.TimeoutExpired, OSError):
             # --no-index exits 1 when the files differ — that's the success
             # path here, so ignore the return code and keep the output.
-            _, out = _run(
+            _, out = run(
                 ["diff", "--no-ext-diff", "--no-index", "--", os.devnull, rel], cwd,
             )
             if out.strip():
@@ -89,7 +89,7 @@ def _untracked_diff(cwd: str, files: list[str]) -> str:
 
 
 def collect_working_diff(cwd: str, mode: str = "working",
-                         paths: list[str] | None = None) -> dict:
+                         paths: list[str] | None = None, *, run=None) -> dict:
     """Collect a git diff of the working directory.
 
     Returns ``{"success", "stat", "diff", "untracked", "empty"}`` on success or
@@ -97,12 +97,13 @@ def collect_working_diff(cwd: str, mode: str = "working",
     ``paths`` optionally restricts the diff to specific pathspecs (passed
     through to git verbatim, so quoted paths with spaces survive).
     """
+    run = run or _run
     if mode not in VALID_MODES:
         return {"success": False,
                 "error": f"Unknown mode '{mode}'. Use: {', '.join(VALID_MODES)}"}
 
     try:
-        code, _ = _run(["rev-parse", "--is-inside-work-tree"], cwd, timeout=5)
+        code, _ = run(["rev-parse", "--is-inside-work-tree"], cwd, timeout=5)
     except (subprocess.TimeoutExpired, OSError) as e:
         return {"success": False, "error": f"git failed: {e}"}
     if code == 127:
@@ -121,12 +122,12 @@ def collect_working_diff(cwd: str, mode: str = "working",
     base_args = ["diff", "--no-ext-diff", *base_args]
     pathspec = ["--", *paths] if paths else []
     try:
-        stat_code, stat_out = _run([*base_args, "--stat", *pathspec], cwd)
-        diff_code, diff_out = _run([*base_args, *pathspec], cwd, timeout=_GIT_TIMEOUT * 2)
+        stat_code, stat_out = run([*base_args, "--stat", *pathspec], cwd)
+        diff_code, diff_out = run([*base_args, *pathspec], cwd, timeout=_GIT_TIMEOUT * 2)
         if _REFUSED in (stat_code, diff_code):
             return {"success": False, "error": _REFUSED_ERROR}
-        untracked = _untracked_files(cwd) if mode in ("working", "all") and not paths else []
-        untracked_diff = _untracked_diff(cwd, untracked) if untracked else ""
+        untracked = _untracked_files(cwd, run) if mode in ("working", "all") and not paths else []
+        untracked_diff = _untracked_diff(cwd, untracked, run) if untracked else ""
     except subprocess.TimeoutExpired:
         return {"success": False, "error": "git diff timed out."}
     except OSError as e:
@@ -139,3 +140,32 @@ def collect_working_diff(cwd: str, mode: str = "working",
     if not stat and not diff and not untracked:
         result["empty"] = True
     return result
+
+
+def collect_executor_working_diff(cwd, mode="working", paths=None, *, terminal_policy=None):
+    """Read a working-tree diff through the session's pinned SSH workspace."""
+    from agent.ssh_context_references import reference_workspace
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from hermes_cli.web_git_executor import ExecutorGit
+
+    try:
+        workspace = reference_workspace(terminal_policy, directory=cwd)
+        if workspace is None:
+            raise SshWorkspaceFsError("ECONN", "The SSH executor workspace is unavailable.")
+        executor = ExecutorGit(workspace.backend, workspace.grants)
+
+        def run(args, directory, timeout=_GIT_TIMEOUT):
+            if "--no-index" in args:
+                try:
+                    executor.file(directory, args[-1], missing=False)
+                except SshWorkspaceFsError as exc:
+                    if exc.code == "EACCES":
+                        return 1, ""
+                    raise
+            status, output, error = executor.run(directory, ["-c", "core.quotePath=false", *args], timeout)
+            if status and args[0] == "diff" and "--no-index" not in args:
+                raise SshWorkspaceFsError("EIO", error.strip() or "Git could not collect the executor diff.")
+            return status, output
+        return collect_working_diff(workspace.cwd, mode, paths, run=run)
+    except (ValueError, SshWorkspaceFsError) as exc:
+        return {"success": False, "error": str(exc)}

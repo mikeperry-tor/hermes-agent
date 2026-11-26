@@ -437,7 +437,10 @@ def execute(frame, channel):
     agent = None
     turn_done = threading.Event()  # ends forward_activity
     try:
-        with policy_scope(policy, home=frame['home']):
+        with contextlib.ExitStack() as stack:
+            if refusal := _enter_turn_policy(stack, _worker_policy_scope(frame, policy, policy_scope), policy):
+                _finish_turn(channel, controls, store, refusal)
+                return
             agent = _construct_agent(frame, AIAgent, policy, model=policy.model, provider=policy.provider, base_url=policy.base_url,
                 api_key=frame['api_key'], session_db=store, session_id=scope['session_id'],
                 # delegate_task stays offered: each child is reserved by the owner under this
@@ -494,11 +497,7 @@ def execute(frame, channel):
             store.flush_token_counts()
             if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
                 result['final_response'] = ''
-            channel.send('result', result=result_frame(result))
-            if not controls.finish.wait(30):
-                raise ValueError('managed_finish_timeout')
-            store.finish()
-            channel.send('finished')
+            _finish_turn(channel, controls, store, result)
     finally:
         turn_done.set()
         unregister_gateway_notify(frame['route'])
@@ -509,6 +508,38 @@ def execute(frame, channel):
         finally:
             with contextlib.suppress(Exception):  # a failing socket close never replaces the turn's outcome
                 rpc.close()
+
+
+def _worker_policy_scope(frame, policy, policy_scope):
+    from gateway.session_policy import _stored_cwd_is_absolute
+
+    cwd = json.loads(policy.request_json).get('owner_workspace_v1')
+    workspace = None
+    if cwd is not None:
+        if not isinstance(cwd, str) or not _stored_cwd_is_absolute(cwd):
+            raise ValueError('invalid_managed_worker_bootstrap')
+        workspace = cwd, json.loads(policy.terminal_json)
+    return policy_scope(policy, home=frame['home'], verified_workspace=workspace)
+
+
+def _enter_turn_policy(stack, scope, policy):
+    from gateway.session_policy import workspace_unavailable_result
+    from persistence.core.errors import AuthorityRefusal
+    try:
+        stack.enter_context(scope)
+    except AuthorityRefusal as exc:
+        if exc.reason != 'workspace_unavailable':
+            raise
+        return workspace_unavailable_result(policy)
+    return None
+
+
+def _finish_turn(channel, controls, store, result):
+    channel.send('result', result=result_frame(result))
+    if not controls.finish.wait(30):
+        raise ValueError('managed_finish_timeout')
+    store.finish()
+    channel.send('finished')
 
 
 def _construct_agent(frame, factory, policy, **kwargs):

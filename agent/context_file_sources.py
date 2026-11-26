@@ -68,16 +68,24 @@ def list_context_file_sources(
     unless *allow_install_tree_fallback*). Keys: ``label``, ``path``, ``chars``, ``est_tokens``, ``loaded``
     and ``status`` ∈ loaded / truncated / flagged / shadowed / blocked / empty / unreadable / skipped / suppressed.
     """
-    cwd_path = _pb._context_cwd_path(cwd)
+    from hermes_cli.main_resume_args import uses_managed_executor
+    managed = uses_managed_executor()
+    if managed:
+        from agent.ssh_project_context import executor_context_candidates
+        _, candidates = executor_context_candidates(context_length)
+        suppressed = False
+    else:
+        cwd_path = _pb._context_cwd_path(cwd)
+        candidates = _pb.discover_context_files(cwd_path) if cwd_path is not None else ()
+        suppressed = cwd_path is not None and _pb._project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback)
     max_chars = _pb._get_context_file_max_chars(context_length)
-    suppressed = cwd_path is not None and _pb._project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback)
     sources: list[dict[str, Any]] = []
     winner: Optional[str] = None
-    for kind, label, path, content in _pb.discover_context_files(cwd_path) if cwd_path is not None else ():
+    for kind, label, path, content in candidates:
         if content is None:  # refused by containment; stat would follow the link to the refused target
             content, status = "", "skipped"
         elif not content:
-            status = _empty_status(path)
+            status = "unreadable" if managed else _empty_status(path)
         elif suppressed:
             status = "suppressed"
         elif winner in (None, kind):
@@ -106,8 +114,9 @@ def context_file_sources_for_agent(agent: Any) -> list[dict[str, Any]]:
         return []
     from agent.runtime_cwd import resolve_context_cwd
     from agent.system_prompt import _agent_home
+    from hermes_cli.main_resume_args import uses_managed_executor
     launch_artifact = getattr(agent, "_context_cwd_is_launch_artifact", False)
-    cwd = resolve_context_cwd(include_session_override=not launch_artifact)
+    cwd = None if uses_managed_executor() else resolve_context_cwd(include_session_override=not launch_artifact)
     ctx_len = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     return list_context_file_sources(
         cwd=str(cwd) if cwd is not None else None, context_length=ctx_len if isinstance(ctx_len, int) else None,

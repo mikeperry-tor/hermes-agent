@@ -531,6 +531,10 @@ def _prune_old_events(conn: sqlite3.Connection, *, session_id: str, root: str) -
 
 def _project_facts(cwd: str | Path | None) -> Optional[dict[str, Any]]:
     """Workspace facts for ``cwd``; ``None`` when detection fails or finds nothing."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        return None
     try:
         from agent.coding_context import project_facts_for
 
@@ -762,6 +766,27 @@ def _newest_workspace_verify(
     ).fetchone()
 
 
+def _executor_verification_status(session_id, cwd):
+    from agent.ssh_context_references import reference_workspace
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from tui_gateway.git_probe import _GIT_TIMEOUT
+
+    try:
+        workspace = reference_workspace(None, directory=str(cwd) if cwd else None)
+        if workspace is None:
+            return {"status": "unknown", "evidence": None}
+        facts = workspace.backend.inspect_projects(
+            [workspace.cwd], workspace.grants, git_timeout=_GIT_TIMEOUT)[workspace.cwd]
+    except SshWorkspaceFsError:
+        return {"status": "unknown", "evidence": None}
+    if "cwd" not in facts or facts.get("git_unavailable"):
+        return {"status": "unknown", "evidence": None}
+    if not (root := facts.get("worktree_root")):
+        return {"status": "not_applicable", "evidence": None}
+    return {"status": "unverified", "evidence": None, "root": root,
+            "session_id": str(session_id or "default"), "changed_paths": []}
+
+
 def verification_status(*, session_id: str | None, cwd: str | Path | None) -> dict[str, Any]:
     """Return the best known verification state for a session/workspace.
 
@@ -771,6 +796,10 @@ def verification_status(*, session_id: str | None, cwd: str | Path | None) -> di
     """
     if not _ledger_enabled():
         return {"status": "disabled", "evidence": None}
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        return _executor_verification_status(session_id, cwd)
     facts = _project_facts(cwd)
     if not facts:
         return {"status": "not_applicable", "evidence": None}
