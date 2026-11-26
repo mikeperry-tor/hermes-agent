@@ -60,14 +60,14 @@ def policy_if_managed(policy):
     return policy
 
 
-def _bootstrap(authority, ref, row, policy, scope, text=None):
+def _bootstrap(authority, ref, row, policy, scope, text=None, workspace=None):
     from gateway.session_ingress import row_turn_author
     from gateway.session_policy import route_launch_key
     from gateway.session_policy_credentials import recover_config_secrets
-    terminal = json.loads(policy.terminal_json)
+    terminal = json.loads(policy.terminal_json) if workspace is None else dict(workspace[1])
     if policy.config_secret_ref:
         for path, value in recover_config_secrets(authority, policy).items():
-            if path[0] is None:
+            if path[0] is None and terminal.get(path[1]) is None:
                 terminal[path[1]] = value
     live = authority.sessions[ref.session_id]
     # This turn's facts ride the per-turn hydrated request (the bootstrap field set is closed):
@@ -79,6 +79,8 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
         **({'surface_v1': row['payload']['surface_v1']} if row['payload'].get('surface_v1') else {}),
         **({'display_v1': row['payload']['display_v1']} if row['payload'].get('display_v1') else {})})
     from gateway.session_worker_construct import construct_inputs
+    if workspace is not None:
+        request['owner_workspace_v1'] = workspace[0]
     request['construct_v1'] = construct_inputs(authority, policy, live.source.chat_id, live.source)
     # This owner consumes the worker's ACTIVITY_FRAME, often enough for its wedge timeout.
     from gateway.run import _float_env
@@ -630,19 +632,23 @@ async def _spawn_registered_worker(authority, ref, row):
 
 
 async def admit_managed(authority, ref, row, policy):
-    """The ingress route into a managed worker. A removed folder is refused before a worker exists,
-    like the in-process runner: a worker failing in its policy scope reads as a LOST execution
-    (``unknown``) and parks every follower behind it."""
-    from gateway.session_policy import workspace_ready, workspace_unavailable_result
-    if not workspace_ready(policy):
-        result = workspace_unavailable_result(policy)
-        authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
-        return result['final_response']
+    """The ingress route into a managed worker."""
     result = _unsupported_command_result(row)
     if result is not None:
         authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
         return result['final_response']
     return await execute_managed(authority, ref, row, policy)
+
+
+def _managed_turn_workspace(policy):
+    from gateway.session_policy import ready_workspace
+
+    if policy.source == 'kanban':
+        from hermes_cli.kanban_db_workspace import _managed_workspace_unavailable
+
+        if _managed_workspace_unavailable():
+            return None
+    return ready_workspace(policy)
 
 
 def _unsupported_command_result(row):
@@ -684,22 +690,47 @@ async def _finalize_managed_refusal(authority, session_id, accepted):
             session_id, None, accepted.get('refused_turn_boundary_row_id'))
 
 
-async def execute_managed(authority, ref, row, policy):
-    from gateway.run_turn_progress import publish_worker_tool_event
-    # This route never passes the inbound prepare step, so the worker would read ``@`` tokens as typed.
+async def _prepare_worker_text(authority, ref, row, policy):
+    """Track cancellation while verifying the workspace and expanding references."""
     from gateway.session_context_refs import managed_turn_text, refused_turn_result
+    from gateway.session_policy import SURFACES, workspace_unavailable_result
+    from hermes_cli.main_resume_args import uses_managed_executor
     _mark_spawning(authority, ref, row)
+    if _stopped_before_spawn(authority, ref, row):
+        return None, None, ''
     try:
+        workspace = await asyncio.to_thread(_managed_turn_workspace, policy) if policy is not None else None
+        if _stopped_before_spawn(authority, ref, row):
+            return None, None, ''
+        if policy is not None and workspace is None:
+            authority._managed_spawning.pop(ref.session_id, None)
+            result = workspace_unavailable_result(policy)
+            authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
+            return None, None, result['final_response']
         text, refusal = await managed_turn_text(authority, row, policy)
+    except asyncio.CancelledError:
+        if _stopped_before_spawn(authority, ref, row):
+            return None, None, ''
+        authority._managed_spawning.pop(ref.session_id, None)
+        raise
     except BaseException:
         authority._managed_spawning.pop(ref.session_id, None)
         raise
+    if _stopped_before_spawn(authority, ref, row):
+        return None, None, ''
     if refusal is not None:
         authority._managed_spawning.pop(ref.session_id, None)
         authority.pending_results[row['admission_id']] = {'result': refused_turn_result(row, refusal), 'usage': {}}
-        return refusal
-    if _stopped_before_spawn(authority, ref, row):
-        return ''
+        return None, None, refusal
+    managed_chat = policy is not None and policy.source in SURFACES and uses_managed_executor()
+    return text, workspace if managed_chat else None, None
+
+
+async def execute_managed(authority, ref, row, policy):
+    from gateway.run_turn_progress import publish_worker_tool_event
+    text, workspace, early_result = await _prepare_worker_text(authority, ref, row, policy)
+    if early_result is not None:
+        return early_result
     spawned = await _spawn_registered_worker(authority, ref, row)
     if spawned is None:
         return ''
@@ -724,7 +755,7 @@ async def execute_managed(authority, ref, row, policy):
                     worker_subject=owner_worker_subject()))
         worker.worker = (scope['pid'], scope['birth'])
         # The child reads nothing else until the exact reservation has committed.
-        frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
+        frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text, workspace)
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
         await asyncio.to_thread(worker.send, frame)
         worker.writer.start()

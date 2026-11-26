@@ -67,3 +67,9 @@ it('sends the launcher\'s client environment (LC-8, T3) only to a gateway that t
     expect(localCreationOptions({ HERMES_TUI_CLIENT_ENV: raw } as NodeJS.ProcessEnv)).not.toHaveProperty('client_env')
   }
 })
+
+it('marks the selected workspace without changing an inherited Ink working directory', () => {
+  const env = { HERMES_TUI_CWD: '/workspace/project' }
+  expect(localCreationOptions(env)).not.toHaveProperty('cwd_explicit')
+  expect(localCreationOptions({ ...env, HERMES_TUI_CWD_EXPLICIT: '1' }).cwd_explicit).toBe(true)
+})

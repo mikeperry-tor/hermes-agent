@@ -1291,7 +1291,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         a stale MEDIA: path from an earlier turn never rides a later reply; the history-path dedup is
         the secondary guard — and the sole one when mid-run compression shrank the list."""
         from gateway.run import _collect_auto_append_media_tags
-        if "MEDIA:" in final_response:
+        from gateway.platforms.base import _managed_media_delivery
+        if "MEDIA:" in final_response and not _managed_media_delivery():
             return final_response
         # Scan tool results for MEDIA:<path> tags that need to be delivered as native audio/file
         # attachments. The TTS tool embeds MEDIA: tags in its JSON response, but the model's final text
@@ -1309,7 +1310,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         media_tags, has_voice_directive = _collect_auto_append_media_tags(
             result.get("messages", []), history_offset=len(agent_history), history_media_paths=history_media_paths,
         )
-        if not media_tags:
+        if _managed_media_delivery():
+            from gateway.media_repair import tool_produced_media_paths
+
+            result["delivery_producers"] = tool_produced_media_paths(
+                media_tags, result.get("messages") or [], len(agent_history))
+        if not media_tags or "MEDIA:" in final_response:
             return final_response
         unique_tags = (["[[audio_as_voice]]"] if has_voice_directive else []) + list(dict.fromkeys(media_tags))
         return final_response + "\n" + "\n".join(unique_tags)
@@ -1583,6 +1589,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return {"final_response": final_response, **common,
                     "agent_persisted": _agent_persisted_flag(result, agent)}
         final_response = self._append_auto_media_tags(final_response, result, agent_history, history_media_paths)
+        if "delivery_producers" in result:
+            from agent.runtime_cwd import scoped_session_cwd
+            from tools.terminal_tool import get_session_cwd
+
+            task_id = getattr(agent, "_current_task_id", None)
+            cwd = (get_session_cwd(task_id) if task_id else None) or scoped_session_cwd()
+            common.update(delivery_producers=result["delivery_producers"], delivery_cwd=cwd)
         # Auto-titling runs at TURN START (agent/turn_context.py) from the user's message alone, so a
         # failed/interrupted turn is still titled.
         return {

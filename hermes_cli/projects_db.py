@@ -107,7 +107,11 @@ def _now() -> int:
 
 def _normalize_path(path: str) -> str:
     """Absolute, user-expanded, separator-normalized path (no trailing sep)."""
-    p = os.path.abspath(os.path.expanduser(str(path).strip()))
+    raw = str(path).strip()
+    if raw.startswith("/") and not raw.startswith("//"):
+        import posixpath
+        return posixpath.normpath(raw)
+    p = os.path.abspath(os.path.expanduser(raw))
     return p.rstrip("/\\") or p
 
 

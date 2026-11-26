@@ -159,15 +159,21 @@ async def attach_file(connection, ref, params):
     if policy is None:
         raise AuthorityRefusal('permission_denied')
     # The staging helpers are bound onto the sidecar module's globals (method_ctx.bind_module).
+    from hermes_cli.main_resume_args import uses_managed_executor
     from tui_gateway import server
-    session = {'cwd': policy.cwd, 'profile_home': authority.profile_id}
+    managed = uses_managed_executor()
+    if managed and params.get('path') and not (connection.native_owner or staged_upload or params.get('data_url')):
+        raise AuthorityRefusal('permission_denied')
+    session = {'cwd': policy.cwd, 'profile_home': authority.profile_id,
+               **({'executor_attachment_session': ref.session_id} if managed else {})}
 
     def stage():
         if staged_upload is not None:
             # Only the receipt is read: a supplied path/data_url never stands in for a missing upload.
             return server._stage_browser_file_attachment(session, staged_upload, params.get('name', ''))
         return server._stage_session_file_attachment(
-            session, raw_path=params.get('path', ''), data_url=params.get('data_url', ''),
+            session, raw_path=("" if managed and not connection.native_owner else params.get('path', '')),
+            data_url=params.get('data_url', ''),
             name=params.get('name', ''))
     try:
         stored, uploaded = await asyncio.to_thread(stage)
@@ -176,7 +182,8 @@ async def attach_file(connection, ref, params):
     except OSError as exc:
         raise AuthorityRefusal('storage_unavailable') from exc
     ref_path = server._attachment_ref_path(session, stored)
-    return {'attached': True, 'name': stored.name, 'path': str(stored), 'ref_path': ref_path,
+    name = stored.name.split('-', 1)[1] if managed else stored.name
+    return {'attached': True, 'name': name, 'path': str(stored), 'ref_path': ref_path,
             'ref_text': f'@file:{server._format_ref_value(ref_path)}', 'uploaded': uploaded}
 
 

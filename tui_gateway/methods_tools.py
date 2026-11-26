@@ -496,16 +496,7 @@ def _dispatch_quick(rid, params, session, name, arg):
 
 @contextlib.contextmanager
 def _session_home_scope(session, cwd: str | None = None, profile: str | None = None):
-    """Bind HERMES_HOME and the logical cwd to the session for the block.
-
-    Skill/bundle/quick-command resolution is home-keyed (``skills.external_dirs``, ``skill-bundles/``,
-    ``quick_commands`` all live in the profile's config/home); nothing upstream of these RPC handlers
-    binds it, so an unscoped call resolves against the launch profile (#110695). Project-local skills
-    are cwd-keyed (``find_project_root`` reads the session-bound cwd first): these RPCs run on the socket
-    thread with no session context, where the terminal scope resolves a placeholder ``terminal.cwd`` to
-    ``$HOME`` and no project skill ever registers or dispatches (#114359). ``cwd`` overrides the session
-    record (a session-less catalog request binds the workspace a new session would be seeded with).
-    ``profile`` scopes a session-less call (a Desktop draft names its rail-selected profile) (#124651)."""
+    """Scope skills and commands to the current chat or draft's profile and workspace."""
     hc = _tools_mod("hermes_constants")
     rc = _tools_mod("agent.runtime_cwd")
     profile_home = session.get("profile_home") if session else None
@@ -514,9 +505,17 @@ def _session_home_scope(session, cwd: str | None = None, profile: str | None = N
     cwd = cwd or (str(session.get("cwd") or "") if session else "")
     token = hc.set_hermes_home_override(profile_home) if profile_home else None
     cwd_token = rc.set_session_cwd(cwd) if cwd else None
+    terminal_token = None
     try:
+        from tui_gateway.session_workdir import bind_sidecar_project
+
+        terminal_token = bind_sidecar_project(cwd, session)
         yield
     finally:
+        if terminal_token is not None:
+            from tools.terminal_scope import reset_terminal_scope
+
+            reset_terminal_scope(terminal_token)
         if cwd_token is not None:
             rc.reset_session_cwd(cwd_token)
         if token is not None:
@@ -661,9 +660,17 @@ def _cmd_init(rid, params, session, name, arg):
     backend from the home directory, so a process-cwd fallback scans and updates the HOME's
     AGENTS.md instead of the workspace attached to the session."""
     from hermes_cli.init_command import build_init_prompt_for_cwd
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
     from tools.terminal_tool import get_session_cwd
 
     skey = session.get("session_key") if session else None
+    if uses_managed_executor():
+        try:
+            prompt = build_init_prompt_for_cwd(extra=arg, cwd=session.get("cwd") if session else None, session_key=skey)
+        except SshWorkspaceFsError as exc:
+            return _err(rid, 4004, str(exc))
+        return _ok(rid, {"type": "send", "message": prompt})
     cwd = None
     with contextlib.suppress(Exception):  # no record → the builder's ladder decides
         cwd = get_session_cwd(skey) if skey else None

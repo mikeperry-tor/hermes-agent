@@ -9,6 +9,8 @@ lane = the worktree path. Linked worktrees fold under their MAIN repo (common-di
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+import posixpath
 import re
 import unicodedata
 from typing import Any, Callable, Optional
@@ -52,7 +54,24 @@ def _kanban_lane_id(repo_root: str) -> str:
     return f"{repo_root}::kanban"
 
 
+_EXACT_POSIX = ContextVar("executor_project_posix_paths", default=False)
+
+
+def build_executor_tree(*args, **kwargs):
+    token = _EXACT_POSIX.set(True)
+    try:
+        return build_tree(*args, **kwargs)
+    finally:
+        _EXACT_POSIX.reset(token)
+
+
+def _strip_separator(path: str) -> str:
+    return (path or "").rstrip("/" if _EXACT_POSIX.get() else "/\\")
+
+
 def _segments(path: str) -> list[str]:
+    if _EXACT_POSIX.get():
+        return [segment for segment in (path or "").split("/") if segment]
     return [s for s in re.split(r"[/\\]", (path or "").rstrip("/\\")) if s]
 
 
@@ -74,6 +93,8 @@ def _comparison_segments(path: str) -> list[str]:
     an accented project folder would otherwise render empty (#65014). Mirrors
     ``comparisonSegments`` in the desktop's ``workspace-groups.ts``.
     """
+    if _EXACT_POSIX.get():
+        return _segments(path)
     segs = [unicodedata.normalize("NFC", segment) for segment in _segments(path)]
     return [segment.casefold() for segment in segs] if _is_windows_path(path) else segs
 
@@ -105,6 +126,8 @@ def kanban_worktree_dir(path: str) -> Optional[str]:
 
 def _with_base_name(path: str, name: str = "") -> str:
     """Swap the last segment for ``name`` (``""`` -> the parent dir, ``""`` past the root)."""
+    if _EXACT_POSIX.get():
+        return posixpath.dirname(_strip_separator(path)).rstrip("/") + ("/" + name if name else "")
     return re.sub(r"[^/\\]+$", name, (path or "").rstrip("/\\")).rstrip("" if name else "/\\")
 
 
@@ -145,7 +168,7 @@ def _probe_sibling_worktree(cwd: str, resolve: Resolve) -> str:
     ``-<segment>`` at a time off each ancestor's name (the cwd is often a SUBDIR of the dead
     worktree), deepest first, returning the first sibling that resolves; probes are bounded."""
     probes = 0
-    path = (cwd or "").rstrip("/\\")
+    path = _strip_separator(cwd)
     while path and probes < _MAX_SIBLING_PROBES:
         parts = base_name(path).split("-")
         for i in range(len(parts) - 1, 0, -1):
@@ -300,7 +323,7 @@ def _seed_folder_repos(
         if not raw:
             continue
         info = resolve(raw) if resolve else None
-        root = (info or {}).get("repo_root") or raw.rstrip("/\\")
+        root = (info or {}).get("repo_root") or _strip_separator(raw)
         root_key = _path_key(root)
         if not root_key or root_key in seen:
             continue

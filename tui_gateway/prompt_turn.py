@@ -210,6 +210,7 @@ class _TurnScopes:
     # The turn's profile state (home, secrets, terminal policy, runtime scope) as ONE bind; released
     # whole after post-turn housekeeping, which still runs under the session's own profile.
     profile: Any = None
+    terminal: Any = None
 
 
 def _route_turn_images(agent, prompt: Any, images: list[str]) -> Any:
@@ -673,6 +674,40 @@ def _sync_agent_daybreak(agent) -> None:
                           and (_load_cfg().get("agent") or {}).get("daybreak") is True)
 
 
+def _bind_executor_prompt_workspace(session, scopes):
+    from agent.ssh_context_references import reference_workspace
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from agent.runtime_scope import bind_terminal_policy
+    from tools.terminal_scope import TerminalPolicyUnavailable, get_terminal_scope
+
+    if not uses_managed_executor():
+        return
+    from hermes_cli.ssh_project_probe import managed_project_access
+    from hermes_constants import get_hermes_home
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = get_hermes_home()
+    try:
+        terminal = get_terminal_scope()
+        if terminal is None:
+            terminal = build_profile_terminal_scope(home)
+        access = managed_project_access(terminal)
+        if access is None:
+            return
+        _, terminal = access
+        explicit = bool(session.get("explicit_cwd"))
+        selected = session.get("cwd") if explicit else None
+        workspace = reference_workspace(terminal, directory=selected)
+    except (TerminalPolicyUnavailable, ValueError) as exc:
+        raise SshWorkspaceFsError("ECONN", str(exc)) from exc
+    if workspace is None:
+        return
+    effective = dict(terminal, TERMINAL_ENV="ssh", TERMINAL_CWD=workspace.cwd)
+    effective["TERMINAL_SSH_PROJECT_SELECTED"] = "1" if explicit or workspace.cwd != "/workspace" else "0"
+    scopes.terminal = bind_terminal_policy(effective, profile_home=home)
+
+
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
     """Bind scopes, sync the agent, snapshot history, build the run message; returns
     ``(prompt, run_message, cols, streamer)`` or None when @-expansion was refused.
@@ -691,6 +726,13 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     # member's hosted-room turn otherwise died with UnscopedSecretError, and ambient TERMINAL_* a
     # secondary context poisoned must never become the launch turn's authority.
     scopes.profile = _profile_runtime_scope_tokens(session.get("profile_home"))
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+    try:
+        _bind_executor_prompt_workspace(session, scopes)
+    except SshWorkspaceFsError as exc:
+        _emit("error", sid, {"message": str(exc)})
+        return None
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)
@@ -731,7 +773,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
             provider=getattr(agent, "provider", "") or "",
             config_context_length=getattr(agent, "_config_context_length", None))
         ctx = preprocess_context_references(
-            prompt, cwd=cwd, allowed_root=cwd, context_length=ctx_len)
+            prompt, cwd=cwd, allowed_root=cwd, context_length=ctx_len, attachment_session_id=sid)
         if ctx.blocked:
             _emit(
                 "error", sid, {"message": "\n".join(ctx.warnings) or "Context injection refused."})
@@ -1094,6 +1136,9 @@ def _release_turn_scopes(sid: str, session: dict, st: _TurnRun) -> None:
         if scopes.approval is not None:
             from tools.approval_context import reset_current_session_key
             reset_current_session_key(scopes.approval)
+    if scopes.terminal is not None:
+        from tools.terminal_scope import reset_terminal_scope
+        reset_terminal_scope(scopes.terminal)
     _clear_session_context(scopes.session_tokens)
 
 

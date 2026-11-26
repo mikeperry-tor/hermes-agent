@@ -172,7 +172,7 @@ def authorize_local_source(runner, source):
     return adapter.authorize_source(source)
 
 
-def _bypass_policy(params, *, private_secrets, client_local=False):
+def _bypass_policy(params, *, private_secrets, client_local=False, executor_project=None):
     """Frozen snapshot for --safe-mode / --ignore-user-config: code defaults plus the explicit
     launch options. The profile's config.yaml/.env are never read, so a malformed profile cannot
     block or shape the session; there is no default model to inherit, so one must be explicit."""
@@ -186,7 +186,7 @@ def _bypass_policy(params, *, private_secrets, client_local=False):
     if not isinstance(defaults.get('model'), dict):  # code default is the empty string
         defaults['model'] = {}
     return build_policy(params, defaults, private_secrets=private_secrets, profile_terminal=False,
-                        client_local=client_local)
+                        client_local=client_local, executor_project=executor_project)
 
 
 def load_profile_config(home=None):
@@ -222,11 +222,20 @@ def project_plugins_warning(policy):
     """The plain notice for a session whose client opted into project plugins (its forwarded
     ``HERMES_ENABLE_PROJECT_PLUGINS``) in a folder that has some: the gateway never loads them."""
     from pathlib import Path
+    from hermes_cli.ssh_project_probe import managed_project_access
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
     from utils import is_truthy_value
     # The client's folder is a path on this host only for a client the gateway proved local.
     env = policy.client_env() if policy is not None and not policy.client_env_remote else None
-    folder = Path(policy.cwd) / '.hermes' / 'plugins' if env else None
-    if not env or not is_truthy_value(env.get('HERMES_ENABLE_PROJECT_PLUGINS')) or not folder.is_dir():
+    if not env or not is_truthy_value(env.get('HERMES_ENABLE_PROJECT_PLUGINS')):
+        return None
+    try:
+        if managed_project_access(json.loads(policy.terminal_json)) is not None:
+            return None
+    except SshWorkspaceFsError:
+        return None
+    folder = Path(policy.cwd) / '.hermes' / 'plugins'
+    if not folder.is_dir():
         return None
     try:
         if not any(folder.iterdir()):
@@ -303,8 +312,65 @@ def staged_creation_follows(authority, actor, request_id):
     return isinstance(request, dict) and request.get('follow_profile_config') is True
 
 
+async def prepare_local_workspace(authority, actor, params):
+    """Probe a new canonical chat's project off-loop. Repeated requests reuse the saved cwd."""
+    import asyncio
+    import json
+
+    from gateway.session_policy import BYPASS_FIELDS, restore_policy
+    from hermes_cli.ssh_project_probe import inspect_managed_project
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from persistence.authority.bindings import local_session_id
+    from tools.file_tools_paths import managed_ssh_workspace_roots
+    from tools.terminal_scope import TerminalPolicyUnavailable, build_profile_terminal_scope, default_terminal_scope
+
+    if actor.profile_id != authority.profile_id:
+        raise AuthorityRefusal('profile_mismatch')
+    if 'session:create' not in actor.capabilities:
+        raise AuthorityRefusal('permission_denied')
+    authority._require_admission_open()
+    request_id = params.setdefault('request_id', uuid.uuid4().hex)
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+        raise AuthorityRefusal('invalid_params', field='request_id',
+                               detail='must be a non-empty string of at most 256 characters')
+    store = authority_persistence(authority)
+    sid = local_session_id(authority.profile_id, actor.subject, request_id)
+    if store.sessions.get(sid) is not None:
+        saved = restore_policy(store.bindings.receipt(sid).policy)
+        if json.loads(saved.terminal_json).get('TERMINAL_ENV') == 'ssh':
+            return saved.cwd, {}
+        return None
+    if 'cwd' in params and not isinstance(params['cwd'], str):
+        raise AuthorityRefusal('invalid_params', field='cwd', detail='must be a directory path')
+
+    def probe():
+        try:
+            if managed_ssh_workspace_roots() is None:
+                return None
+        except ValueError as exc:
+            raise SshWorkspaceFsError('ECONN', str(exc)) from exc
+        bypass = any(params.get(name) is True for name in BYPASS_FIELDS)
+        terminal = default_terminal_scope() if bypass else build_profile_terminal_scope(authority.profile_id)
+        path = params.get('cwd')
+        client_default = params.get('source', 'cli') in ('cli', 'oneshot', 'tui', 'tool')
+        if not params.get('cwd_explicit', not client_default) or path is None:
+            path = terminal.get('TERMINAL_CWD')
+            if path in {None, '', '.', 'auto', 'cwd', '~'}:
+                path = None
+        project = inspect_managed_project(terminal, path, profile_key=str(authority.profile_id))
+        if project is not None:
+            facts, selected = project
+            return facts['cwd'], selected
+        return None
+
+    try:
+        return await asyncio.to_thread(probe)
+    except (SshWorkspaceFsError, TerminalPolicyUnavailable, ValueError) as exc:
+        raise AuthorityRefusal('invalid_params', field='cwd', detail=str(exc)) from exc
+
+
 def stage_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None, skills_prompt=None,
-                        client_local=False, desktop_local=False):
+                        client_local=False, desktop_local=False, executor_project=None):
     """Everything before the creation commit: the existing session's ref on an exact retry, else the
     receipt ``commit_local_session`` writes (the async RPC commits it off the owner loop).
     ``client_local``: the gateway's own proof that the client is on this host (its connection redeemed a
@@ -315,15 +381,39 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
         raise AuthorityRefusal('profile_mismatch')
     if 'session:create' not in actor.capabilities:
         raise AuthorityRefusal('permission_denied')
-    from gateway.session_policy import build_policy, BYPASS_FIELDS, FOLLOW_ADOPTED, LOCAL_DESKTOP_CHAT
+    from gateway.session_policy import (
+        build_policy, public_create_request, BYPASS_FIELDS, CREATE_FIELDS, FOLLOW_ADOPTED, LOCAL_DESKTOP_CHAT, SURFACES,
+    )
     from gateway.run import _resolve_gateway_model
     from dataclasses import replace
+    from persistence.authority.bindings import local_session_id
+    from gateway.session_policy import bind_launch_key, restore_policy
+
+    request_id = params.get('request_id', uuid.uuid4().hex)
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
+        raise AuthorityRefusal('invalid_params', field='request_id',
+                               detail='must be a non-empty string of at most 256 characters')
+    authority._require_admission_open()
+    sid = local_session_id(authority.profile_id, actor.subject, request_id)
+    store = authority_persistence(authority)
     private_secrets = dict(trusted_secrets or {})
     client_key = params.get('api_key')  # the client's own; an alias's key is the owner's expansion
+    source = params.get('source', 'cli')
+    if (trusted_policy is None and isinstance(source, str) and source in SURFACES
+            and source != 'a2a' and not (set(params) - CREATE_FIELDS) and store.sessions.get(sid) is not None):
+        from gateway.session_local_editor import validate_editor
+        from session_rules.local_create import matches_unresolved_retry
+        if 'api_key' in params and (not isinstance(client_key, str) or not client_key.strip()):
+            raise AuthorityRefusal('invalid_params', field='api_key', detail='must be a non-empty string')
+        validate_editor(source, params.get('editor'))
+        saved = store.bindings.receipt(sid).policy
+        if matches_unresolved_retry(saved, public_create_request(params, {}), params):
+            return _restore_create_retry(authority, sid, restore_policy(saved), client_key)
     if trusted_policy is not None:
         policy = trusted_policy
     elif any(params.get(name) is True for name in BYPASS_FIELDS):
-        policy = _bypass_policy(params, private_secrets=private_secrets, client_local=client_local)
+        policy = _bypass_policy(params, private_secrets=private_secrets, client_local=client_local,
+                                executor_project=executor_project)
     else:
         from gateway.session_local_route import resolve_launch_route
         raw_model, sent = params.get('model'), params
@@ -332,15 +422,16 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             params = resolve_launch_route(params, config)
         # A client's session.create is the one caller whose named folder may select the coding posture.
         policy = build_policy(params, config, private_secrets=private_secrets, workspace_posture=True,
-                              client_local=client_local)
+                              client_local=client_local, executor_project=executor_project)
         if params is not sent:  # resolved, even to a model of the alias's own name
             # Owner-stamped provenance (not create fields): a remote client cannot re-resolve the typed
             # `-m` alias against its own home, so resume and an exact retry compare a repeat against the
             # name, and ``route_derived`` names the fields the route (not the client) filled.
-            import json
             derived = sorted(key for key in ('provider', 'base_url') if key in params and key not in sent)
+            explicit = {'provider_requested': sent['provider']} if 'provider' in sent else {}
             policy = replace(policy, request_json=json.dumps(
-                {**json.loads(policy.request_json), 'model_requested': raw_model, 'route_derived': derived},
+                {**json.loads(policy.request_json), 'model_requested': raw_model,
+                 'route_derived': derived, **explicit},
                 sort_keys=True))
         marks = {LOCAL_DESKTOP_CHAT: True} if desktop_local and policy.source == 'gui' else {}
         if policy.model is None:
@@ -350,21 +441,10 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
                 # Follows its profile, so the provider the user connects later replaces the trial model.
                 marks[FOLLOW_ADOPTED] = True
         if marks:
-            import json
             policy = replace(policy, config_json=json.dumps({**json.loads(policy.config_json), **marks}))
-    request_id = params.get('request_id', uuid.uuid4().hex)
-    if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
-        raise AuthorityRefusal('invalid_params', field='request_id',
-                               detail='must be a non-empty string of at most 256 characters')
     from dataclasses import asdict
     from gateway.session import SessionEntry
     from gateway.session_lifecycle import _now
-    from persistence.authority.bindings import local_session_id
-    from gateway.session_local_recovery import restore_local_session
-    authority._require_admission_open()
-    sid = local_session_id(authority.profile_id, actor.subject, request_id)
-    from gateway.session_policy import bind_launch_key, restore_policy, launch_key
-    store = authority_persistence(authority)
     if store.sessions.get(sid) is not None:
         saved = store.bindings.receipt(sid)
         original = restore_policy(saved.policy)
@@ -372,18 +452,7 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
         if not same_create_retry(saved.policy, policy.request_json, params):
             raise AuthorityRefusal('invalid_params', field='request_id',
                                    detail='a resumed request_id must carry the same frozen request')
-        import hmac
-        import json
-        if 'model_requested' in json.loads(original.request_json):
-            # An owner-resolved alias: its key came from the profile (a `.env` rotation is not a changed
-            # request) and the client sent none, so one it sends now is a different request.
-            if client_key is not None:
-                raise AuthorityRefusal('admission_conflict')
-        elif original.credential_ref is not None or params.get('api_key') is not None:
-            key = launch_key(authority, original)
-            if key is None or not hmac.compare_digest(key, params.get('api_key') or ''):
-                raise AuthorityRefusal('admission_conflict')
-        return restore_local_session(authority, sid)
+        return _restore_create_retry(authority, sid, original, client_key)
     from gateway.session_policy import launch_skills
     if launch_skills(params) and skills_prompt is None:
         # `-s` is rendered off-loop by the RPC handler (render_launch_skills); a caller that
@@ -413,6 +482,20 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     # winner's committed rules, as a sequential retry is.
     staged.client_request = client_request
     return staged
+
+
+def _restore_create_retry(authority, sid, original, client_key):
+    from gateway.session_local_recovery import restore_local_session
+    from gateway.session_policy import launch_key, launch_keys_match
+
+    if 'model_requested' in json.loads(original.request_json):
+        if client_key is not None:
+            raise AuthorityRefusal('admission_conflict')
+    elif original.credential_ref is not None or client_key is not None:
+        key = launch_key(authority, original)
+        if key is None or not launch_keys_match(key, client_key or ''):
+            raise AuthorityRefusal('admission_conflict')
+    return restore_local_session(authority, sid)
 
 
 def publish_local_policy(authority, session_id, *, evict=True):
@@ -521,7 +604,7 @@ def local_session_info(authority, ref):
     live = authority.sessions[ref.session_id]
     agent = authority.agent(ref)
     from gateway.session_authorities import served_profile_name
-    from gateway.session_policy import policy_for_source
+    from gateway.session_policy import display_workspace_cwd, policy_for_source
     policy = policy_for_source(authority.runner, live.source)
     if live.source is None:  # a history mount: what its stored row says
         source = authority_persistence(authority).sessions.get(ref.session_id).source
@@ -534,7 +617,7 @@ def local_session_info(authority, ref):
             'profile_id': authority.profile_id, 'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL,
             # Main's TUI labels a named profile's composer (``alpha ❯``) from this field.
             'profile_name': served_profile_name(authority.profile_id),
-            **({'cwd': policy.cwd} if policy else {}),
+            **({'cwd': display_workspace_cwd(policy)} if policy else {}),
             # An ACP session's edit approval policy: every attached surface reads the same one.
             **({'edit_approval_policy': policy.edit_approval_policy} if policy and policy.source == 'acp' else {})}
     peek = getattr(authority.runner, '_peek_session_state', None)
@@ -548,6 +631,9 @@ def local_session_info(authority, ref):
         # resuming client can tell "same flags again" from a real override attempt.
         import json
         info['launch_request'] = json.loads(policy.request_json)
+        selected = json.loads(policy.terminal_json).get('TERMINAL_SSH_PROJECT_SELECTED')
+        if selected is not None:
+            info['launch_request']['cwd_explicit'] = selected == '1'
         from gateway.session_client import policy_client
         if (client := policy_client(policy)) is not None:  # only a client that named itself
             info['client'] = client

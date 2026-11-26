@@ -239,6 +239,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # message's id or it collides with an earlier turn's row carrying the same text. Reply
             # routing is untouched: the anchor still comes from this event.
             if isinstance(agent_result, dict):
+                event._managed_media_producers = tuple(agent_result.get("delivery_producers", ()))
+                event._managed_media_cwd = agent_result.get("delivery_cwd")
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
                 if _terminal_inbound:
                     event.ledger_message_id = str(_terminal_inbound)
@@ -1599,7 +1601,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         await self._record_room_silence_decision(
             session_key, _delivery_result, _silent,
             display_kind=turn_ctx.persist_user_display_kind, reply_expected=turn_ctx.reply_expected)
-        # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:
             logger.info(
@@ -1614,9 +1615,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
                     deliver_media=_deliver_media, stream_consumer=_sc,
-                    # The text send records a delivery-ledger obligation under this key, keyed on
-                    # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    delivery_producers=_delivery_result.get("delivery_producers", ()),
+                    delivery_cwd=_delivery_result.get("delivery_cwd"),
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -1632,7 +1633,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
-        # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
             with suppress(Exception):

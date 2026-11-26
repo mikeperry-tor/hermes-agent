@@ -256,6 +256,29 @@ def adopts_client_history(authority, actor, row):
     return True
 
 
+def _legacy_executor_project(authority, params):
+    """Resolve a legacy session's cwd on the managed SSH executor when active."""
+    from hermes_cli.ssh_project_probe import inspect_managed_project
+    from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+    from tools.file_tools_paths import managed_ssh_workspace_roots
+    from tools.terminal_scope import TerminalPolicyUnavailable, build_profile_terminal_scope
+
+    try:
+        if managed_ssh_workspace_roots() is None:
+            return None
+        terminal = build_profile_terminal_scope(authority.profile_id)
+        path = params.get('cwd') or terminal.get('TERMINAL_CWD')
+        if path in {None, '', '.', 'auto', 'cwd', '~'}:
+            path = None
+        project = inspect_managed_project(terminal, path, profile_key=str(authority.profile_id))
+    except (SshWorkspaceFsError, TerminalPolicyUnavailable, ValueError) as exc:
+        raise AuthorityRefusal('invalid_params', field='cwd', detail=str(exc)) from exc
+    if project is None:
+        raise AuthorityRefusal('invalid_params', field='cwd', detail='The managed SSH workspace is unavailable.')
+    facts, selected = project
+    return facts['cwd'], selected
+
+
 def adopt_legacy_session(authority, actor, row):
     if actor.profile_id != authority.profile_id:
         raise AuthorityRefusal('profile_mismatch')
@@ -317,7 +340,8 @@ def adopt_legacy_session(authority, actor, row):
             config['model'] = {k: v for k, v in model_cfg.items() if k not in dropped}
             if saved['base_url']:
                 params['provider'] = _endpoint_owner(saved, config)
-    policy = build_policy(params, config, private_secrets=private)
+    executor_project = _legacy_executor_project(authority, params)
+    policy = build_policy(params, config, private_secrets=private, executor_project=executor_project)
     if api_mode:
         config = json.loads(policy.config_json)
         config.setdefault('model', {})['api_mode'] = api_mode

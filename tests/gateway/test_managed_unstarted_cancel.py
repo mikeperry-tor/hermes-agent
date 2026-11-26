@@ -67,3 +67,38 @@ async def test_cancel_before_worker_reservation_settles_interrupted(tmp_path, mo
                 if child.poll() is None:
                     child.kill()
                 child.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_a_failed_ssh_workdir_probe_settles_before_spawn(monkeypatch):
+    from types import SimpleNamespace
+
+    from gateway import session_managed_worker
+
+    entered, release = threading.Event(), threading.Event()
+
+    def unavailable(_):
+        entered.set()
+        assert release.wait(10)
+
+    monkeypatch.setattr("gateway.session_policy.ready_workspace", unavailable)
+    monkeypatch.setattr("hermes_cli.main_resume_args.uses_managed_executor", lambda: True)
+    authority = SimpleNamespace(pending_results={}, pending_stops={}, pending_stop_causes={})
+    ref = SimpleNamespace(session_id="chat")
+    row = {"admission_id": "turn", "generation": 8}
+    turn = asyncio.create_task(session_managed_worker.execute_managed(authority, ref, row, SimpleNamespace(source="cli")))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        assert authority._managed_spawning == {"chat": 8}
+        authority.pending_stops["chat"] = 8
+        authority.pending_stop_causes["chat"] = (8, "Gateway shutdown")
+    finally:
+        release.set()
+
+    assert await turn == ""
+    assert authority._managed_spawning == {}
+    assert authority.pending_results["turn"]["result"] == {
+        "final_response": "",
+        "interrupted": True,
+        "interrupt_message": "Gateway shutdown",
+    }

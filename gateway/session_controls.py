@@ -529,7 +529,9 @@ class AuthorityConnection:
             return await self._create(params, title)
 
     async def _create(self, params, title):
-        from gateway.session_local import commit_local_session, stage_local_session, staged_creation_follows
+        from gateway.session_local import (
+            commit_local_session, prepare_local_workspace, stage_local_session, staged_creation_follows,
+        )
         from gateway.session_local_recovery import restore_local_session
         from gateway.session_local_title import resolve_titled_session, title_new_session
         from gateway.session_policy import BYPASS_FIELDS
@@ -549,6 +551,7 @@ class AuthorityConnection:
             # retry of a creation staged without the flag keeps that frozen request.
             params.setdefault('follow_profile_config', True)
         if not ref:
+            executor_project = await prepare_local_workspace(self.authority, self.actor, params)
             skills_prompt = None
             if 'skills' in params:
                 # Skill files are read off the owner loop, once per NEW session (a retried
@@ -562,7 +565,8 @@ class AuthorityConnection:
             # Host-bound client values apply only over the gateway's own ticketed attach (run_api).
             ref = stage_local_session(self.authority, self.actor, params, skills_prompt=skills_prompt,
                                       client_local=self.native_owner,
-                                      desktop_local=getattr(self.transport, 'desktop_local', False))
+                                      desktop_local=getattr(self.transport, 'desktop_local', False),
+                                      executor_project=executor_project)
             if isinstance(ref, dict):
                 # The creation commit runs off the owner loop: a held writer must not freeze
                 # every session behind one new chat (N50).

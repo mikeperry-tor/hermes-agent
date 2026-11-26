@@ -242,14 +242,17 @@ def _skill_directive(name, arg, route):
     skills = get_interactive_skill_commands()
     key = resolve_slash_key(name, skills)
     if key is None:
-        raise AuthorityRefusal('unsupported_command')
+        from hermes_cli.main_resume_args import uses_managed_executor
+        if not uses_managed_executor():
+            raise AuthorityRefusal('unsupported_command')
+        key = f'/{name}'
     extra, instruction = split_stacked_skill_commands(arg, interactive=True)
     stacked = build_stacked_skill_invocation_message([key, *extra], instruction, task_id=route) if extra else None
     message = stacked[0] if stacked else build_skill_invocation_message(key, arg, task_id=route)
     if not message:
         raise AuthorityRefusal('command_unavailable')
     missing = stacked[2] if stacked else []
-    return {'type': 'skill', 'name': ', '.join(stacked[1]) if stacked else skills[key]['name'], 'message': message,
+    return {'type': 'skill', 'name': ', '.join(stacked[1]) if stacked else skills.get(key, {}).get('name', name), 'message': message,
             'display': describe_skill_invocation(message, separator=' '),
             **({'notice': t('cli.skills.skipped_missing', names=', '.join(missing))} if missing else {})}
 

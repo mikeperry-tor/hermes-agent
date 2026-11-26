@@ -228,6 +228,16 @@ def test_the_workspace_filter_keeps_the_folder_and_its_repo(backend, scope_a):
                                           SessionWindow(limit=20))
     assert {entry.session.session_id for entry in listed} == {"repo", "under", "at"}
     assert store.sessions.sessions_in_workspace([SessionId(n) for n in rows], "/w/proj") == {"repo", "under", "at"}
+    store.sessions.create(NewSession(session_id=SessionId("saved"), source="cli",
+                                     cwd="/w/proj/nested", git_repo_root="/w/proj"))
+    saved = store.sessions.list_sessions(SessionQuery(workspace_key="/w/proj/nested"), SessionWindow(limit=20))
+    assert {entry.session.session_id for entry in saved} == {"saved"}
+    store.sessions.create(NewSession(session_id=SessionId("case"), source="cli", cwd="/w/Proj"))
+    store.sessions.create(NewSession(session_id=SessionId("backslash"), source="cli", cwd="/w/proj" + chr(92)))
+    upper = store.sessions.list_sessions(SessionQuery(workspace_key="/w/Proj"), SessionWindow(limit=20))
+    slash = store.sessions.list_sessions(SessionQuery(workspace_key="/w/proj" + chr(92)), SessionWindow(limit=20))
+    assert {entry.session.session_id for entry in upper} == {"case"}
+    assert {entry.session.session_id for entry in slash} == {"backslash"}
 
 
 def test_picker_facts_read_roots_segments_and_the_last_shown_reply(backend, scope_a):

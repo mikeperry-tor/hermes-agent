@@ -122,10 +122,16 @@ def _under(path: Optional[str], prefix: str) -> bool:
 
 
 def _in_workspace(row: Mapping[str, Any], key: str) -> bool:
-    """``workspace_key(row) == key``: the repo root equals it, or a row without one has its cwd at or under it."""
+    """Match the Git root or exact cwd. Rows without Git metadata can match descendant cwd paths."""
+    if key.startswith("/") and not key.startswith("//"):
+        prefix = key.rstrip("/") or "/"
+        if row["git_repo_root"]:
+            return prefix in (row["git_repo_root"], row["cwd"])
+        cwd = row["cwd"] or ""
+        return cwd == prefix or cwd.startswith(prefix.rstrip("/") + "/")
     head = key.rstrip("/\\") or key
     if row["git_repo_root"]:
-        return bool(row["git_repo_root"] == head)
+        return head in (row["git_repo_root"], row["cwd"])
     return _under(row["cwd"], head)
 
 

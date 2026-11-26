@@ -111,7 +111,24 @@ def validate_options(args):
 
 def _caller_cwd(args) -> str:
     """The caller's working directory (``--in`` wins), resolved; filesystem work, so off the loop."""
-    return str(Path(getattr(args, "in_dir", None) or os.getcwd()).expanduser().resolve())
+    from hermes_cli.main_resume_args import uses_managed_executor
+    from posixpath import normpath
+
+    requested = getattr(args, "in_dir", None)
+    if requested and uses_managed_executor():
+        if not requested.startswith("/") or requested.startswith("//"):
+            raise GatewayClientError("--in requires an absolute executor directory")
+        return normpath(requested)
+    return str(Path(requested or os.getcwd()).expanduser().resolve())
+
+
+def _launch_workspace(args, cwd, parameters):
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    launch = {"cwd": cwd}
+    if getattr(args, "in_dir", None) and "cwd_explicit" in parameters and uses_managed_executor():
+        launch["cwd_explicit"] = True
+    return launch
 
 
 def _workspace_key(cwd):
@@ -123,6 +140,15 @@ def _workspace_key(cwd):
         return _resolve_workspace_key()
     finally:
         os.chdir(previous)
+
+
+def _resume_workspace(args):
+    from hermes_cli.main_resume_args import managed_executor_workspace, uses_managed_executor
+
+    if uses_managed_executor():
+        path = _caller_cwd(args) if getattr(args, "in_dir", None) else None
+        return managed_executor_workspace(path, use_profile=not bypass_launch(args))
+    return _workspace_key(_caller_cwd(args))
 
 
 async def _resume(client, args, **params):
@@ -149,7 +175,7 @@ async def _resume_latest(client, args):
         except GatewayClientError as exc:
             if str(exc) not in RESUME_REFUSALS:
                 raise
-    workspace = await asyncio.to_thread(_workspace_key, _caller_cwd(args))
+    workspace = await asyncio.to_thread(_resume_workspace, args)
     try:
         return await _resume(client, args, latest="cli", **({"workspace": workspace} if workspace else {}))
     except GatewayClientError as exc:
@@ -212,7 +238,7 @@ async def run_gateway_chat(args, emitter=None):
             policy.update(client_env_policy(parameters))
             cwd = await asyncio.to_thread(_caller_cwd, args)
             if "cwd" in parameters:
-                policy["cwd"] = cwd
+                policy.update(_launch_workspace(args, cwd, parameters))
             elif getattr(args, "in_dir", None):
                 raise GatewayClientError("Gateway does not support --in / caller cwd; update the gateway")
             else:
@@ -299,8 +325,10 @@ def _requested_policy(args):
 def check_resume_policy(args, snapshot):
     """A resume may repeat the flags the session was created with (scripts re-run one command
     line); anything that would CHANGE the frozen route is refused, as before."""
+    from hermes_cli.main_resume_args import uses_managed_executor
+
     requested = _requested_policy(args)
-    if getattr(args, "in_dir", None):
+    if getattr(args, "in_dir", None) and not uses_managed_executor():
         requested["cwd"] = str(Path(args.in_dir).expanduser().resolve())
     if not requested:
         return
@@ -317,6 +345,8 @@ def check_resume_policy(args, snapshot):
         from hermes_constants import get_hermes_home
         flags = {key: requested[key] for key in ("model", "provider", "base_url", "api_key") if key in requested}
         requested["model"] = resolve_launch_route(flags, load_user_config_effective(get_hermes_home() / "config.yaml"))["model"]
+    if "provider" in requested and requested["provider"] == frozen.get("provider_requested"):
+        requested["provider"] = frozen.get("provider")
     # api_key is never durable; a repeated key is not a policy change.
     differs = [key for key, value in requested.items() if key != "api_key" and frozen.get(key) != value]
     if differs:

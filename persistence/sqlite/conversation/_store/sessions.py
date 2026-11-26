@@ -78,6 +78,10 @@ def _parse_model_config(raw: Any) -> dict[str, Any]:
 
 
 def _cwd_prefix_clause(cwd_prefix: str) -> tuple[str, list[str]]:
+    if cwd_prefix.startswith("/") and not cwd_prefix.startswith("//"):
+        prefix = cwd_prefix.rstrip("/") or "/"
+        child_prefix = prefix.rstrip("/") + "/"
+        return "(s.cwd = ? COLLATE BINARY OR instr(s.cwd, ?) = 1)", [prefix, child_prefix]
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
     # ``_``/``%`` are LIKE wildcards but ordinary path characters: unescaped, a
     # prefix also matches sibling directories. The ``=`` arm keeps the raw prefix.
@@ -89,13 +93,20 @@ def _cwd_prefix_clause(cwd_prefix: str) -> tuple[str, list[str]]:
 
 
 def _workspace_key_clause(key: str) -> tuple[str, list[str]]:
-    """WHERE for ``workspace_key(row) == key``: git_repo_root equals ``key``, or (rows predating
-    per-session git metadata) cwd is at/under ``key``."""
+    """Match the saved Git root or exact cwd. Rows without Git metadata can also match a descendant cwd."""
+    if key.startswith("/") and not key.startswith("//"):
+        prefix = key.rstrip("/") or "/"
+        child_prefix = prefix.rstrip("/") + "/"
+        return (
+            "(s.git_repo_root = ? COLLATE BINARY OR s.cwd = ? COLLATE BINARY "
+            "OR (COALESCE(s.git_repo_root, '') = '' AND instr(s.cwd, ?) = 1))",
+            [prefix, prefix, child_prefix],
+        )
     prefix = key.rstrip("/\\") or key
     cwd_clause, cwd_params = _cwd_prefix_clause(prefix)
     return (
-        f"(s.git_repo_root = ? OR (COALESCE(s.git_repo_root, '') = '' AND {cwd_clause}))",
-        [prefix, *cwd_params],
+        f"(s.git_repo_root = ? OR s.cwd = ? OR (COALESCE(s.git_repo_root, '') = '' AND {cwd_clause}))",
+        [prefix, prefix, *cwd_params],
     )
 
 

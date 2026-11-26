@@ -814,3 +814,70 @@ def test_project_tree_rows_name_every_lineage_segment():
         "comp-tip": ("comp-root", ["comp-root", "comp-tip"]),
         "loc-b": (None, ["loc-a", "loc-b"]),
     }
+
+
+@pytest.mark.platforms("posix")
+def test_managed_discovery_keeps_saved_projects_and_refreshes_executor_facts(monkeypatch, tmp_path):
+    from tui_gateway import git_probe, managed_project_queries
+
+    root = "/mnt/projects/shared"
+    repo, manual = root + "/code", root + "/notes"
+    stale, sibling = root + "/old", root + "-other/code"
+    home = _profile_dir(tmp_path, "managed")
+    paths = {repo: {"cwd": repo, "repo_root": repo, "worktree_root": repo, "branch": "executor-main"},
+             manual: {"cwd": manual}}
+    access = ((root,), {"TERMINAL_CWD": repo})
+    monkeypatch.setattr(managed_project_queries, "profile_project_access", lambda: access)
+    scan_calls = []
+
+    class Adapter:
+        def inspect_projects(self, requested, roots, *, git_timeout):
+            assert roots == (root,)
+            assert all(path.startswith(root + "/") for path in requested)
+            return {path: paths.get(path, {"error": "unavailable"}) for path in requested}
+
+        def discover_projects(self, roots, scan_roots, exclusions, *, git_timeout):
+            scan_calls.append((roots, scan_roots, exclusions))
+            return [repo], True
+
+    monkeypatch.setattr("hermes_cli.ssh_workspace_fs.get_ssh_workspace_fs", lambda *_a, **_k: Adapter())
+    for name in ("warm_roots", "resolve", "branch", "common_repo_root"):
+        monkeypatch.setattr(git_probe, name, lambda *_a: pytest.fail("managed projects probed Git on Hermes"))
+
+    _create_session(home, "saved-code", Path(repo))
+    _create_session(home, "saved-notes", Path(manual))
+
+    def project_rpc(method, **params):
+        response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        assert response is not None and "result" in response, response
+        return response["result"]
+
+    with _serving_launch_profile(home):
+        _call("projects.create", {"name": "Code", "folders": [repo]})
+        _call("projects.create", {"name": "Notes", "primary_path": manual})
+        refused = server._methods["projects.create"](1, {"name": "Sibling", "folders": [sibling]})
+        assert "error" in refused
+        stale_report = _call("projects.record_repos", {"repos": [stale, sibling]})
+        assert stale_report["accepted"] is False
+        scan = _call("projects.discover_repos", {"scan": True})
+        assert [item["root"] for item in scan["repos"]] == [repo]
+        assert scan_calls == [((root,), (root,), ())]
+
+        def preview(label):
+            tree = project_rpc("projects.tree")
+            return next(item for item in tree["projects"] if item["label"] == label)["previewSessions"][0]
+
+        assert preview("Code")["git_branch"] == "executor-main"
+        assert preview("Notes")["workspace_available"]
+        assert project_rpc("projects.for_cwd", cwd=repo)["branch"] == "executor-main"
+
+        paths.pop(repo)
+        assert preview("Code")["id"] == "saved-code"
+        assert not preview("Code")["workspace_available"]
+        assert _call("projects.discover_repos")["repos"] == []
+
+        paths[repo] = {"cwd": repo, "repo_root": repo, "worktree_root": repo, "branch": "executor-remap"}
+        assert preview("Code")["git_branch"] == "executor-remap"
+        paths[repo] = {"cwd": repo}
+        remapped = preview("Code")
+        assert remapped["workspace_available"] and not remapped["git_branch"]
