@@ -866,11 +866,27 @@ function canonicalFileKey(target: Pick<PreviewTarget, 'path' | 'url'>): string {
   return (target.path || target.url).replace(/^file:\/\//, '')
 }
 
-/** The tab already showing `target`'s file in `tabs` (a session's visible set). */
-function fileTabFor(tabs: readonly PreviewTab[], target: PreviewTarget): PreviewTab | undefined {
+function needsFileSession(source: string): boolean {
+  return !/^(?:[a-z][a-z\d+.-]*:|[/\\]|~[/\\])/i.test(source)
+}
+
+/** The tab already showing this file. Relative targets belong to their asking session. */
+function fileTabFor(tabs: readonly PreviewTab[], target: PreviewTarget, owner: null | string): PreviewTab | undefined {
   const key = canonicalFileKey(target)
 
-  return tabs.find(tab => tab.target.kind === 'file' && canonicalFileKey(tab.target) === key)
+  return tabs.find(tab =>
+    tab.target.kind === 'file' && canonicalFileKey(tab.target) === key &&
+    (!(needsFileSession(target.source) || needsFileSession(tab.target.source)) || currentSessionId(tab.sessionId) === owner)
+  )
+}
+
+export function previewTabForSource(source: string, owner: PreviewOwner): PreviewTab | undefined {
+  const identity = ownerIdentity(owner)
+
+  return previewTabsFor(owner).find(tab =>
+    tab.target.source === source &&
+    (tab.target.kind !== 'file' || !needsFileSession(source) || currentSessionId(tab.sessionId) === identity.sessionId)
+  )
 }
 
 /** `base`, suffixed until no tab holds it: a file's owner-derived id can be
@@ -985,7 +1001,7 @@ export function openPreview(
     target.kind === 'url'
       ? browserTabFor(visible)
       : target.kind === 'file'
-        ? fileTabFor(visible, target)
+        ? fileTabFor(visible, target, owner)
         : current.find(tab => tab.id === previewTabId(target))
 
   const id =
@@ -1021,14 +1037,15 @@ const blankPage = (): PreviewTarget => ({ kind: 'url', label: 'Browser', source:
  *  the next restore drops them instead of re-probing the dead path on every
  *  boot. Takes a tab id or the file's url/path; a file that is gone is gone
  *  for every session showing it. */
-export function markPreviewTabMissing(tabIdOrUrl: string) {
+export function markPreviewTabMissing(tabIdOrUrl: string, { onlyTab = false } = {}) {
   const current = $previewTabs.get()
   const key = canonicalFileKey({ url: tabIdOrUrl.replace(/^file:(?!\/\/)/, '') })
 
   const hit = (tab: PreviewTab) =>
     tab.target.kind === 'file' &&
     !tab.target.missing &&
-    (tab.id === tabIdOrUrl || tab.target.url === tabIdOrUrl || canonicalFileKey(tab.target) === key)
+    (tab.id === tabIdOrUrl ||
+      (!onlyTab && (tab.target.url === tabIdOrUrl || canonicalFileKey(tab.target) === key)))
 
   if (!current.some(hit)) {
     return

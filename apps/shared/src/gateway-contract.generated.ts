@@ -2677,6 +2677,7 @@ export interface ProjectsForCwdResult {
   project?: ProjectInfo | null
   cwd: string
   branch?: string
+  available?: boolean | null
 }
 /** ``scan`` asks the host to walk the policy roots itself (remote-gateway desktop). */
 export interface ProjectsDiscoverReposParams {
@@ -2743,6 +2744,7 @@ export interface ProjectTreeNode {
   icon?: string | null
   isAuto?: boolean
   isNoProject?: boolean
+  workspace_available?: boolean | null
   sessionCount?: number
   lastActive?: number
   totalTokens?: number
@@ -2755,6 +2757,7 @@ export interface ProjectTreeRepo {
   id: string
   label: string
   path?: string | null
+  workspace_available?: boolean | null
   groups?: ProjectTreeLane[]
   sessionCount?: number
 }
@@ -2766,6 +2769,7 @@ export interface ProjectTreeLane {
   isMain?: boolean
   isKanban?: boolean
   isGit?: boolean
+  workspace_available?: boolean | null
   sessions?: ProjectTreeSession[]
 }
 /** ``methods_projects._project_tree_row`` + ``project_tree.stamp_profile``: the minimal row the sidebar renders, stamped with the profile it belongs to. */
@@ -2798,6 +2802,7 @@ export interface ProjectTreeSession {
   _lineage_ids?: string[] | null
   continuation_kind?: string | null
   profile?: string | null
+  workspace_available?: boolean | null
   [key: string]: unknown
 }
 export interface ProjectsProjectSessionsParams {

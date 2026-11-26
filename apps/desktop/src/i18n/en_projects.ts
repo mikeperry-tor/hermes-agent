@@ -5,6 +5,7 @@ export const enProjects: Translations['sidebar']['projects'] = {
   sectionLabel: 'Projects',
   home: 'Home',
   autoDiscovered: 'Auto-discovered',
+  folderUnavailable: 'Folder unavailable',
   newButton: 'New project',
   createTitle: 'New project',
   createDesc: 'Name a workspace and add one or more folders.',

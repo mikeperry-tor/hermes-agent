@@ -106,6 +106,32 @@ interface ProjectOverviewRowProps {
   style?: React.CSSProperties
 }
 
+function projectSessionAction(project: SidebarProjectTree, action: ((path: null | string) => void) | undefined) {
+  return project.workspace_available === false ? undefined : action
+}
+
+function ProjectOverviewLink({ project, isActive, onEnter }: {
+  project: SidebarProjectTree; isActive?: boolean; onEnter?: (id: string) => void
+}) {
+  const s = useI18n().t.sidebar
+  const folderUnavailable = project.workspace_available === false
+  const status = folderUnavailable ? s.projects.folderUnavailable : project.isAuto ? s.projects.autoDiscovered : ''
+  const link = (
+    <SidebarRowLink
+      // The glyph is aria-hidden and the tooltip only speaks on hover, so the
+      // link's own name carries the auto cue — screen readers get it too.
+      aria-label={status ? `${s.projects.enter(project.label)} (${status})` : s.projects.enter(project.label)}
+      labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
+      onClick={() => onEnter?.(project.id)}
+    >
+      {project.label}
+      {folderUnavailable && <Codicon aria-hidden="true" className="ml-1.5 text-muted-foreground" name="warning" />}
+    </SidebarRowLink>
+  )
+
+  return status ? <Tip label={status}>{link}</Tip> : link
+}
+
 export function ProjectOverviewRow({
   project,
   onEnter,
@@ -190,21 +216,8 @@ export function ProjectOverviewRow({
     <SidebarRowLead>{projectIcon(project)}</SidebarRowLead>
   )
 
-  const labelLink = (
-    <SidebarRowLink
-      // The glyph is aria-hidden and the tooltip only speaks on hover, so the
-      // link's own name carries the auto cue — screen readers get it too.
-      aria-label={
-        project.isAuto
-          ? `${s.projects.enter(project.label)} (${s.projects.autoDiscovered})`
-          : s.projects.enter(project.label)
-      }
-      labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
-      onClick={() => onEnter?.(project.id)}
-    >
-      {project.label}
-    </SidebarRowLink>
-  )
+  const startSession = projectSessionAction(project, onNewSession)
+
 
   const shell = (
     <SidebarGroupRow
@@ -215,10 +228,10 @@ export function ProjectOverviewRow({
               folder" chat. New session sits outermost: it's the one you reach
               for. */}
           {!project.isNoProject && <ProjectMenu anchorRef={rowRef} isActive={isActive} project={project} />}
-          {onNewSession && (
+          {startSession && (
             <WorkspaceAddButton
               label={s.newSessionIn(project.label)}
-              onClick={() => onNewSession(newSessionPath)}
+              onClick={() => startSession(newSessionPath)}
               onPointerDown={
                 onNewSessionSplit
                   ? event => {
@@ -246,7 +259,7 @@ export function ProjectOverviewRow({
       }
       className={cn(dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
       data-glass-opaque={dragging ? '' : undefined}
-      label={project.isAuto ? <Tip label={s.projects.autoDiscovered}>{labelLink}</Tip> : labelLink}
+      label={<ProjectOverviewLink isActive={isActive} project={project} onEnter={onEnter} />}
       lead={lead}
       // The label is grab surface too, not just the lead's grabber — the
       // pointer activator only (the full handle stays on the grabber, see

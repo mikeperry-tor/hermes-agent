@@ -78,3 +78,28 @@ def test_resolve_chat_cwd_fails_closed_and_reaches_the_tui_env(monkeypatch, tmp_
 
     _argv, _cwd, env = web_server_chat._resolve_chat_argv()
     assert "HERMES_TUI_CWD" not in env
+
+
+def test_managed_pty_passes_the_executor_selection_as_data(monkeypatch, tmp_path):
+    from hermes_cli import main_resume_args, main_tui_launch
+    from tui_gateway import managed_project_queries
+
+    selected = "/workspace/only on executor"
+    access = (("/workspace",), {})
+    monkeypatch.setattr(managed_project_queries, "profile_project_access", lambda: access)
+    monkeypatch.setattr(managed_project_queries, "current_project_facts", lambda _access, _paths: {
+        selected: {"cwd": selected, "branch": "executor"},
+    })
+    monkeypatch.setattr(main_resume_args, "uses_managed_executor", lambda: True)
+    monkeypatch.setattr(main_tui_launch, "_make_tui_argv", lambda *_a, **_k: (["node", "fake-tui.js"], tmp_path))
+    monkeypatch.setenv("HERMES_CWD", str(tmp_path))
+
+    assert chat_workspaces.resolve_chat_cwd(selected) == selected
+    with pytest.raises(HTTPException, match="unavailable"):
+        chat_workspaces.resolve_chat_cwd(str(tmp_path))
+    _argv, cwd, env = web_server_chat._resolve_chat_argv(workspace_cwd=selected)
+
+    assert cwd == str(tmp_path) or cwd == tmp_path
+    assert env["HERMES_CWD"] == str(tmp_path)
+    assert env["HERMES_TUI_CWD"] == selected
+    assert env["HERMES_TUI_CWD_EXPLICIT"] == "1"

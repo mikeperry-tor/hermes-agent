@@ -158,6 +158,7 @@ class ProjectsForCwdResult(Result):
     project: ProjectInfo | None = None
     cwd: str
     branch: str = ""
+    available: bool | None = None
 
 
 method("projects.for_cwd", params=ProjectsForCwdParams, result=ProjectsForCwdResult,
@@ -238,6 +239,7 @@ class ProjectTreeSession(StoredSessionRow):
     sidebar renders, stamped with the profile it belongs to."""
 
     profile: str | None = None
+    workspace_available: bool | None = None
 
 
 class ProjectTreeLane(Result):
@@ -252,6 +254,7 @@ class ProjectTreeLane(Result):
     # path-only heuristic lane for a non-git folder is isMain but isGit=False,
     # so the renderer never offers `git switch` on it (#61362).
     isGit: bool = True
+    workspace_available: bool | None = None
     sessions: list[ProjectTreeSession] = Field(default_factory=list)
 
 
@@ -259,6 +262,7 @@ class ProjectTreeRepo(Result):
     id: str
     label: str
     path: str | None = None
+    workspace_available: bool | None = None
     groups: list[ProjectTreeLane] = Field(default_factory=list)
     sessionCount: int = 0
 
@@ -273,6 +277,7 @@ class ProjectTreeNode(Result):
     icon: str | None = None
     isAuto: bool = False
     isNoProject: bool = False
+    workspace_available: bool | None = None
     sessionCount: int = 0
     lastActive: float = 0.0
     totalTokens: int = 0

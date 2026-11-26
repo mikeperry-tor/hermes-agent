@@ -4,6 +4,7 @@ export interface SidebarProjectsTranslations {
   sectionLabel: string
   home: string
   autoDiscovered: string
+  folderUnavailable: string
   newButton: string
   createTitle: string
   createDesc: string

@@ -9,6 +9,7 @@ import type { ChatWorkspacesResponse } from "@/lib/api";
 export interface WorkspaceOption {
   value: string;
   label: string;
+  unavailable?: true;
 }
 
 const STORAGE_PREFIX = "hermes-chat-workspace:";
@@ -53,24 +54,24 @@ export function abbreviateHomePath(path: string, home: string): string {
 export function workspaceOptions(data: ChatWorkspacesResponse): WorkspaceOption[] {
   const seen = new Set<string>();
   const out: WorkspaceOption[] = [];
-  const push = (value: string, label: string) => {
+  const push = (value: string, label: string, available?: boolean) => {
     if (!value || seen.has(value)) return;
     seen.add(value);
-    out.push({ value, label });
+    out.push(available === false ? { value, label, unavailable: true } : { value, label });
   };
   for (const project of data.projects) {
     if (project.archived) continue;
     const folders = project.folders.length
       ? project.folders
       : project.primary_path
-        ? [{ path: project.primary_path, label: null, is_primary: true }]
+        ? [{ path: project.primary_path, label: null, is_primary: true, workspace_available: undefined }]
         : [];
     for (const folder of folders) {
       const suffix =
         folders.length > 1
           ? ` · ${folder.label || abbreviateHomePath(folder.path, data.home)}`
           : "";
-      push(folder.path, `${project.name}${suffix}`);
+      push(folder.path, `${project.name}${suffix}`, folder.workspace_available);
     }
   }
   const repos = [...data.repos].sort((a, b) => b.last_active - a.last_active);

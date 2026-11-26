@@ -174,6 +174,7 @@ interface LocalPreviewState {
   /** The read confirmed the file is gone (not a transient failure) — renders
    *  the explicit tombstone and prunes the tab from future restores. */
   missing?: boolean
+  path?: string
   text?: string
   loading: boolean
   truncated?: boolean
@@ -740,11 +741,28 @@ export function SourceView({ filePath, language, text }: { filePath?: string; la
 
 export type PreviewViewMode = 'diff' | 'rendered' | 'source'
 
+function previewReadFailure(error: unknown, tabId: string | undefined, sessionId: null | string | undefined, url: string) {
+  const missing = error instanceof DesktopFileMissingError
+
+  if (missing && tabId) {
+    markPreviewTabMissing(tabId, { onlyTab: true })
+  } else if (missing && !sessionId) {
+    markPreviewTabMissing(url)
+  }
+
+  return {
+    error: error instanceof Error ? error.message : String(error),
+    loading: false,
+    missing
+  }
+}
+
 export function LocalFilePreview({
   onClose,
   onSelectRendered,
   reloadKey,
   sessionId,
+  tabId,
   target
 }: {
   /** Closes the preview's tab; offered when the file can't be shown. */
@@ -755,6 +773,7 @@ export function LocalFilePreview({
   reloadKey: number
   /** The session whose tab this is: a gateway read and Save resolve `/workspace` in its sandbox. */
   sessionId?: string
+  tabId?: string
   target: PreviewTarget
 }) {
   const { t } = useI18n()
@@ -774,6 +793,7 @@ export function LocalFilePreview({
   const draftRef = useRef('')
   const baselineRef = useRef('')
   const editorScopeRef = useRef('')
+  const editPathRef = useRef('')
   const [dirty, setDirty] = useState(false)
   const [editorKey, setEditorKey] = useState(0)
   const [saving, setSaving] = useState(false)
@@ -850,6 +870,7 @@ export function LocalFilePreview({
             byteSize: result.byteSize,
             language: result.language || target.language || 'text',
             loading: false,
+            path: result.path,
             text: shouldBlock ? undefined : result.text,
             truncated: result.truncated
           })
@@ -859,8 +880,8 @@ export function LocalFilePreview({
           // Empty (clean file / not a repo / remote) just hides the option.
           if (!shouldBlock) {
             try {
-              const root = await desktopGitRoot(filePath)
-              const diff = root ? await desktopFileDiff(root, filePath) : ''
+              const root = await desktopGitRoot(result.path)
+              const diff = root ? await desktopFileDiff(root, result.path) : ''
 
               if (active && diff.trim()) {
                 setState(prev => (prev.text === result.text ? { ...prev, diff } : prev))
@@ -872,20 +893,7 @@ export function LocalFilePreview({
         }
       } catch (error) {
         if (active) {
-          // Expected absence (deleted / moved / cleared /tmp): tombstone the
-          // tab so the next launch drops it instead of re-probing the dead
-          // path, and show the explicit "file no longer exists" state.
-          const missing = error instanceof DesktopFileMissingError
-
-          if (missing) {
-            markPreviewTabMissing(target.url)
-          }
-
-          setState({
-            error: error instanceof Error ? error.message : String(error),
-            loading: false,
-            missing
-          })
+          setState(previewReadFailure(error, tabId, sessionId, target.url))
         }
       }
     }
@@ -906,6 +914,7 @@ export function LocalFilePreview({
     reloadKey,
     selfReload,
     sessionId,
+    tabId,
     target.dataUrl,
     target.language,
     target.url
@@ -966,6 +975,7 @@ export function LocalFilePreview({
   const beginEdit = () => {
     const text = state.text ?? ''
     editorScopeRef.current = fileEditScopeKey()
+    editPathRef.current = state.path || filePath
     baselineRef.current = text
     draftRef.current = text
     setDirty(false)
@@ -1038,6 +1048,7 @@ export function LocalFilePreview({
     // Keep the edit's owner across awaits: the FS facade routes each call via
     // the window's current connection, which can change while validation waits.
     const saveScope = editorScopeRef.current
+    const savePath = editPathRef.current
 
     const requireEditorOwner = () => {
       if (fileEditScopeKey() !== saveScope) {
@@ -1054,7 +1065,7 @@ export function LocalFilePreview({
       // choice. `force` is the user picking "overwrite" from that banner.
       if (!force) {
         try {
-          const current = await readTextPreview(filePath, sessionId)
+          const current = await readTextPreview(savePath, sessionId)
 
           if (!current.binary && (current.text ?? '') !== baselineRef.current) {
             setConflict(true)
@@ -1070,7 +1081,7 @@ export function LocalFilePreview({
       // Also guards Overwrite: bypassing a content conflict never authorizes
       // writing the same path on another connection/profile or this device.
       requireEditorOwner()
-      await writeDesktopFileText(filePath, draftRef.current, { sessionId })
+      await writeDesktopFileText(savePath, draftRef.current, { sessionId })
       baselineRef.current = draftRef.current
       setDirty(false)
       setConflict(false)

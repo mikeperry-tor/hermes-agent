@@ -17,6 +17,11 @@ def create() -> dict | None:
     -> ``{path, branch, repo_root, base}``, or None when it could not be made (the reason was
     printed). Pass ``path`` as the session's cwd.
     """
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        print("Worktree creation is unavailable for an SSH executor workspace.", file=sys.stderr)
+        return None
     wt_info = None
     try:
         from cli import _git_repo_root, _maintain_pack_health, _prune_stale_worktrees, _setup_worktree
@@ -55,6 +60,10 @@ def restore(session_id: str) -> str | None:
 
     -> its path, or None when the session's directory exists or is not a tree Hermes recorded.
     """
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        return None
     cwd = ""
     from hermes_cli.main import _session_db
     with _session_db() as db:  # a store error is swallowed: nothing to recreate
@@ -108,6 +117,10 @@ def finish(info: dict, session_id: str | None, *, ask: bool) -> None:
     handed to *session_id* (when set) so the sweep keeps it while that session can resume, and its
     path is printed to stderr.
     """
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    if uses_managed_executor():
+        return
     if ask:
         from hermes_cli.worktree_exit import ask_exit_choice
         ask_exit_choice(info)

@@ -235,6 +235,7 @@ export const en: Translations = {
     newChat: "New chat",
     workspace: "workspace",
     workspaceDefault: "Default",
+    workspaceUnavailable: "Folder unavailable",
     workspaceRescan: "Rescan repositories",
     workspaceCustom: "Other path…",
     previousPage: "Previous page",

@@ -11,11 +11,13 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from hermes_cli.web_git_executor import CURRENT as _EXECUTOR_GIT
 
 from hermes_cli._subprocess_compat import (
     FILTER_DISCOVERY_FAILED,
@@ -69,6 +71,8 @@ def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int
     in ``.gitattributes`` on a stat-dirty file, and those commands are emptied. When the filters
     cannot be discovered git is not spawned and the result is ``(1, "", FILTER_DISCOVERY_FAILED)``.
     """
+    if executor := _EXECUTOR_GIT.get():
+        return executor.run(cwd, args, timeout)
     env = noninteractive_repo_git_env(cwd)
     if env is None:
         return 1, "", FILTER_DISCOVERY_FAILED
@@ -81,6 +85,8 @@ def _git_write(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tup
     Repository filters stay active: staging or checking out with an emptied clean/smudge filter
     would store or write unconverted content (encrypted files, large-file pointers).
     """
+    if executor := _EXECUTOR_GIT.get():
+        return executor.run(cwd, args, timeout, write=True)
     return _git_in(cwd, args, timeout, noninteractive_git_env())
 
 
@@ -106,6 +112,8 @@ def _git_ok(cwd: str, args: list[str]) -> None:
 
 
 def _is_dir(cwd: str) -> bool:
+    if executor := _EXECUTOR_GIT.get():
+        return executor.directory(cwd)
     try:
         return Path(cwd).is_dir()
     except OSError:
@@ -159,18 +167,29 @@ def _numstat(cwd: str, args: list[str]) -> dict[str, tuple[int, int]]:
 
 
 def _untracked_insertions(cwd: str, rel: str) -> int:
-    """Line count of an untracked file (+N for new files in the review tree). Binary/oversized → 0."""
-    try:
-        target = Path(cwd) / rel
-        if not os.path.isfile(target) or target.stat().st_size > _UNTRACKED_LINE_MAX_BYTES:
+    """Line count of an untracked file (+N for new files in the review tree). Binary/oversized returns zero."""
+    if executor := _EXECUTOR_GIT.get():
+        import base64
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+        try:
+            state = executor.file(cwd, rel, missing=False)
+        except SshWorkspaceFsError as exc:
+            if exc.code == "EACCES":
+                return 0
+            raise
+        result = executor.file_ops().read_inspected_ssh_bytes(state, _UNTRACKED_LINE_MAX_BYTES)
+        data = base64.b64decode(result.base64_content) if result.base64_content is not None else b""
+    else:
+        try:
+            target = Path(cwd) / rel
+            if not os.path.isfile(target) or target.stat().st_size > _UNTRACKED_LINE_MAX_BYTES:
+                return 0
+            data = target.read_bytes()
+        except OSError:
             return 0
-        data = target.read_bytes()
-        if b"\0" in data:
-            return 0
-        lines = data.count(b"\n")
-        return lines + 1 if data and not data.endswith(b"\n") else lines
-    except OSError:
-        return 0
+    lines = data.count(b"\n") if b"\0" not in data else 0
+    return lines + 1 if data and b"\0" not in data and not data.endswith(b"\n") else lines
 
 
 def _branch_base(cwd: str) -> str | None:
@@ -288,7 +307,7 @@ def review_list(cwd: str, scope: str, base_ref: str | None) -> dict:
     if not _is_dir(cwd):
         return {"files": [], "base": None}
     if scope in ("branch", "lastTurn"):
-        base = _branch_base(cwd) if scope == "branch" else base_ref
+        base = _branch_base(cwd) if scope == "branch" else _executor_revision(cwd, base_ref)
         if not base:
             return {"files": [], "base": None}
         rng = f"{base}...HEAD" if scope == "branch" else base
@@ -319,9 +338,20 @@ def review_list(cwd: str, scope: str, base_ref: str | None) -> dict:
     return _review_result(cwd, files, None)
 
 
+def _executor_revision(cwd, ref):
+    if not ref or _EXECUTOR_GIT.get() is None:
+        return ref
+    return _git_line(cwd, ["rev-parse", "--verify", "--end-of-options", ref + "^{commit}"]) or None
+
+
 def _all_add_diff(cwd: str, file_path: str) -> str:
     """Synthesized all-add diff for an untracked file (``--no-index`` exits non-zero by design)."""
-    if not (Path(cwd) / file_path).is_file():
+    if executor := _EXECUTOR_GIT.get():
+        state = executor.file(cwd, file_path)
+        if state.kind != "regular":
+            return ""
+        file_path = state.path
+    elif not (Path(cwd) / file_path).is_file():
         return ""
     return _git(cwd, ["diff", "--no-index", "--", os.devnull, file_path])[1]
 
@@ -332,9 +362,14 @@ def _single_file_diff(cwd: str, args: list[str], file_path: str) -> str:
     names = _git_out(cwd, ["diff", *args, "--no-renames", "--name-only", "-z", "--", literal])
     if not names:
         return ""
-    root = Path(_git_line(cwd, ["rev-parse", "--show-toplevel"]))
-    target = (Path(cwd) / file_path).resolve()
-    if any((root / name).resolve() != target for name in names.split("\0") if name):
+    root = _git_line(cwd, ["rev-parse", "--show-toplevel"])
+    if executor := _EXECUTOR_GIT.get():
+        target = executor.file(cwd, file_path).path
+        different = any(executor.file(root, n).path != target for n in names.split("\0") if n)
+    else:
+        target = (Path(cwd) / file_path).resolve()
+        different = any((Path(root) / name).resolve() != target for name in names.split("\0") if name)
+    if different:
         raise RuntimeError("Expected a single file, not a directory")
     return _git_out(cwd, ["diff", *args, "--no-renames", "--", literal])
 
@@ -346,7 +381,8 @@ def review_diff(cwd: str, file_path: str, scope: str, base_ref: str | None, stag
         base = _branch_base(cwd)
         return _single_file_diff(cwd, [f"{base}...HEAD"], file_path) if base else ""
     if scope == "lastTurn":
-        return _single_file_diff(cwd, [base_ref], file_path) if base_ref else ""
+        base = _executor_revision(cwd, base_ref)
+        return _single_file_diff(cwd, [base], file_path) if base else ""
     if staged:
         return _single_file_diff(cwd, ["--cached"], file_path)
     worktree = _single_file_diff(cwd, [], file_path)
@@ -367,17 +403,26 @@ def file_diff_vs_head(cwd: str, file_path: str) -> str:
 
 
 def review_stage(cwd: str, file_path: str | None) -> dict:
+    if file_path and (executor := _EXECUTOR_GIT.get()):
+        executor.file(cwd, file_path)
+        file_path = f":(literal){file_path}"
     _git_ok(cwd, ["add", "--", file_path] if file_path else ["add", "-A"])
     return {"ok": True}
 
 
 def review_unstage(cwd: str, file_path: str | None) -> dict:
+    if file_path and (executor := _EXECUTOR_GIT.get()):
+        executor.file(cwd, file_path)
+        file_path = f":(literal){file_path}"
     _git_ok(cwd, ["reset", "-q", "HEAD", *(["--", file_path] if file_path else [])])
     return {"ok": True}
 
 
 def review_revert(cwd: str, file_path: str | None) -> dict:
     """Discard changes back to the committed state (restore tracked, remove untracked)."""
+    if file_path and (executor := _EXECUTOR_GIT.get()):
+        executor.file(cwd, file_path)
+        file_path = f":(literal){file_path}"
     target = ["--", file_path or "."]
     _git_write(cwd, ["checkout", "HEAD", *target])
     _git_write(cwd, ["clean", "-fd", *target])
@@ -385,6 +430,8 @@ def review_revert(cwd: str, file_path: str | None) -> dict:
 
 
 def review_rev_parse(cwd: str, ref: str | None) -> str | None:
+    if _EXECUTOR_GIT.get() is not None:
+        return _executor_revision(cwd, ref or "HEAD")
     return _git_line(cwd, ["rev-parse", ref or "HEAD"]) or None
 
 
@@ -629,12 +676,17 @@ def worktree_list(cwd: str, *, run: _GitRunner = _git) -> list[dict]:
             trees[-1]["detached"] = True
         elif line.startswith("locked"):
             trees[-1]["locked"] = True
+    if executor := _EXECUTOR_GIT.get():
+        from hermes_cli.ssh_project_probe import _under_roots
+        return [tree for tree in trees if _under_roots(tree["path"], executor.roots)]
     return trees
 
 
 def _main_root(cwd: str) -> str:
     """Main tree of *cwd*'s repository; only the mutating worktree operations ask."""
     trees = worktree_list(cwd, run=_git_write)
+    if _EXECUTOR_GIT.get() is not None and (not trees or not trees[0]["isMain"]):
+        raise RuntimeError("The main checkout is outside the applied SSH workspace roots.")
     return trees[0]["path"] if trees else cwd
 
 
@@ -658,6 +710,8 @@ def _fetch_tracking_ref(root: str, remote: str, branch: str) -> bool:
     """
     from hermes_cli.update_cmd_check import tracking_refspec
 
+    if _EXECUTOR_GIT.get() is not None:
+        return False
     return _git_write(root, ["fetch", remote, tracking_refspec(remote, branch)])[0] == 0
 
 
@@ -693,6 +747,11 @@ def _ensure_repo(cwd: str) -> None:
 
 def _unique_dir(base: str) -> str:
     candidates = itertools.chain([base], (f"{base}-{n}" for n in itertools.count(2)))
+    if executor := _EXECUTOR_GIT.get():
+        parent = posixpath.dirname(base)
+        if executor.checkout_target(parent) not in ("absent", "directory"):
+            raise RuntimeError("The executor worktree parent is unavailable.")
+        return next(candidate for candidate in candidates if executor.checkout_target(candidate) == "absent")
     return next(c for c in candidates if not os.path.exists(c))
 
 
@@ -759,12 +818,13 @@ def _worktree_for_existing(root: str, raw_name: str) -> dict:
 
 
 def worktree_add(cwd: str, options: dict) -> dict:
-    _ensure_repo(cwd)
+    if _EXECUTOR_GIT.get() is None:
+        _ensure_repo(cwd)
     root = _main_root(cwd)
     options = options or {}
     if options.get("existingBranch"):
         result = _worktree_for_existing(root, options["existingBranch"])
-        if result.get("path") != root:  # a new checkout, not a switch of the main tree
+        if _EXECUTOR_GIT.get() is None and result.get("path") != root:
             from hermes_cli.worktree_registry import record_worktree_repo
             record_worktree_repo(root)
         return result
@@ -787,18 +847,27 @@ def worktree_add(cwd: str, options: dict) -> dict:
             # Branching off a remote-tracking ref auto-wires upstream tracking; the user wants
             # a standalone local branch (Electron-op parity).
             args.append("--no-track")
+        if _EXECUTOR_GIT.get() is not None:
+            base = _executor_revision(root, base)
+            if not base:
+                raise RuntimeError("The requested base ref is unavailable on the SSH executor.")
         args.append(base)
     code, _, err = _git_write(root, args)
     if code != 0:
         if "already exists" not in (err or "").lower():
             raise RuntimeError(err.strip() or "git worktree add failed")
         _git_ok(root, ["worktree", "add", target, branch])
-    from hermes_cli.worktree_registry import record_worktree_repo
-    record_worktree_repo(root)
+    if _EXECUTOR_GIT.get() is None:
+        from hermes_cli.worktree_registry import record_worktree_repo
+        record_worktree_repo(root)
     return {"path": target, "branch": branch, "repoRoot": root}
 
 
 def worktree_remove(cwd: str, worktree_path: str, force: bool) -> dict:
+    if executor := _EXECUTOR_GIT.get():
+        admitted = {tree["path"] for tree in worktree_list(cwd) if not tree["isMain"]}
+        if worktree_path not in admitted or executor.checkout_target(worktree_path) != "directory":
+            raise RuntimeError("Select an existing executor worktree to remove.")
     _git_ok(_main_root(cwd), ["worktree", "remove", *(["--force"] if force else []), worktree_path])
     return {"removed": worktree_path}
 

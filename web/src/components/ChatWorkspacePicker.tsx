@@ -131,8 +131,8 @@ export function ChatWorkspacePicker({
       >
         <SelectOption value="">{defaultLabel}</SelectOption>
         {options.map((opt) => (
-          <SelectOption key={opt.value} value={opt.value}>
-            {opt.label}
+          <SelectOption key={opt.value} value={opt.value} disabled={opt.unavailable}>
+            {opt.unavailable ? `${opt.label} · ${t.sessions.workspaceUnavailable ?? "Folder unavailable"}` : opt.label}
           </SelectOption>
         ))}
         {!valueListed && !customOpen && (

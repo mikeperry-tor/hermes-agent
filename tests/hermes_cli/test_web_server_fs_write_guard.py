@@ -5,7 +5,10 @@ write any resolvable path: a credential store read-text refuses, a file outside 
 managed-files root, or ``~/.ssh/authorized_keys``.
 """
 
+import ctypes
+import io
 import os
+import sys
 
 import pytest
 
@@ -123,11 +126,99 @@ def test_write_text_never_hands_a_credential_path_to_the_ssh_workspace(client, m
         "/srv/app/auth.json\n/b/..",
         "/srv/app/config.yaml\x1f/q/..",
     ):
-        assert _save(client, path, profile="remote-dev").status_code == 403, repr(path)
+        response = _save(client, path, profile="remote-dev")
+        assert response.status_code == 403, (repr(path), response.text)
     assert sent == []
     saved = _save(client, "/srv/app/README.md ", profile="remote-dev")
     assert (saved.status_code, saved.json()["path"]) == (200, "/srv/app/README.md")
     assert len(sent) == 1
+
+
+@pytest.mark.platforms("linux")
+def test_managed_ssh_editor_uses_the_shared_publisher(client, tmp_path, monkeypatch, capsys):
+    from tools.file_operations import ShellFileOperations
+    from tools.file_operations_ssh_acl import SSH_PROJECT_ACL
+
+    project = tmp_path / "project"
+    project.mkdir()
+    sibling = tmp_path / "project-sibling"
+    sibling.mkdir()
+    retired = tmp_path / "retired"
+    retired.symlink_to(sibling, target_is_directory=True)
+    executor_home = tmp_path / "executor-home"
+    executor_home.mkdir()
+    monkeypatch.setenv("HOME", str(executor_home))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    configured = {"terminal": {
+        "backend": "ssh", "ssh_host": "executor", "ssh_user": "runner", "ssh_port": 22,
+        "ssh_key": "/key", "ssh_config": "/known-hosts", "ssh_workspace_roots": [str(project), str(retired)],
+    }}
+    monkeypatch.setattr("hermes_cli.managed_scope.load_managed_config", lambda **_: configured)
+
+    class SshMachine:
+        cwd = str(project)
+
+    monkeypatch.setattr(
+        "hermes_cli.web_routers.session_files.managed_project_connection",
+        lambda *_: SshWorkspaceFs(SshMachine()),
+    )
+    acl = {"ctypes": ctypes, "WriteError": RuntimeError}
+    exec(SSH_PROJECT_ACL, acl)
+    try:
+        libacl = acl["acl_library"]()
+    except RuntimeError:
+        pytest.skip("libacl is unavailable")
+
+    def execute(_ops, snippet, *, stdin_data=None):
+        source = io.TextIOWrapper(io.BytesIO((stdin_data or "").encode("ascii")))
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "stdin", source)
+            env = {}
+            exec(compile(snippet, "<ssh executor>", "exec"), env)
+        return capsys.readouterr().out
+
+    monkeypatch.setattr(ShellFileOperations, "_framed_ssh_file_output", execute)
+    executable = project / "run.sh"
+    executable.write_text("first")
+    executable.chmod(0o755)
+    with executable.open("rb") as initial:
+        initial_acl = acl["acl_rows"](libacl, initial.fileno())
+    assert _save(client, executable, "second").status_code == 200
+    assert executable.read_text() == "second" and executable.stat().st_mode & 0o777 == 0o755
+    with executable.open("rb") as updated:
+        assert acl["acl_rows"](libacl, updated.fileno()) == initial_acl
+    assert _save(client, project / "new.txt", "third").status_code == 200
+    assert (project / "new.txt").read_text() == "third"
+    forbidden = sibling / "ungranted.txt"
+    assert _save(client, forbidden).status_code == 403 and not forbidden.exists()
+    assert _save(client, retired / forbidden.name).status_code == 403
+    assert not forbidden.exists()
+    missing = project / "missing-parent" / "new.txt"
+    assert _save(client, missing).status_code == 404 and not missing.parent.exists()
+    assert _save(client, project).status_code == 400
+    credential = project / ".env.local"
+    credential.write_text("existing")
+    alias = project / "notes.txt"
+    alias.symlink_to(credential)
+    assert _save(client, alias).status_code == 403 and credential.read_text() == "existing"
+
+    def race(ops, snippet, *, stdin_data=None):
+        if "\nprint(json.dumps(publish(" in snippet:
+            executable.write_text("outside editor")
+        return execute(ops, snippet, stdin_data=stdin_data)
+
+    monkeypatch.setattr(ShellFileOperations, "_framed_ssh_file_output", race)
+    assert _save(client, executable, "retry later").status_code == 409
+    assert executable.read_text() == "outside editor"
+
+    def change_before_snapshot(ops, snippet, *, stdin_data=None):
+        if "\nprint(json.dumps(write_digest(" in snippet:
+            executable.write_text("changed before snapshot")
+        return execute(ops, snippet, stdin_data=stdin_data)
+
+    monkeypatch.setattr(ShellFileOperations, "_framed_ssh_file_output", change_before_snapshot)
+    assert _save(client, executable).status_code == 409
+    assert executable.read_text() == "changed before snapshot"
 
 
 def test_write_text_still_saves_an_ordinary_file(client, tmp_path):
@@ -208,3 +299,84 @@ def test_write_text_refuses_a_file_url_naming_an_nt_namespace(client, monkeypatc
     monkeypatch.setattr(file_routes, "_remote_fs_backend", unexpected_fs_access)
     response = _save(client, url)
     assert response.status_code == 403, response.text
+
+
+@pytest.mark.platforms("posix")
+def test_project_picker_creates_a_folder_only_on_the_selected_ssh_backend(client, tmp_path, monkeypatch, capsys):
+    from tools.file_operations import ShellFileOperations
+
+    executor_home = tmp_path / "executor-home"
+    hermes_home = executor_home / ".hermes"
+    profile_dir = hermes_home / "profiles" / "team-dev"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(executor_home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    remote = tmp_path.resolve() / "project"
+    remote.mkdir()
+    sibling = remote.with_name("project-sibling")
+    sibling.mkdir()
+    (remote / "alias").symlink_to(sibling, target_is_directory=True)
+    (remote / "existing").write_text("keep")
+    configured = {
+        "terminal": {
+            "backend": "ssh",
+            "ssh_host": "executor",
+            "ssh_user": "runner",
+            "ssh_port": 2222,
+            "ssh_key": "/etc/hermes/ssh_key",
+            "ssh_config": "/etc/hermes/ssh_config",
+            "ssh_workspace_roots": [str(remote)],
+        }
+    }
+    monkeypatch.setattr("tools.file_tools_paths.load_managed_config", lambda **_: configured)
+    monkeypatch.setattr("hermes_cli.managed_scope.load_managed_config", lambda **_: configured)
+    terminal_scope = {"TERMINAL_ENV": "ssh"}
+    monkeypatch.setattr("tools.terminal_scope.build_profile_terminal_scope", lambda *_a, **_k: dict(terminal_scope))
+
+    class SshMachine:
+        cwd = str(remote)
+
+    def connection(_terminal, home):
+        assert os.path.basename(home) == "team-dev"
+        return SshWorkspaceFs(SshMachine())
+
+    def execute(_ops, snippet):
+        exec(compile(snippet, "<ssh executor>", "exec"), {})
+        return capsys.readouterr().out
+
+    monkeypatch.setattr("hermes_cli.ssh_project_probe.managed_project_connection", connection)
+    monkeypatch.setattr(ShellFileOperations, "_framed_ssh_file_output", execute)
+
+    def create(path):
+        return client.post("/api/fs/mkdir", params={"profile": "team-dev"}, json={"path": str(path)})
+
+    created = remote / "new project"
+    assert create(created).json() == {"ok": True, "path": str(created)}
+    assert create(created).status_code == 200
+    assert created.is_dir()
+    assert create(remote / "existing").status_code == 409
+    assert create(remote / ".env").status_code == 403
+    assert create(sibling / "new").status_code == 403
+    assert create(remote / "alias" / "new").status_code == 400
+    assert not (sibling / "new").exists()
+    assert create(remote / "missing" / "new").status_code == 400
+    assert not (remote / "missing").exists()
+
+    def stopped(_ops, _snippet):
+        raise ValueError("missing SSH response framing")
+
+    monkeypatch.setattr(ShellFileOperations, "_framed_ssh_file_output", stopped)
+    assert create(remote / "offline").status_code == 503
+    assert not (remote / "offline").exists()
+
+    # Removing the backend or losing the applied policy cannot select a local writer.
+    terminal_scope.clear()
+    assert create(remote / "no-backend").status_code == 503
+    assert not (remote / "no-backend").exists()
+    terminal_scope["TERMINAL_ENV"] = "ssh"
+    configured["terminal"]["ssh_workspace_roots"] = []
+    refused = create(remote / "no-roots")
+    assert refused.status_code == 503
+    assert "SSH workspace is unavailable" in refused.json()["detail"]
+    assert not (remote / "no-roots").exists()

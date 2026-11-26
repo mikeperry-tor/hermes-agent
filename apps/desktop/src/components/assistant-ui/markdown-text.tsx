@@ -51,6 +51,7 @@ import {
   mediaPathFromMarkdownHref,
   validImageDimensions
 } from '@/lib/media'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { remarkSoftBreaks } from '@/lib/remark-soft-breaks'
 import { sessionRefFromMarkdownHref } from '@/lib/session-refs'
@@ -306,6 +307,26 @@ function PreviewOnlyMarkdownLink({ children, className, href }: ComponentProps<'
   return <ExternalLink className={cn('wrap-anywhere', className)} href={target.href}>{children}</ExternalLink>
 }
 
+function relativeWorkspaceLink(href?: string): string | null {
+  if (!href || !isDesktopFsRemoteMode() || /[:?#\\]/.test(href)) {
+    return null
+  }
+
+  const explicit = /^(?:\.\.?\/)(?!\/)/.test(href)
+  const fileName = /^(?:[\w-]+\/)*(?:(?:Dockerfile|Makefile|README|LICENSE)|[^/]+\.(?:txt|md|csv|json|ya?ml|toml|lock|conf|log|py|go|rs|c|h|cpp|java|sql|css|ts|tsx|js|jsx|sh|pdf|png|jpe?g|webp|gif|svg|html?))$/i
+  if (!explicit && !fileName.test(href)) {
+    return null
+  }
+  try {
+    const decoded = decodeURIComponent(href)
+    return /%2f|%5c/i.test(href) || decoded.split('/').some((part, i) =>
+      (part === '.' || part === '..') && part !== href.split('/')[i]
+    ) ? null : decoded
+  } catch {
+    return null
+  }
+}
+
 function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a'>) {
   const mediaPath = mediaPathFromMarkdownHref(href)
 
@@ -332,7 +353,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
     return <ToolMediaSlot path={mediaPath}>{builtIn}</ToolMediaSlot>
   }
 
-  const previewTarget = previewTargetFromMarkdownHref(href)
+  const previewTarget = previewTargetFromMarkdownHref(href) ?? relativeWorkspaceLink(href)
 
   if (previewTarget) {
     return <PreviewAttachment target={previewTarget} />
@@ -673,7 +694,7 @@ function holdsMediaLink(children: ReactNode): boolean {
     const href = typeof child.props.href === 'string' ? child.props.href : ''
 
     return (
-      (href !== '' && (mediaPathFromMarkdownHref(href) !== null || (!href.startsWith('#') && isFileMediaPath(href)))) ||
+      (href !== '' && (mediaPathFromMarkdownHref(href) !== null || relativeWorkspaceLink(href) !== null || (!href.startsWith('#') && isFileMediaPath(href)))) ||
       holdsMediaLink(child.props.children)
     )
   })

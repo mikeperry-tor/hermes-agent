@@ -73,11 +73,11 @@ export function EnteredProjectContent({
     <>
       {project.repos.map(repo => (
         <RepoFlatSection
-          discoveredWorktrees={repo.path ? repoWorktrees?.[repo.path] : undefined}
+          discoveredWorktrees={repo.path && repo.workspace_available !== false ? repoWorktrees?.[repo.path] : undefined}
           key={repo.id}
           liveSessions={liveSessions}
-          onNewSession={owned.onNewSession}
-          onNewSessionSplit={owned.onNewSessionSplit}
+          onNewSession={repo.workspace_available === false ? undefined : owned.onNewSession}
+          onNewSessionSplit={repo.workspace_available === false ? undefined : owned.onNewSessionSplit}
           owner={projectOwnerRoute(project)}
           removedSessionIds={removedSessionIds}
           renderRows={renderRows}
@@ -210,9 +210,11 @@ function RepoFlatSection({
           key={group.id}
           // The kanban bucket is read-only: it aggregates many task worktrees, so
           // "new session here" and "remove worktree" have no single target.
-          onNewSession={group.isKanban ? undefined : onNewSession}
-          onNewSessionSplit={group.isKanban ? undefined : onNewSessionSplit}
-          onRemove={group.isMain || group.isKanban ? undefined : () => setRemoveTarget(group)}
+          onNewSession={group.isKanban || group.workspace_available === false ? undefined : onNewSession}
+          onNewSessionSplit={group.isKanban || group.workspace_available === false ? undefined : onNewSessionSplit}
+          onRemove={
+            group.isMain || group.isKanban || group.workspace_available === false ? undefined : () => setRemoveTarget(group)
+          }
           owner={owner}
           renderRows={renderRows}
         />
