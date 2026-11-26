@@ -64,7 +64,7 @@ def _captured_context_cwd(agent):
 def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id, expected):
     """A profile can expose kanban tools without making the session a worker."""
     from agent.agent_init import _load_tools
-    from agent.prompt_builder import KANBAN_GUIDANCE
+    from agent.system_prompt import _tool_guidance_block
     import model_tools
 
     if task_id is None:
@@ -81,7 +81,9 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
 
     _load_tools(agent, enabled_toolsets=["kanban"], disabled_toolsets=None)
 
-    assert (agent._kanban_worker_guidance == KANBAN_GUIDANCE) is expected
+    assert ("Kanban task execution protocol" in (_tool_guidance_block(agent) or "")) is expected
+    agent.valid_tool_names.remove("kanban_show")
+    assert _tool_guidance_block(agent) is None
 
 
 @pytest.mark.parametrize("task_id, owner, expected", [
@@ -89,13 +91,12 @@ def test_kanban_guidance_requires_worker_task_at_agent_init(monkeypatch, task_id
     ("t_worker", True, True),   # the dispatcher-owned worker
     ("t_worker", False, False), # cron run / delegate child inheriting the worker's env
 ])
-def test_kanban_guidance_fallback_requires_owned_worker_task(monkeypatch, task_id, owner, expected):
+def test_kanban_guidance_requires_owned_worker_task(monkeypatch, task_id, owner, expected):
     """Prompt fallback preserves the worker boundary when init was bypassed: tool access
     is not identity, and an inherited HERMES_KANBAN_TASK is not ownership (#112486)."""
     from contextlib import nullcontext
 
     from agent.delegation_context import non_dispatcher_owned_context
-    from agent.prompt_builder import KANBAN_GUIDANCE
     from agent.system_prompt import _tool_guidance_block
 
     if task_id is None:
@@ -103,10 +104,9 @@ def test_kanban_guidance_fallback_requires_owned_worker_task(monkeypatch, task_i
     else:
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     agent = _make_agent(valid_tool_names={"kanban_show"})
-    delattr(agent, "_kanban_worker_guidance")
 
     with nullcontext() if owner else non_dispatcher_owned_context():
-        assert (_tool_guidance_block(agent) == KANBAN_GUIDANCE) is expected
+        assert ("Kanban task execution protocol" in (_tool_guidance_block(agent) or "")) is expected
 
 
 @pytest.mark.parametrize("stores", [(True, True), (False, True), (True, False), (False, False)])

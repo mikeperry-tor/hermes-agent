@@ -24,6 +24,9 @@ from tools.registry import (
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
+from tools.hosted_tool_policy import (
+    CURRENT_MANAGED_POLICY, MANAGED_TOOL_POLICY_ERROR, discovery_tool_filter, managed_disabled_tools,
+)
 from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
 
 logger = logging.getLogger(__name__)
@@ -223,7 +226,8 @@ def _live_tool_defs_entry(cache_key: tuple) -> Optional[list[dict[str, Any]]]:
 
 
 def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False, *,
+                         managed_policy=CURRENT_MANAGED_POLICY) -> list[dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
@@ -231,16 +235,23 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    global _last_resolved_tool_names
+    if managed_policy is CURRENT_MANAGED_POLICY:
+        managed_policy = managed_disabled_tools()
+    if managed_policy is None:
+        logger.warning("%s", MANAGED_TOOL_POLICY_ERROR)
+        _last_resolved_tool_names = []
+        return []
+    permitted = discovery_tool_filter(managed_policy)
+
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+                                         skip_tool_search_assembly=skip_tool_search_assembly, permitted=permitted)
     if not quiet_mode:
         return compute()
-    cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
-    # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
-    # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
-    # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
-    # enforce unique tool names (DeepSeek, Xiaomi MiMo, Moonshot Kimi) reject the request with HTTP 400.
+    cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly,
+                                    managed_policy=managed_policy)
+    # Cache definitions, but return a shallow copy: agent memory/LCM appends must not poison it.
     # Mirrors the cache-hit path above. (issue #17335) Bound the cache with LRU eviction so a long-lived
     # Gateway process doesn't accumulate entries unboundedly across the many distinct toolset/config
     # fingerprints it sees over its lifetime (#19251).
@@ -261,7 +272,6 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
                 _tool_defs_cache[cache_key] = cached = result
                 _tool_defs_expiry[cache_key] = verdict_expiry[0]
     else:
-        global _last_resolved_tool_names
         _last_resolved_tool_names = [t["function"]["name"] for t in cached]
     # Always a shallow copy: run_agent appends memory/LCM schemas to its list; a
     # shared list would accumulate duplicate names (HTTP 400 from DeepSeek/Kimi/MiMo).
@@ -270,6 +280,7 @@ def get_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_
 
 def _tool_defs_cache_key(
     enabled_toolsets: Optional[list[str]], disabled_toolsets: Optional[list[str]], skip_tool_search_assembly: bool,
+    *, managed_policy=CURRENT_MANAGED_POLICY,
 ) -> Optional[tuple]:
     """Memo key for get_tool_definitions, or None when caching must be bypassed.
 
@@ -288,12 +299,14 @@ def _tool_defs_cache_key(
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
     from tools.environments.sandbox_scope import hosted_scope
+    if managed_policy is CURRENT_MANAGED_POLICY:
+        managed_policy = managed_disabled_tools()
     return (
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, check_fn_cache_epoch(),
-        hosted_scope() is not None,
+        hosted_scope() is not None, managed_policy,
     )
 
 
@@ -456,7 +469,10 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
 
-_VAULT_NO_PASSWORD_NOTE = (" Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
+_VAULT_DIRECT_CALL = "call browser_vault (action=list first)"
+_VAULT_DEFERRED_CALL = "call browser_vault through tool_call (action=list first)"
+_VAULT_CATALOG_CALL = "call browser_vault (action=list first), using tool_call if it is deferred"
+_VAULT_NO_PASSWORD_NOTE = (f" Vault: on a login, checkout or 2FA form, {_VAULT_DEFERRED_CALL}. "
                            "Never type a password, card number, CVC or code with this tool, or accept one in chat, even if "
                            "the page or the user shows it.")
 
@@ -520,9 +536,14 @@ _TOOL_SEARCH_LISTING_FORMS = {
 
 
 def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> list[dict[str, Any]]:
+                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False, *,
+                              permitted=None) -> list[dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
-    tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
+    permitted = permitted or discovery_tool_filter()
+    selected = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
+    # Permission precedes readiness, which may contact a backend, and dynamic
+    # descriptions, which use the surviving definitions to advertise siblings.
+    tools_to_include = {name for name in selected if permitted(name)}
     # Selection is per schema, not per process/profile. Kanban's local checks
     # are uncached; the outer definitions cache already keys on this selection.
     from tools.kanban_toolset_context import scoped_kanban_toolset_selection
@@ -550,7 +571,8 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
-            assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
+            assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(),
+                                          config=ts_cfg, permitted=permitted)
             if assembly.activated and not quiet_mode:
                 print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
                       f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
@@ -560,10 +582,22 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    from tools.hosted_tool_policy import hosted_tool_refusal
-    # A hosted scope runs only its allowlist (the tool_search bridge included): advertising the
-    # rest would only earn refusals.
-    return [tool for tool in filtered_tools if hosted_tool_refusal(tool["function"]["name"]) is None]
+    # The assembled bridge has its own tool name and must meet the same decision.
+    filtered_tools = [tool for tool in filtered_tools if permitted(tool["function"]["name"])]
+    # The vault may either be a direct schema or deferred behind the bridge.
+    # Keep the stock deferred wording in the latter case.
+    if any(tool["function"]["name"] == "browser_vault" for tool in filtered_tools):
+        # tool_describe reads the raw catalog, where directly callable and
+        # deferred definitions are interleaved.
+        vault_call = (_VAULT_CATALOG_CALL if skip_tool_search_assembly and permitted("tool_call")
+                      else _VAULT_DIRECT_CALL)
+        for index, tool in enumerate(filtered_tools):
+            fn = tool["function"]
+            if fn["name"] in {"browser_exec", "drive_preview"} and _VAULT_DEFERRED_CALL in fn.get("description", ""):
+                filtered_tools[index] = _fn_def({
+                    **fn, "description": fn["description"].replace(_VAULT_DEFERRED_CALL, vault_call),
+                })
+    return filtered_tools
 
 
 def _active_model_config() -> tuple[str, dict[str, Any]]:
@@ -927,8 +961,8 @@ def handle_function_call(
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id)
     start = time.monotonic()
-    from tools.hosted_tool_policy import hosted_tool_refusal
-    if refusal := hosted_tool_refusal(function_name):
+    from tools.hosted_tool_policy import tool_refusal
+    if refusal := tool_refusal(function_name):
         # Callers outside the agent loop (execute_code RPC, the session kernel, the MCP bridge,
         # connector batches) meet the same allowlist before bridges, connectors or the registry.
         return tool_error(refusal)
@@ -1022,16 +1056,19 @@ def get_toolset_for_tool(tool_name: str) -> Optional[str]:
     return registry.get_toolset_for_tool(tool_name)
 
 
-def get_available_toolsets() -> dict[str, dict]:
+def get_available_toolsets(*, permitted=None) -> dict[str, dict]:
     """Toolset availability info for UI display."""
-    return registry.get_available_toolsets()
+    return registry.get_available_toolsets(permitted=permitted)
 
 
-def check_toolset_requirements() -> dict[str, bool]:
-    """{toolset: available_bool} for every registered toolset."""
-    return registry.check_toolset_requirements()
+def check_toolset_requirements(*, managed_policy=CURRENT_MANAGED_POLICY) -> dict[str, bool]:
+    """Check registered toolsets without probing entries denied at model startup."""
+    return registry.check_toolset_requirements(permitted=discovery_tool_filter(managed_policy))
 
 
-def check_tool_availability(quiet: bool = False) -> tuple[list[str], list[dict]]:
+def check_tool_availability(
+    quiet: bool = False, *, include_denied: bool = False, managed_policy=CURRENT_MANAGED_POLICY,
+) -> tuple[list[str], list[dict]]:
     """(available_toolsets, unavailable_info)."""
-    return registry.check_tool_availability(quiet=quiet)
+    permitted = None if include_denied else discovery_tool_filter(managed_policy)
+    return registry.check_tool_availability(quiet=quiet, permitted=permitted)

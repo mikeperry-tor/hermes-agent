@@ -192,7 +192,7 @@ def start_session_fork(
     expired lease, another profile's lease, a tool outside :func:`fork_tool_allowlist`, a tool the
     session neither advertises nor defers behind Tool Search, a task the plugin does not own).
     When a named tool is deferred, one line appended to ``prompt`` says to call it through
-    ``tool_call`` (:func:`_deferred_call_note`); ``tools[]`` stays the session's. The lease is consumed by every
+    ``tool_call`` (:func:`tools.tool_search_catalog.deferred_call_note`); ``tools[]`` stays the session's. The lease is consumed by every
     call except another profile's and one naming a tool outside the allowlist. ``own_tools``
     returns the plugin's own tool names; it is read here and again when the fork starts. Never
     raises: a fork whose worker thread cannot start returns its handle settled ``error:spawn``."""
@@ -217,7 +217,8 @@ def start_session_fork(
                     sorted(map(str, unreached)) if names is not None else tools)
         return None
     if deferred:
-        prompt = prompt + _deferred_call_note(deferred)
+        from tools.tool_search_catalog import deferred_call_note
+        prompt = prompt + deferred_call_note(deferred)
     task_cfg = capture.context.copy().run(_resolve_task_cfg, task, owned_tasks)
     if task_cfg is None:
         logger.info("session_fork plugin=%s outcome=rejected:task_not_owned (%r)", plugin_id, task)
@@ -261,25 +262,6 @@ def _session_deferred_tools(parent: Any) -> frozenset:
     from agent.tool_executor import _tool_search_scoped_names
 
     return _tool_search_scoped_names(parent)
-
-
-def _deferred_call_note(names: Iterable[str]) -> str:
-    """The line core appends to a fork's prompt when Tool Search defers a requested tool: the
-    fork's ``tools[]`` (the session's, byte for byte) holds only the bridge, so the model is told
-    to reach the tool through ``tool_call`` and given the parameters ``tool_call`` validates
-    against. ``tool_describe`` and ``tool_search`` are therefore never needed, and stay refused."""
-    from tools.registry import registry
-    from tools.tool_search_catalog import TOOL_CALL_NAME
-
-    def _parameters(name: str) -> str:
-        schema = registry.get_schema(name) or {}
-        fn = schema.get("function") if schema.get("type") == "function" else schema
-        params = fn.get("parameters") if isinstance(fn, dict) else None
-        return json.dumps(params if isinstance(params, dict) else {}, ensure_ascii=False,
-                          separators=(",", ":"), sort_keys=True)
-
-    return (f"\n\nCall {', '.join(sorted(names))} through {TOOL_CALL_NAME} with name=<tool> and arguments "
-            "matching its parameters: " + "; ".join(f"{n} {_parameters(n)}" for n in sorted(names)) + ".")
 
 
 def _should_defer(parent: Any, task_cfg: dict) -> bool:
@@ -427,17 +409,6 @@ def interrupt_plugin_forks(agent: Any, *, message: str, tool_reason: str) -> lis
     return [job.run for job in jobs]
 
 
-def _pin_capture(fork: Any, capture: Any) -> None:
-    """Same-model fork: replay the captured request inputs byte-for-byte (cache parity)."""
-    import copy
-
-    fork._cached_system_prompt = capture.system_prompt
-    fork._cached_system_prompt_static = capture.system_prompt_static
-    fork.tools = copy.deepcopy(capture.tools)
-    fork.valid_tool_names = {tool["function"]["name"] for tool in fork.tools}
-    fork._prompt_cache_fork_tag = PLUGIN_FORK_TASK
-
-
 def _called_tool(tc: dict) -> Optional[str]:
     """The tool a call runs: its own name, or a ``tool_call`` carrier's single target (the only
     form the executor unwraps; the dispatch guard then checks the target, never the bridge)."""
@@ -513,7 +484,11 @@ def _run_job(job: _ForkJob) -> None:
                 outcome = f"refused:{refusal}"
                 return
             if not routed:
-                _pin_capture(fork, capture)
+                if not capture.policy_matches(fork):
+                    outcome = "refused:policy_changed"
+                    return
+                capture.pin_prefix(fork)
+                fork._prompt_cache_fork_tag = PLUGIN_FORK_TASK
             fork.session_id = capture.session_id
             # The ceiling is the user's own review bound (auxiliary.background_review), never the
             # fork's routing block: that is {} without ``task`` and the plugin's own defaults with one.

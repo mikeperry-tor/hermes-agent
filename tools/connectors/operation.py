@@ -242,12 +242,17 @@ class ConnectionOperation:
             return self._result_locked(with_urls=with_urls)
 
     def result(self, *, with_urls: bool = True) -> dict[str, Any]:
+        from tools.hosted_tool_policy import discovery_tool_filter
+
         with self._lock:
             result = self._result_locked(with_urls=with_urls)
+        permitted = discovery_tool_filter()
         for target in result["targets"]:
             target.pop("connection_id", None)
             target.pop("resolved", None)  # the card's flag; the model reads state
             target.pop("launch", None)  # the card's consent line; the model named the server itself
+            if "tools" in target:
+                target["tools"] = [name for name in target["tools"] if permitted(name)]
         if result.get("settled_at") is None:
             return result
         from tools.registry import registry
@@ -262,7 +267,7 @@ class ConnectionOperation:
             if not names:
                 continue
             definitions = registry.get_definitions(set(names), quiet=True)
-            listing, _form = build_catalog_listing_with_form(definitions, max_tokens=1500)
+            listing, _form = build_catalog_listing_with_form(definitions, max_tokens=1500, permitted=permitted)
             if listing:
                 target["tools_listing"] = listing
         return result

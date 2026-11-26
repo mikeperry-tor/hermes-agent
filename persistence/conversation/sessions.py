@@ -17,6 +17,8 @@ from ..authority.vocabulary import OwnerRule
 from ..core.errors import Conflict, TransientStoreError
 from ..core.identity import JsonValue, SessionId
 
+PROMPT_MANAGED_TOOLS_KEY = "prompt_managed_disabled_tools"
+
 __all__ = [
     "ACTIVITY_DESCRIPTION_MAX",
     "ACTIVITY_PROVENANCES",
@@ -972,8 +974,9 @@ class SessionRepository(Protocol):
         """Store the YOLO flag in ``model_config``."""
         ...
 
-    def update_system_prompt(self, session_id: SessionId, system_prompt: Optional[str]) -> None:
-        """Store the system prompt snapshot byte for byte; ``None`` clears it."""
+    def update_system_prompt(self, session_id: SessionId, system_prompt: Optional[str], *,
+                             managed_tools: list[str] | str | None = None) -> None:
+        """Store prompt bytes together with their producing managed policy when supplied."""
         ...
 
     def request_prompt_refresh(self, session_id: Optional[SessionId] = None) -> int:

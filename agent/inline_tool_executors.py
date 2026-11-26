@@ -255,8 +255,12 @@ def _scope_in_connected_mcp_servers(agent, result: Any) -> None:
         targets = json.loads(result).get("targets") or []
     except (AttributeError, TypeError, ValueError):
         return
-    connected = [str(t.get("name")) for t in targets if isinstance(t, dict)
-                 and t.get("kind") == "mcp" and t.get("state") == "connected" and t.get("tools")]
+    # The result's tool list is a model-facing projection. Scope the verified
+    # registration even when its tools are all temporarily denied.
+    connected = [t["name"] for t in targets if isinstance(t, dict)
+                 and t.get("kind") == "mcp" and t.get("state") == "connected"
+                 and not t.get("discovery_error") and isinstance(t.get("name"), str) and t["name"]
+                 and registry.get_tool_names_for_toolset(f"mcp-{t['name']}")]
     added = [name for name in connected if name not in enabled]
     if added:
         agent.enabled_toolsets = [*enabled, *added]
@@ -355,8 +359,8 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
 
 def _coerced(name: str, executor: InlineToolExecutor) -> InlineToolExecutor:
     def _exec(agent, args: dict, ctx: InlineToolContext) -> Any:
-        from tools.hosted_tool_policy import hosted_tool_refusal
-        if refusal := hosted_tool_refusal(name):  # the table is an execution primitive: same allowlist
+        from tools.hosted_tool_policy import tool_refusal
+        if refusal := tool_refusal(name):  # the table is an execution primitive: same allowlist
             return json.dumps({"error": refusal}, ensure_ascii=False)
         return call_with_arg_checks(
             registry.get_entry(name), coerce_tool_args(name, args), lambda checked: executor(agent, checked, ctx))

@@ -3480,3 +3480,44 @@ dashboard:
 - `ws_orphan_reap_grace_s` — how long a WS-detached session waits before the orphan reaper collects it. Raise alongside the keepalive values if clients reconnect slowly. Periodic session maintenance also completes cleanup for closed sockets and re-arms a missing orphan timer, so a detached chat cannot keep its ownership lease solely because its initial cleanup or timer was lost. Reconnecting cancels that timer; active delegated work and healthy running turns remain protected by the normal orphan-reaper checks. (`HERMES_TUI_WS_ORPHAN_REAP_GRACE_S` remains as an internal override.)
 - `ws_orphan_activity_stale_s` (default `600`) — how long a detached **running** turn's activity clock (the same clock the `agent.turn_liveness` watchdog samples: API waits, stream tokens, tool heartbeats) must be idle before the orphan reaper interrupts it. A client-absent turn that is still actively producing keeps running to completion detached — closing the laptop, backgrounding the mobile app, or a desktop update no longer cancels healthy long turns; only a genuinely wedged turn is interrupted. Set `0` to interrupt at the grace window regardless of activity (old behavior).
 - `startup_orphan_sweep` (default `true`) — the WS-orphan reap timer above is in-process, so a gateway restart (update, crash, systemd) before it fires leaves the session row open forever — phantom "active" work in `/resume` and dashboards. On every gateway boot — both the stdio TUI (`entry.main`) and the desktop/dashboard WebSocket sidecar (`handle_ws`) — rows with source `tui` / `desktop` / `subagent` / `unknown` (a row the token-accounting guard had to materialize itself) whose start time **and** newest message are both older than the session TTL (`HERMES_TUI_SESSION_TTL_S`, default 6 hours) are closed with `end_reason: startup_orphan_reap`. Messaging-platform sessions (Telegram, Discord, …) are never touched, live in-memory sessions (a client that already resumed) are excluded, and swept sessions remain resumable.
+
+
+### Deployment-owned tool denial
+
+In deployments using native managed scope (`/etc/hermes/config.yaml`), an
+administrator can disable specific tools across all profiles by listing their
+exact names:
+
+```yaml
+tools:
+  disabled: [browser_exec, computer_use]
+```
+
+- **Where it applies:** Startup readiness, model tool schemas, `--list_tools`,
+  CLI banner/info listings, Tool Search, MCP/connector catalogs, direct and
+  inline dispatch, `execute_code` RPC, and child agents. Profiles can further
+  narrow their own toolsets but cannot re-enable managed-disabled tools.
+- **Tool Search & MCP:** Disabling a Tool Search bridge tool keeps permitted
+  tools in the direct tool list so they remain callable. Hosted Search and
+  Describe require `manage_connections` and filter returned tools, schemas, and
+  counts against the current policy. A registered MCP server stays selected
+  when all of its tools are temporarily disabled so a later policy change can
+  expose them on the same connection.
+- **Prompt caching & live updates:** Changes follow the managed-file cache.
+  When the policy is unchanged, resumed sessions keep their cached system prompt
+  prefix untouched. When an administrator changes `tools.disabled`, resumed and
+  live sessions (including same-model reviews and `/btw` forks) rebuild affected
+  tool definitions and generated prompt guidance while keeping conversation
+  history. Bot Chat can still reply to incoming messages when outbound messaging
+  is disabled, Kanban workers receive guidance matching their permitted tools,
+  and plugin forks that require captured prompt/tool state return a refusal if
+  their captured policy is stale.
+- **Failure & diagnostics:** An absent managed file or `{}` disables nothing; a
+  blank, null, malformed, or unreadable managed file fails tool discovery and
+  dispatch closed without leaking file contents, while `hermes doctor` remains
+  available. Profiles cannot repoint `HERMES_MANAGED_DIR` through `.env` or
+  user config. Remote config backends that do not honor native managed files
+  ignore this option.
+- **Scope:** This is a Hermes tool-dispatch policy, not OS isolation or a
+  restriction on trusted plugins importing Python handlers directly. It does
+  not enable the hosted allowlist or change other local features.

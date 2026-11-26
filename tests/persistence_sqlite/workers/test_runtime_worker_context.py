@@ -2,6 +2,7 @@
 import pytest
 
 from agent.runtime_session_store import WorkerPersistenceError
+from persistence.conversation.sessions import PROMPT_MANAGED_TOOLS_KEY
 from persistence.sqlite.authority._runtime_ends import begin_runtime_epoch
 from persistence.sqlite.conversation._store.compression import (
     get_compression_failure_cooldown_row, record_compression_failure_cooldown, set_compression_fallback_streak,
@@ -38,10 +39,14 @@ def test_worker_context_preserves_authority_identity_and_prompt_receipts(backend
             raise TimeoutError('lost-ack')
         store.rpc = lost_ack
         with pytest.raises(TimeoutError, match='lost-ack'):
-            store.update_system_prompt('owned', 'durable-prefix')
+            store.update_system_prompt('owned', 'durable-prefix', managed_tools=['terminal'])
         store.rpc = original
         assert len(store.retry_pending()) == 1
         assert get_session(holder, 'owned')['system_prompt'] == 'durable-prefix'
+        assert get_session_model_config_value(holder, 'owned', PROMPT_MANAGED_TOOLS_KEY) == ['terminal']
+        pin = {'version': 'fixture', 'tools': [], 'managed_disabled_tools': ['terminal']}
+        store.update_session_tool_names('owned', pin)
+        assert store.get_session('owned')['tool_names']
         with pytest.raises(Exception, match='invalid_params'):
             mutate_worker_execution(holder, **scope, sequence=store.journal['next_sequence'],
                                     operation='session.sidecars', payload={'patch': {'_delegate_from': 'foreign'}})

@@ -341,6 +341,29 @@ KANBAN_GUIDANCE = (
     "own run; board tasks are for cross-agent handoffs that outlive one API loop."
 )
 
+# The full lifecycle instructions assume every named operation is available.
+_KANBAN_LIFECYCLE_TOOLS = frozenset((
+    "kanban_show", "kanban_heartbeat", "kanban_block", "kanban_complete",
+    "kanban_request_review", "kanban_request_changes", "kanban_create",
+    "kanban_comment", "kanban_attach", "kanban_attach_url", "kanban_attachments",
+))
+
+
+def build_kanban_guidance(names):
+    if "kanban_show" not in names:
+        return None
+    if _KANBAN_LIFECYCLE_TOOLS <= names:
+        return KANBAN_GUIDANCE
+    available = ", ".join(sorted(name for name in names if name.startswith("kanban_")))
+    return (
+        "# Kanban task execution protocol\n"
+        "Your assigned task id is in `$HERMES_KANBAN_TASK` and your workspace is "
+        "`$HERMES_KANBAN_WORKSPACE`. Call `kanban_show()` to read the task and its handoffs. "
+        f"Use the available board tools: {available}. Report any blocked lifecycle "
+        "transition to the dispatcher without claiming that it happened."
+    )
+
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do or plan to do without actually doing "

@@ -15,6 +15,9 @@ logger = logging.getLogger("tools.mcp_tool")
 # the reload RPC, gateway reload and late-binding refresh thread; the run loop
 # reads them during tool iteration and must never see a half-updated pair.
 _agent_tools_lock = threading.Lock()
+# Above any registry generation. Cache-parity forks retain their wire schema
+# across compaction and late discovery, unless managed authority changes.
+FROZEN_TOOL_SNAPSHOT_GENERATION = 2_147_483_647
 
 # (profile home, session id) -> (registry generation, toolset selection) of the tools[] this process last
 # pinned for that session. A rebuild from the pin in the SAME process (agent-cache eviction, ``/model``, a
@@ -66,11 +69,11 @@ def _tool_defs_content_changed(agent, new_defs: list) -> bool:
         return False
 
 
-def _drop_session_tools(agent, new_defs: list, new_names: set) -> tuple:
+def _drop_session_tools(agent, new_defs: list, new_names: set, permitted) -> tuple:
     # Drops only: runs after a merge, where a carried or pinned entry keeps the bytes already sent. The one-shot
     # schema variants (``toolsets.agent_tool_surface``) shape fresh definitions, before any merge.
     from toolsets import agent_tool_drops
-    drops = agent_tool_drops(agent)
+    drops = agent_tool_drops(agent) | {name for name in new_names if not permitted(name)}
     if not drops:
         return new_defs, new_names
     return [entry for entry in new_defs if _def_name(entry) not in drops], new_names - drops
@@ -85,44 +88,59 @@ def _frozen_tool_names(registered: set) -> frozenset:
 
 def _publish_tool_snapshot(
     agent, new_defs: list, new_names: set, *, snapshot_generation: int, built_generation: int, selection: tuple,
-    staged_engine_names: set, content_aware: bool, prefix_registered: Optional[set]) -> Optional[set]:
+    staged_engine_names: set, content_aware: bool, prefix_registered: Optional[set],
+    permitted, built_backend: str) -> Optional[tuple[set, bool]]:
     """Single atomic read-diff-publish under ``_agent_tools_lock`` so ``added`` matches what
     was published and a stale (older-generation) rebuild can't overwrite a newer one. Returns
-    the added names, or None when nothing was published (unchanged, or a newer snapshot won)."""
+    the added names and whether to persist. None means the policy moved during the build."""
+    from agent.delegation_backends import adopt_built_backend
+    from tools.hosted_tool_policy import managed_disabled_tools
+
     with _agent_tools_lock:
+        if selection[2] != managed_disabled_tools():
+            return None
         # Tolerate an agent that never set the generation (or a non-int mock).
         published_gen = getattr(agent, "_tool_snapshot_generation", -1)
         published_gen = published_gen if isinstance(published_gen, int) else -1
+        recorded_selection = getattr(agent, "_tool_snapshot_selection", None)
+        policy_changed = isinstance(recorded_selection, tuple) and selection[2] != recorded_selection[2]
         if snapshot_generation < published_gen:
-            return None  # a newer snapshot already won
+            # A newer registry snapshot won. Rebuild if it still used the previous policy.
+            if not policy_changed:
+                return set(), False
+            if published_gen != FROZEN_TOOL_SNAPSHOT_GENERATION:
+                return None
         current_defs = _agent_tool_defs(agent)
         current = {_def_name(t) for t in current_defs}
-        if prefix_registered is not None:
+        keep_prefix = prefix_registered is not None and not policy_changed
+        if keep_prefix:
             # Neither the registry (read after the build) nor the toolset selection moved since the last
             # snapshot: a name can only be new here because a check_fn flipped, and tools[] stays frozen
             # for that (#101367). A registration or a widened selection appends as before.
-            recorded_selection = getattr(agent, "_tool_snapshot_selection", None)
             frozen = built_generation == published_gen and selection == recorded_selection
             held = _frozen_tool_names(prefix_registered) if frozen else frozenset()
             new_defs, new_names = _merge_preserving_prefix(current_defs, new_defs, prefix_registered, held)
-        new_defs, new_names = _drop_session_tools(agent, new_defs, new_names)
+        new_defs, new_names = _drop_session_tools(agent, new_defs, new_names, permitted)
         # Record the generation (the one read BEFORE the build: a registration that landed during it may
         # be missing from these definitions) and selection even when unchanged, so an in-flight older
         # caller can't clobber.
         agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
         agent._tool_snapshot_selection = selection
-        # Same name set: nothing to publish, unless the caller is content_aware
-        # (explicit reload, compaction) and the serialized schema bytes moved.
-        if new_names == current and not (content_aware and _tool_defs_content_changed(agent, new_defs)):
-            return None
-        agent.tools = new_defs
-        agent.valid_tool_names = new_names
-        # Publish context-engine routing names atomically with the snapshot.
-        engine_names = getattr(agent, "_context_engine_tool_names", None)
-        if isinstance(engine_names, set):
-            engine_names.clear()
-            engine_names.update(staged_engine_names)
-        return new_names - current
+        schemas_changed = new_names != current or (
+            (content_aware or not keep_prefix) and _tool_defs_content_changed(agent, new_defs))
+        if schemas_changed:
+            agent.tools = new_defs
+            agent.valid_tool_names = new_names
+            # Publish context-engine routing names atomically with the snapshot.
+            engine_names = getattr(agent, "_context_engine_tool_names", None)
+            if isinstance(engine_names, set):
+                engine_names.clear()
+                engine_names.update(staged_engine_names & new_names)
+        backend_before = getattr(agent, "_delegation_backend", None)
+        if not keep_prefix:
+            adopt_built_backend(agent, new_defs, built_backend)
+        return new_names - current, (schemas_changed or policy_changed
+                                     or getattr(agent, "_delegation_backend", None) != backend_before)
 
 
 def refresh_agent_mcp_tools(
@@ -149,50 +167,40 @@ def refresh_agent_mcp_tools(
     With ``preserve_prefix`` off (explicit ``/reload-mcp``, and a rebuild before the
     first turn) a same-name schema change is published. The caller has already
     accepted the cache break, or nothing has been cached yet."""
+    from agent.delegation_backends import saved_backend
     from model_tools import get_tool_definitions
+    from tools.hosted_tool_policy import discovery_tool_filter
     from tools.registry import registry
     from toolsets import agent_tool_surface, tool_selection_key
     enabled, disabled = _resolve_refresh_toolsets(agent, enabled_override, disabled_override)
-    # Generation captured BEFORE the slow get_tool_definitions call (a slower caller holding an
-    # OLDER set must not clobber a newer one); definitions computed OUTSIDE the lock.
-    snapshot_generation = registry._generation
-    from agent.delegation_backends import adopt_built_backend, saved_backend
-    built_backend = saved_backend()
-    new_defs = agent_tool_surface(agent, list(
-        get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode) or []))
-    new_names = {_def_name(t) for t in new_defs}
-    # Post-build families re-appended on LOCALS only; live attributes untouched until publish.
-    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
-    _reinject_authorized_dynamic_tools(agent, new_defs, new_names)
-    # Registry membership is read OUTSIDE ``_agent_tools_lock``: taking ``registry._lock``
-    # under the tools lock would be the first nesting of the two.
-    prefix_registered: Optional[set] = None
-    if preserve_prefix:
-        try:
-            prefix_registered = {entry.name for entry in registry.get_all_entries()}
-        except Exception:
-            pass  # fail open to the plain rebuild
-    else:
-        # Explicit reload and pre-first-turn rebuild. A same-name description
-        # change has to publish; between-turns refresh keeps preserve_prefix.
-        content_aware = True
-    # Read after the build and the membership read: a registration that landed meanwhile counts as one.
-    built_generation = registry._generation
-    added = _publish_tool_snapshot(
-        agent, new_defs, new_names, snapshot_generation=snapshot_generation, built_generation=built_generation,
-        selection=tool_selection_key(enabled, disabled), staged_engine_names=staged_engine_names,
-        content_aware=content_aware, prefix_registered=prefix_registered)
-    backend_before = getattr(agent, "_delegation_backend", None)
-    published_gen = getattr(agent, "_tool_snapshot_generation", -1)
-    stale = isinstance(published_gen, int) and snapshot_generation < published_gen  # a newer snapshot won
-    if prefix_registered is None and not stale:  # a rebuild: route on the backend its new delegate_task is from
-        adopt_built_backend(agent, new_defs, built_backend)
-    if added is None:
-        if getattr(agent, "_delegation_backend", None) != backend_before:
-            persist_agent_tool_names(agent)  # only the backend moved (two backends build one schema): pin it
-        return set()
-    persist_agent_tool_names(agent)  # re-pin so a rebuild after agent-cache eviction restores this order
-    return added
+    while True:
+        selection = tool_selection_key(enabled, disabled)
+        permitted = discovery_tool_filter(selection[2])
+        # Snapshot generation before slow discovery so a concurrent newer registry build wins.
+        snapshot_generation = registry._generation
+        built_backend = saved_backend()
+        new_defs = agent_tool_surface(agent, list(
+            get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=quiet_mode,
+                                 managed_policy=selection[2]) or []))
+        new_names = {_def_name(t) for t in new_defs}
+        staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names, permitted)
+        _reinject_authorized_dynamic_tools(agent, new_defs, new_names, permitted)
+        # Registry membership is read outside the tools lock to avoid nesting the registry lock.
+        prefix_registered: Optional[set] = None
+        if preserve_prefix:
+            try:
+                prefix_registered = {entry.name for entry in registry.get_all_entries()}
+            except Exception:
+                pass  # use the plain rebuild
+        outcome = _publish_tool_snapshot(
+            agent, new_defs, new_names, snapshot_generation=snapshot_generation, built_generation=registry._generation,
+            selection=selection, staged_engine_names=staged_engine_names, content_aware=content_aware,
+            prefix_registered=prefix_registered, permitted=permitted, built_backend=built_backend)
+        if outcome is not None:
+            added, repin = outcome
+            if repin:
+                persist_agent_tool_names(agent)
+            return added
 
 
 def reprobe_tool_availability() -> None:
@@ -216,18 +224,26 @@ def tool_pin_version() -> str:
 
 def persist_agent_tool_names(agent) -> None:
     """Best-effort: write ``agent.tools`` to the session row (freeze pin) through the agent's storage
-    interface, else through its store. The full definitions, keyed by the code that built them: another
-    process or surface derives different bytes."""
+    interface, else through its store. The full definitions carry the code and managed policy that
+    built them so future sessions know when the cached bytes can be reused."""
     from agent.agent_init_session import agent_interface
+    from toolsets import managed_tool_snapshot_key
 
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not db or not session_id:
         return
     try:
-        pin = {"version": tool_pin_version(), "tools": _agent_tool_defs(agent)}
-        if isinstance(backend := getattr(agent, "_delegation_backend", None), str) and backend:
-            pin["delegation_backend"] = backend  # what its delegate_task was built from: the session routes on it
+        version = tool_pin_version()
+        with _agent_tools_lock:
+            pin = {"version": version, "tools": _agent_tool_defs(agent)}
+            disabled = managed_tool_snapshot_key(agent)
+            if disabled != []:
+                pin["managed_disabled_tools"] = disabled
+            if isinstance(backend := getattr(agent, "_delegation_backend", None), str) and backend:
+                pin["delegation_backend"] = backend
+            generation = getattr(agent, "_tool_snapshot_generation", None)
+            selection = getattr(agent, "_tool_snapshot_selection", None)
         if (store := agent_interface(agent)) is not None:
             store.sessions.update_tool_pin(session_id, pin)
         else:
@@ -235,7 +251,7 @@ def persist_agent_tool_names(agent) -> None:
     except Exception:
         logger.debug("tool_names persist skipped", exc_info=True)
         return
-    _record_pinned_snapshot(agent, session_id)
+    _record_pinned_snapshot(session_id, generation, selection)
 
 
 def _pinned_snapshot_key(session_id) -> tuple:
@@ -243,11 +259,9 @@ def _pinned_snapshot_key(session_id) -> tuple:
     return hermes_home_key(), str(session_id)
 
 
-def _record_pinned_snapshot(agent, session_id) -> None:
+def _record_pinned_snapshot(session_id, generation, selection) -> None:
     """Remember what the pin just written was built against (see ``_PINNED_SNAPSHOTS``)."""
     key = _pinned_snapshot_key(session_id)
-    generation = getattr(agent, "_tool_snapshot_generation", None)
-    selection = getattr(agent, "_tool_snapshot_selection", None)
     with _agent_tools_lock:
         _PINNED_SNAPSHOTS.pop(key, None)
         if isinstance(generation, int) and isinstance(selection, tuple):
@@ -366,11 +380,30 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
     process that wrote the pin a pinned Tool Search bridge tool keeps its slot (it is synthesized, never
     registered, exactly as the between-turns refresh keeps it) and a tool new only because its ``check_fn``
     flipped stays out (``_pin_restore_held``)."""
-    pinned, same_code, pinned_defs = _pinned_tool_defs(saved, {_def_name(t): t for t in _agent_tool_defs(agent)})
+    from toolsets import managed_tool_snapshot_key, session_tool_discovery_filter
+
+    def snapshot_key():
+        return (getattr(agent, "_tool_snapshot_generation", None),
+                getattr(agent, "_tool_snapshot_selection", None),
+                getattr(agent, "_delegation_backend", None))
+
+    with _agent_tools_lock:
+        tools = getattr(agent, "tools", None)
+        fresh_defs = _agent_tool_defs(agent)
+        producing_snapshot = snapshot_key()
+        current_policy = managed_tool_snapshot_key(agent)
+        permitted = session_tool_discovery_filter(agent)
+    pinned_policy = saved.get("managed_disabled_tools", []) if isinstance(saved, dict) else []
+    if pinned_policy != current_policy:
+        # Old catalog bytes and direct/bridge choices no longer describe this deployment.
+        persist_agent_tool_names(agent)
+        return False
+    pinned, same_code, pinned_defs = _pinned_tool_defs(saved, {_def_name(t): t for t in fresh_defs})
     if not pinned:
         return False
+    from agent.delegation_backends import adopt_built_backend
+    from tools.delegate_tool import adopt_session_delegation_mode
     from tools.registry import registry
-    fresh_defs = _agent_tool_defs(agent)
     fresh = {_def_name(t): t for t in fresh_defs}
     registered_names = {entry.name for entry in registry.get_all_entries()}
     carried = {_def_name(d) for d in pinned_defs if _def_name(d) not in fresh and _def_name(d) in registered_names}
@@ -384,19 +417,19 @@ def restore_agent_tool_prefix(agent, saved) -> bool:
     merged.extend(t for t in fresh_defs if _def_name(t) not in pinned_names and _def_name(t) not in held)
     merged = _drop_gated_carried_tools(merged, carried)
     merged_names = {_def_name(t) for t in merged}
-    _reinject_authorized_dynamic_tools(agent, merged, merged_names)
-    merged, merged_names = _drop_session_tools(agent, merged, merged_names)
+    _reinject_authorized_dynamic_tools(agent, merged, merged_names, permitted)
+    merged, merged_names = _drop_session_tools(agent, merged, merged_names, permitted)
     merged = _refresh_name_dependent_defs(merged, {_def_name(d) for d in pinned_defs} - merged_names, fresh)
     changed = merged != fresh_defs
-    if changed:
-        with _agent_tools_lock:
+    with _agent_tools_lock:
+        if getattr(agent, "tools", None) is not tools or snapshot_key() != producing_snapshot:
+            return False  # a concurrent refresh already published the newer snapshot
+        if changed:
             agent.tools = merged
             agent.valid_tool_names = merged_names
-    if isinstance(saved, dict) and saved.get("delegation_backend"):
-        from agent.delegation_backends import adopt_built_backend
-        adopt_built_backend(agent, pinned, saved["delegation_backend"])
-    from tools.delegate_tool import adopt_session_delegation_mode
-    adopt_session_delegation_mode(agent)  # the restored delegate_task decides joined vs background from here on
+        if isinstance(saved, dict) and saved.get("delegation_backend"):
+            adopt_built_backend(agent, pinned, saved["delegation_backend"])
+        adopt_session_delegation_mode(agent)  # restored delegate_task decides joined vs background
     if not same_code or merged != list(pinned):
         persist_agent_tool_names(agent)
     return changed
@@ -434,7 +467,7 @@ def _merge_preserving_prefix(current_defs: list, new_defs: list, registered_name
     return merged, {_def_name(t) for t in merged}
 
 
-def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set) -> None:
+def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set, permitted) -> None:
     """``message_agent`` is injected by an auth gate, never registered, so a registry-derived
     rebuild drops it. Scrub any stale copy from the STAGED pair and re-add it only when the live
     gate re-authorizes, so the publisher exposes a coherent ``(tools, valid_tool_names)``."""
@@ -442,19 +475,19 @@ def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set) -
 
     tools_list[:] = [entry for entry in tools_list if _def_name(entry) != MESSAGE_AGENT_TOOL_NAME]
     name_set.discard(MESSAGE_AGENT_TOOL_NAME)
-    if message_agent_authorized(agent):
+    if permitted(MESSAGE_AGENT_TOOL_NAME) and message_agent_authorized(agent):
         tools_list.append(message_agent_tool_schema())
         name_set.add(MESSAGE_AGENT_TOOL_NAME)
 
 
-def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
+def _reinject_post_build_tools(agent, tools_list: list, name_set: set, permitted) -> set:
     """Append memory-provider and context-engine tools onto the caller's staged ``tools_list``
     / ``name_set`` (never the live agent attributes), mirroring ``agent_init``'s post-build
     injection. Idempotent and fail-soft. Returns the context-engine routing names THIS rebuild
     appended: a name already owned by a registry/plugin tool is not claimed, matching agent_init."""
     def _add(schema) -> bool:
         name = schema.get("name", "") if isinstance(schema, dict) else ""
-        if not name or name in name_set:
+        if not name or name in name_set or not permitted(name):
             return False
         tools_list.append({"type": "function", "function": schema})
         name_set.add(name)

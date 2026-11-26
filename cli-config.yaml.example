@@ -1450,6 +1450,11 @@ gateway:
   # sessiondb_loop_guard: off
 
 # =============================================================================
+# Administrator-managed config.yaml only. Use exact tool names.
+# tools:
+#   disabled: [browser_exec, computer_use]
+
+# =============================================================================
 # Toolsets
 # =============================================================================
 # Control which tools the agent has access to.
