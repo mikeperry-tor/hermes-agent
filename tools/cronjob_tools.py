@@ -1124,7 +1124,25 @@ def _cronjob_schema_overrides() -> dict:
     static schema is built once per process, but the multiplexed gateway serves every profile from
     that process, so a path baked in at import would name the launch profile's home (#95685)."""
     params = copy.deepcopy(CRONJOB_SCHEMA["parameters"])
-    params["properties"]["script"]["description"] = _script_description(display_hermes_home())
+    from hermes_cli.main_resume_args import uses_managed_executor
+
+    description = _script_description(display_hermes_home())
+    if uses_managed_executor():
+        from cron.executor_script import scripts_root
+        from cron.executor_workspace import executor_policy
+        from hermes_cli.ssh_workspace_fs import SshWorkspaceFsError
+
+        try:
+            managed, _, _, home = executor_policy()
+            location = scripts_root(managed, home)
+        except (OSError, ValueError, SshWorkspaceFsError):
+            location = "the administrator's SSH executor scripts directory"
+        description = (
+            f"Optional pre-run script on the SSH executor. Relative paths resolve under {location}. "
+            "Use a file within that directory. Shell scripts use bash; other scripts use Python. "
+            "Stdout provides context, or becomes the response with no_agent=True. On update, '' clears."
+        )
+    params["properties"]["script"]["description"] = description
     return {"parameters": params}
 
 
