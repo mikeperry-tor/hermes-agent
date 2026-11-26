@@ -26,6 +26,23 @@ import tools.file_tools_paths as ftp
 from tools import terminal_tool
 
 
+def test_managed_ssh_roots_preserve_configured_spelling(monkeypatch):
+    roots = ["/workspace", "/mnt/projects/literal ${PROJECT_NAME}"]
+    monkeypatch.setattr(ftp, "load_managed_config", lambda *, strict: {
+        "terminal": {"ssh_workspace_roots": roots},
+    })
+    assert ftp.managed_ssh_workspace_roots() == tuple(roots)
+
+
+@pytest.mark.parametrize("roots", [None, [], ["/"], ["/workspace/../other"], ["project"]])
+def test_managed_ssh_roots_refuse_invalid_grants(monkeypatch, roots):
+    monkeypatch.setattr(ftp, "load_managed_config", lambda *, strict: {
+        "terminal": {"ssh_workspace_roots": roots},
+    })
+    with pytest.raises(ValueError, match="absolute directory paths"):
+        ftp.managed_ssh_workspace_roots()
+
+
 @pytest.fixture
 def _isolated_cwd(tmp_path, monkeypatch):
     """Two checkouts: workspace (intended) + decoy (process cwd)."""

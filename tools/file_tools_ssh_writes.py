@@ -25,6 +25,7 @@ from tools.file_operations import (
 from tools.file_operations_common import LintResult, _detect_line_ending, _normalize_line_endings, _strip_bom
 from tools.file_operations_lint import LINTERS, LINTERS_INPROC
 from tools.file_operations_ssh_write import inspect_ssh_write, publish_ssh_file, read_ssh_write_source
+from tools.file_tools_paths import managed_ssh_workspace_roots
 from tools.file_tools_read_tracking import SSHFileKey, record_ssh_write, ssh_write_baseline
 from tools.file_tools_write_guards import (
     _SENSITIVE_EXACT_PATHS,
@@ -40,11 +41,18 @@ from tools.registry import tool_error
 logger = logging.getLogger(__name__)
 
 
-def ssh_write_policy() -> tuple:
-    roots = tuple(filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)))
+def executor_write_policy(roots: tuple[str, ...], *, managed: bool) -> tuple:
     return (ssh_read_protected_entries(), (*HOME_CREDENTIAL_FILES, *SSH_KEY_FILES),
             HOME_CREDENTIAL_DIRS, SHELL_RC_FILES, HERMES_PROTECTED_SUBPATHS, _SENSITIVE_PATH_PREFIXES,
-            tuple(sorted(_SENSITIVE_EXACT_PATHS | set(WRITE_PROTECTED_SYSTEM_FILES))), roots)
+            tuple(sorted(_SENSITIVE_EXACT_PATHS | set(WRITE_PROTECTED_SYSTEM_FILES))), roots, managed)
+
+
+def ssh_write_policy() -> tuple:
+    managed = managed_ssh_workspace_roots()
+    if managed is not None:
+        return executor_write_policy(managed, managed=True)
+    roots = tuple(filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)))
+    return executor_write_policy(roots, managed=False)
 
 
 def ssh_content_denial(inspected, task_id: str) -> str | None:

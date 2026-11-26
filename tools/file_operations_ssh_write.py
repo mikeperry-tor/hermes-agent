@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 from tools.file_operations import SSHPathState
 from tools.file_operations_common import WriteResult
+from tools.file_operations_ssh_acl import SSH_PROJECT_ACL
 from tools.file_operations_ssh_path import SSH_PATH_STATE
 
 
@@ -19,6 +20,14 @@ class SSHWritePath(NamedTuple):
     intermediate_links: tuple[str, ...]
 
 
+class SSHWriteConflict(OSError):
+    """The executor file changed after inspection."""
+
+
+class SSHWriteFileTypeError(OSError):
+    """The requested path exists and cannot be edited as a regular file."""
+
+
 SSH_WRITE = r"""
 import binascii
 import ctypes
@@ -27,6 +36,9 @@ import pwd
 import uuid
 
 class WriteError(Exception):
+    pass
+
+class StaleWrite(WriteError):
     pass
 
 def under(path, root):
@@ -41,14 +53,24 @@ def write_homes(requested):
             homes.add(Path(expanded))
     return homes
 
+def project_root(path, roots):
+    for root in roots:
+        if under(path, root) and os.path.isdir(root) and os.path.realpath(root) == root:
+            return root
+    return None
+
 def write_policy(requested, supplied, resolved, policy, *, entry=False, check_roots=True):
-    read_protected, home_files, home_dirs, shell_rc, protected, sensitive, exact, roots = policy
+    read_protected, home_files, home_dirs, shell_rc, protected, sensitive, exact, roots, managed = policy
     targets = {policy_key(Path(supplied)), policy_key(resolved)}
     if roots and check_roots:
-        allowed = [os.path.realpath(os.path.expanduser(root)) for root in roots]
         changed_paths = (resolved, supplied) if entry else (resolved,)
-        if any(not any(under(path, root) for root in allowed) for path in changed_paths):
-            return 'The path is outside the allowed SSH write roots (HERMES_WRITE_SAFE_ROOT).', None
+        if managed:
+            if any(project_root(path, roots) is None for path in changed_paths):
+                return 'The path is outside the applied SSH workspace roots.', None
+        else:
+            allowed = [os.path.realpath(os.path.expanduser(root)) for root in roots]
+            if any(not any(under(path, root) for root in allowed) for path in changed_paths):
+                return 'The path is outside the allowed SSH write roots (HERMES_WRITE_SAFE_ROOT).', None
     exact_paths = {policy_key(candidate) for path in exact for candidate in (Path(path), policy_path(Path(path)))}
     dirs = {policy_key(candidate) for path in sensitive for candidate in (Path(path), policy_path(Path(path)))}
     if targets & exact_paths or any(under(path, directory) for path in targets for directory in dirs):
@@ -124,18 +146,20 @@ def inspect_write(requested, policy, entry=False):
             'intermediate_links': intermediate_links(location) if location != resolved and not denied else []}
 
 @contextmanager
-def opened_parent(path, *, create=False):
+def opened_parent(path, *, create=False, create_below='/'):
     # Walk from the root with directory descriptors so later symlink changes
     # cannot redirect staged writes.
     parent, name = os.path.split(path)
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open('/', flags)
     try:
+        current = '/'
         for part in Path(parent).parts[1:]:
+            current = os.path.join(current, part)
             try:
                 child = os.open(part, flags, dir_fd=fd)
             except FileNotFoundError:
-                if not create:
+                if not create or current == create_below or not under(current, create_below):
                     raise
                 try:
                     os.mkdir(part, dir_fd=fd)
@@ -165,31 +189,81 @@ def receive_bytes(source, dest, length, digest):
         raise WriteError('The SSH client did not send the expected file data.')
     dest.flush()
 
-def target_permissions(parent_fd, name, expected, stage_fd):
+def target_permissions(parent_fd, name, expected, stage_fd, *, managed):
     previous_fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
     with os.fdopen(previous_fd, 'rb') as previous:
         before = os.fstat(previous_fd)
         if not stat.S_ISREG(before.st_mode) or metadata(before) != expected[:5]:
-            raise WriteError('The SSH file changed before the write.')
+            raise StaleWrite('The SSH file changed before the write.')
         current_digest = hashlib.sha256()
         for block in iter(lambda: previous.read(65536), b''):
             current_digest.update(block)
         if current_digest.hexdigest() != expected[5] or metadata(os.fstat(previous_fd)) != expected[:5]:
-            raise WriteError('The SSH file changed before the write.')
-        os.fchmod(stage_fd, stat.S_IMODE(before.st_mode) & 0o777)
+            raise StaleWrite('The SSH file changed before the write.')
+        if managed:
+            try:
+                preserve_shared_access(previous_fd, stage_fd)
+            except OSError:
+                raise SharedAccessError('The destination filesystem could not preserve the file ACL.') from None
+        else:
+            os.fchmod(stage_fd, stat.S_IMODE(before.st_mode) & 0o777)
 
 def checked_parent(parent, fd):
     current = os.stat(parent, follow_symlinks=False)
     pinned = os.fstat(fd)
     if (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
-        raise WriteError('The SSH destination directory changed before the write.')
+        raise StaleWrite('The SSH destination directory changed before the write.')
 
-def publish(requested, path, entry, entry_version, expected, source, length, digest, policy, approvals):
+def mkdir_checked(target, policy):
+    parent = os.path.dirname(target)
+    roots = policy[-2]
+    if roots and project_root(parent, roots) is None:
+        return {'error': 'EWRITE', 'message': 'The parent is outside the applied SSH workspace roots.'}
+    try:
+        with opened_parent(target) as (parent, fd, name):
+            denied, approvals = write_policy(target, target, target, policy, entry=True)
+            if denied or approvals:
+                return {'error': 'EWRITE', 'message': denied or 'Access to sensitive files is not allowed.'}
+            checked_parent(parent, fd)
+            try:
+                os.mkdir(name, dir_fd=fd)
+            except FileExistsError:
+                if not stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                    return {'error': 'EEXIST', 'message': 'A file already exists at that path.'}
+    except (FileNotFoundError, NotADirectoryError):
+        return {'error': 'EWRITETYPE', 'message': 'The parent must be an existing directory without symlinks.'}
+    except PermissionError:
+        return {'error': 'EWRITE', 'message': 'The directory is not writable.'}
+    except StaleWrite:
+        return {'error': 'EEXIST', 'message': 'The destination directory changed. Reopen it and retry.'}
+    except OSError:
+        return {'error': 'EIO'}
+    return {'path': target}
+
+
+def write_digest(path, version):
+    try:
+        with open_regular(path, version) as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        return {'digest': digest}
+    except PermissionError:
+        return {'error': 'EACCES'}
+    except OSError as exc:
+        if exc.errno in (None, errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            return {'error': 'ESTALE'}
+        raise
+
+def publish(requested, path, entry, entry_version, links, expected, source, length, digest,
+            policy, approvals, create_parents):
     landed = False
     try:
         if not os.path.isabs(path) or path == '/' or os.path.normpath(path) != path:
             raise WriteError('The SSH write needs a verified absolute file path.')
-        with opened_parent(path, create=True) as (parent, parent_fd, name):
+        roots, managed = policy[-2:]
+        root = project_root(path, roots) if managed else '/'
+        if root is None:
+            raise WriteError('The path is outside the applied SSH workspace roots.')
+        with opened_parent(path, create=create_parents, create_below=root) as (parent, parent_fd, name):
             scratch = '.hermes-write-' + uuid.uuid4().hex
             os.mkdir(scratch, 0o700, dir_fd=parent_fd)
             try:
@@ -199,13 +273,14 @@ def publish(requested, path, entry, entry_version, expected, source, length, dig
                     with os.fdopen(stage_fd, 'w+b') as stage:
                         receive_bytes(source, stage, length, digest)
                         if expected is not None:
-                            target_permissions(parent_fd, name, expected, stage_fd)
+                            target_permissions(parent_fd, name, expected, stage_fd, managed=managed)
                         checked_parent(parent, parent_fd)
                         current = inspect_write(requested, policy)
                         if (current['path'] != path or current['entry'] != entry
                                 or current['entry_metadata'] != entry_version
+                                or tuple(current['intermediate_links']) != links
                                 or current['kind'] != ('absent' if expected is None else 'regular')):
-                            raise WriteError('The SSH path changed before the write.')
+                            raise StaleWrite('The SSH path changed before the write.')
                         if current['error'] or tuple(current['approvals']) != approvals:
                             raise WriteError(current['error'] or 'The SSH permissions changed before the write.')
                         if expected is None:
@@ -214,7 +289,7 @@ def publish(requested, path, entry, entry_version, expected, source, length, dig
                             os.unlink('file', dir_fd=scratch_fd)
                         else:
                             if metadata(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)) != expected[:5]:
-                                raise WriteError('The SSH file changed before the write.')
+                                raise StaleWrite('The SSH file changed before the write.')
                             os.replace('file', name, src_dir_fd=scratch_fd, dst_dir_fd=parent_fd)
                             landed = True
                         return {'landed': True, 'written': length, 'metadata': metadata(os.fstat(stage_fd))}
@@ -230,10 +305,16 @@ def publish(requested, path, entry, entry_version, expected, source, length, dig
         if landed:
             return {'landed': True, 'error': 'The SSH write landed before an I/O error. Inspect the file.'}
         if isinstance(exc, FileExistsError):
-            return {'error': 'The SSH destination appeared before the write.'}
+            return {'error': 'The SSH destination appeared before the write.', 'error_code': 'ESTALE'}
+        if isinstance(exc, FileNotFoundError):
+            return {'error': 'The SSH file or its parent directory disappeared.', 'error_code': 'ENOENT'}
         if isinstance(exc, PermissionError):
-            return {'error': 'The SSH user cannot write the file or its parent directory.'}
+            return {'error': 'The SSH user cannot write the file or its parent directory.', 'error_code': 'EWRITE'}
         return {'error': 'The SSH filesystem rejected the write: ' + os.strerror(exc.errno) + '.'}
+    except StaleWrite as exc:
+        return {'error': str(exc), 'error_code': 'ESTALE'}
+    except SharedAccessError as exc:
+        return {'error': str(exc), 'error_code': 'EWRITE'}
     except WriteError as exc:
         return {'error': str(exc)}
 
@@ -278,7 +359,12 @@ def mutate_entry(requested, expected, policy, destination=None):
                 os.unlink(name, dir_fd=fd)
                 return {'landed': True}
             target, expected_destination = destination
-            with opened_parent(expected_destination['entry'], create=True) as (parent_to, fd_to, name_to):
+            roots, managed = policy[-2:]
+            target_path = expected_destination['entry']
+            root = project_root(target_path, roots) if managed else '/'
+            if root is None:
+                raise WriteError('The path is outside the applied SSH workspace roots.')
+            with opened_parent(target_path, create=True, create_below=root) as (parent_to, fd_to, name_to):
                 if verify_entry(target, expected_destination, policy, fd_to, name_to) is not None:
                     raise WriteError('The SSH destination already exists.')
                 if stat.S_ISLNK(mode):
@@ -327,7 +413,7 @@ def inspect_ssh_write(ops, path: str, policy: tuple, *, entry: bool = False) -> 
               and all(type(value) is int for value in info)):
             state = SSHPathState(destination, kind, tuple(info))
         else:
-            raise PermissionError("The SSH write target is not a regular file.")
+            raise SSHWriteFileTypeError("The SSH write target is not a regular file.")
         approvals = tuple(data["approvals"])
         if any(key not in {"ssh_config_write", "shell_rc_write"} for key in approvals):
             raise ValueError
@@ -390,8 +476,28 @@ def read_ssh_write_source(ops, state: SSHPathState, maximum: int) -> bytes:
     except (TypeError, ValueError):
         raise ValueError("Could not read the inspected SSH file before writing.") from None
 
+def ssh_write_snapshot(ops, state: SSHPathState) -> tuple | None:
+    """Hash the inspected version on the executor without returning its file bytes."""
+    if state.kind == "absent":
+        return None
+    args = f"{state.path!r}, {state.metadata!r}"
+    reply = ops._framed_ssh_file_output(
+        SSH_PATH_STATE + SSH_WRITE + f"\nprint(json.dumps(write_digest({args})))\n")
+    response = json.loads(reply)
+    if not isinstance(response, dict):
+        raise ValueError("Could not verify the SSH file before saving.")
+    if response.get("error") == "ESTALE":
+        raise SSHWriteConflict("The SSH file changed before saving.")
+    if response.get("error") == "EACCES":
+        raise PermissionError("The SSH user cannot read the file before saving.")
+    digest = response.get("digest")
+    if not isinstance(digest, str) or len(digest) != 64:
+        raise ValueError("Could not verify the SSH file before saving.")
+    return (*state.metadata, bytes.fromhex(digest))
+
+
 def publish_ssh_file(ops, input_path: str, inspected: SSHWritePath, expected: tuple | None,
-                     content: bytes, policy: tuple) -> WriteResult:
+                     content: bytes, policy: tuple, *, create_parents: bool = True) -> WriteResult:
     """Publish verified bytes against the previously inspected SSH file."""
     state = inspected.destination
     if state.kind == "absent" and expected is None:
@@ -399,17 +505,18 @@ def publish_ssh_file(ops, input_path: str, inspected: SSHWritePath, expected: tu
     elif state.kind == "regular" and expected is not None and expected[:5] == state.metadata:
         remote_version = (*expected[:5], expected[5].hex())
     else:
-        return WriteResult(error="The SSH file changed before the write. Read it again.")
+        return WriteResult(error="The SSH file changed before the write. Read it again.", _error_code="ESTALE")
     digest = hashlib.sha256(content).digest()
     args = (f"{input_path!r}, {state.path!r}, {inspected.entry!r}, {inspected.entry_metadata!r}, "
-            f"{remote_version!r}, sys.stdin.buffer, {len(content)}, {digest.hex()!r}, "
-            f"{policy!r}, {inspected.approvals!r}")
+            f"{inspected.intermediate_links!r}, {remote_version!r}, sys.stdin.buffer, "
+            f"{len(content)}, {digest.hex()!r}, {policy!r}, {inspected.approvals!r}, {create_parents!r}")
     try:
         response = json.loads(ops._framed_ssh_file_output(
-            SSH_PATH_STATE + SSH_WRITE + f"\nprint(json.dumps(publish({args})))\n",
+            SSH_PATH_STATE + SSH_WRITE + SSH_PROJECT_ACL + f"\nprint(json.dumps(publish({args})))\n",
             stdin_data=base64.b64encode(content).decode("ascii")))
         if isinstance(response.get("error"), str):
-            return WriteResult(error=response["error"], _entry_landed=response.get("landed") is True)
+            return WriteResult(error=response["error"], _entry_landed=response.get("landed") is True,
+                               _error_code=response.get("error_code"))
         info = response["metadata"]
         if (response["written"] != len(content) or len(info) != 5
                 or any(type(value) is not int for value in info) or info[2] != len(content)):

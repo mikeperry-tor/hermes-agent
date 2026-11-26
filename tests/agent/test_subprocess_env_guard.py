@@ -69,8 +69,9 @@ ALLOWED_RAW_SPAWN_ENV_FILES = {
     # needing their real HOME for ~/.ssh and ~/.docker. Same as inheriting (``None``) plus the
     # forwarded values; what crosses into the sandbox is the backend's forward/passthrough policy.
     "tools/environments/remote_common.py",
-    # Remote Python snippet executed on the SSH executor (where Hermes and
-    # tools.environments.local are not installed), not a local Hermes subprocess.
+    # Remote Python snippets executed on the SSH executor (where Hermes and
+    # tools.environments.local are not installed), not local Hermes subprocesses.
+    "hermes_cli/ssh_project_probe.py",
     "tools/file_operations_ssh_search.py",
     # Needing provider keys is not a reason to be here: such a child uses
     # hermes_subprocess_env(inherit_credentials=True), which still drops bot/relay tokens.

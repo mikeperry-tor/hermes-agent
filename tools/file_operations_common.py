@@ -53,6 +53,7 @@ class WriteResult:
     _snapshot: Optional[tuple] = None
     _entry_landed: bool = False
     _entry_metadata: Optional[tuple] = None
+    _error_code: Optional[str] = None
     lint: Optional[dict[str, Any]] = None
     # LSP semantic diagnostics, kept separate from ``lint`` (syntax) so the model
     # reads the two as independent signals. None when LSP is off/inapplicable.

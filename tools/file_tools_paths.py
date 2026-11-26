@@ -13,10 +13,36 @@ import sys
 import time
 from pathlib import Path, PurePosixPath
 
+import hermes_yaml as yaml
 from agent.runtime_self_protection import split_entry
+from hermes_cli.config_backend import ConfigBackendUnavailable
+from hermes_cli.managed_scope import load_managed_config
 from tools.terminal_tool_config import _is_container_backend
 
 logger = logging.getLogger(__name__)
+
+
+def managed_ssh_workspace_roots(managed: dict | None = None) -> tuple[str, ...] | None:
+    """Read the administrator's executor roots without resolving them on this host."""
+    if managed is None:
+        try:
+            managed = load_managed_config(strict=True)
+        except (ConfigBackendUnavailable, OSError, ValueError, yaml.YAMLError) as exc:
+            raise ValueError("The managed SSH workspace roots could not be read.") from exc
+    terminal = managed.get("terminal", {})
+    if not isinstance(terminal, dict):
+        raise ValueError("The managed terminal settings must be a mapping.")
+    if "ssh_workspace_roots" not in terminal:
+        return None
+    roots = terminal["ssh_workspace_roots"]
+    if not isinstance(roots, list) or not roots or any(
+        not isinstance(root, str) or not root.startswith("/") or root.startswith("//")
+        or root == "/" or "\0" in root or posixpath.normpath(root) != root
+        for root in roots
+    ):
+        raise ValueError("The managed SSH workspace roots must be absolute directory paths.")
+    return tuple(dict.fromkeys(roots))
+
 
 # ``TERMINAL_CWD`` values that mean "not configured" ("." from a stale config;
 # "auto"/"cwd" are wizard placeholders). gateway/run.py sanitizes the same set.
