@@ -97,14 +97,18 @@ def _bang_env() -> dict:
     return build_subprocess_env()
 
 
-def run_bang_command(command: str, *, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT, writer=None) -> int:
+def run_bang_command(command: str, *, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT, writer=None,
+                     strict_cwd: bool = False) -> int:
     """Execute *command*, streaming merged stdout/stderr through *writer* (default ``print``); return the exit code.
 
     Output exists only on the user's terminal — nothing is returned for insertion into history.
     """
     emit = writer or (lambda line: print(line, end="" if line.endswith("\n") else "\n"))
     run_cwd = os.path.expanduser(cwd) if cwd else None
-    if run_cwd and not os.path.isdir(run_cwd):
+    if strict_cwd and (not run_cwd or not os.path.isdir(run_cwd)):
+        emit("!: the session's gateway directory is unavailable")
+        return 127
+    if not strict_cwd and run_cwd and not os.path.isdir(run_cwd):
         run_cwd = None
     try:
         from hermes_cli._subprocess_compat import windows_hide_flags

@@ -1,18 +1,11 @@
-"""Ink ``!cmd`` / ``{!cmd}`` on the shared owner: one captured shell command for a local session.
-
-The legacy sidecar ran ``subprocess.run(cwd=os.getcwd())`` in its own process: on the owner that is
-the daemon's directory (the install root for an auto-started one), not the session's launch cwd or
-``-w`` worktree, and the sidecar's contract refused the ``session_id`` Ink sends (dokterdok N22).
-Here the command runs for exactly one local session, in its frozen launch cwd, behind the same
-hardline/dangerous-command refusal, with Hermes-managed secrets scrubbed from the child and the
-output redacted before it crosses the wire. Nothing enters the transcript or the admission FIFO.
-"""
+"""Run a captured operator shell command for a local session."""
 import asyncio
 from functools import partial
 import json
 import os
 import subprocess
 
+from hermes_cli.managed_operator_shell import OperatorShellUnavailable, placement, run_executor_async
 from persistence.core.errors import AuthorityRefusal
 
 TIMEOUT_SECONDS = 30
@@ -20,15 +13,12 @@ _LOCAL_BACKENDS = frozenset({'', 'local'})
 
 
 def handlers(connection):
-    return {'shell.exec': partial(shell_exec, connection)}
+    return {'shell.exec': partial(shell_exec, connection), 'shell.cwd': partial(shell_cwd, connection)}
 
 
-async def shell_exec(connection, ref, params):
-    command = params.get('command')
-    if (set(params) - {'session_id', 'profile', 'command'} or not isinstance(ref.session_id, str)
-            or not ref.session_id or not isinstance(command, str) or not command.strip()):
-        raise AuthorityRefusal('invalid_params')
+def _operator_session(connection, ref, params):
     from gateway.session_busy_controls import authorize
+
     authorize(connection, ref, params, 'session:control')
     authority = connection.authority
     authority._require_admission_open()
@@ -42,37 +32,106 @@ async def shell_exec(connection, ref, params):
     policy = policy_for_source(authority.runner, live.source)
     if policy is None:
         raise AuthorityRefusal('permission_denied')
-    # The frozen terminal policy chose a sandbox (docker, ssh, ...): the owner's host shell is not
-    # that backend, so refuse rather than run on the host behind the session's back.
-    # The refusal names the backend so the client can say where the command would have run.
-    backend = str(json.loads(policy.terminal_json).get('TERMINAL_ENV') or '').strip().lower()
-    if backend not in _LOCAL_BACKENDS:
-        raise AuthorityRefusal('unsupported_terminal_backend', field='terminal.backend', detail=backend)
+    try:
+        selected = placement()
+    except OperatorShellUnavailable as exc:
+        raise AuthorityRefusal('operator_shell_unavailable', detail=str(exc)) from None
+    if selected is not None and (not connection.native_owner or 'session:operator' not in connection.actor.capabilities):
+        raise AuthorityRefusal('permission_denied')
+    return live, policy, selected
+
+
+def _agent_shell_cwd(connection, policy):
+    from tools import file_tools_paths
+
+    managed_roots = getattr(file_tools_paths, 'managed_ssh_workspace_roots', None)
+    if managed_roots is None:
+        return policy.cwd
+    try:
+        if managed_roots() is None:
+            return policy.cwd
+    except ValueError:
+        pass
+    return str(connection.authority.profile_id)
+
+
+async def shell_cwd(connection, ref, params):
+    """Read the managed shell directory from the owner of this chat."""
+    if (set(params) - {'session_id', 'profile', 'executor'} or not ref.session_id
+            or not isinstance(params.get('executor', False), bool)):
+        raise AuthorityRefusal('invalid_params')
+    live, policy, selected = _operator_session(connection, ref, params)
+    if selected is None:
+        raise AuthorityRefusal('operator_shell_unavailable')
+    from gateway.session_terminal_cwd import operator_ssh_cwd
+    try:
+        cwd = (operator_ssh_cwd(connection.authority.runner, live.route, policy)
+               if selected.mode == 'executor' or params.get('executor') is True
+               else _agent_shell_cwd(connection, policy))
+    except OperatorShellUnavailable as exc:
+        raise AuthorityRefusal('operator_shell_unavailable', detail=str(exc)) from None
+    return {'environment': selected.mode, 'cwd': cwd}
+
+
+async def shell_exec(connection, ref, params):
+    command = params.get('command')
+    if (set(params) - {'session_id', 'profile', 'command'} or not isinstance(ref.session_id, str)
+            or not ref.session_id or not isinstance(command, str) or not command.strip()):
+        raise AuthorityRefusal('invalid_params')
+    live, policy, selected = _operator_session(connection, ref, params)
+    if selected is None:
+        backend = str(json.loads(policy.terminal_json).get('TERMINAL_ENV') or '').strip().lower()
+        if backend not in _LOCAL_BACKENDS:
+            raise AuthorityRefusal('unsupported_terminal_backend', field='terminal.backend', detail=backend)
     from tools.approval_detection import detect_dangerous_command, detect_hardline_command
     # No prompt here, so anything the agent's gate would ask about is refused, including a command
     # the scanners could not read to the end (detect_dangerous_command reports that too).
     if detect_hardline_command(command)[0] or detect_dangerous_command(command)[0]:
         raise AuthorityRefusal('dangerous_command')
-    return await asyncio.to_thread(_run, command, policy.cwd)
+    if selected is None or selected.mode == 'gateway':
+        cwd = policy.cwd if selected is None else _agent_shell_cwd(connection, policy)
+        return await _run(command, cwd)
+    from gateway.session_terminal_cwd import operator_ssh_cwd
+    try:
+        cwd = operator_ssh_cwd(connection.authority.runner, live.route, policy)
+        result = await run_executor_async(selected, command, cwd, timeout=TIMEOUT_SECONDS)
+    except TimeoutError:
+        raise AuthorityRefusal('command_timeout') from None
+    except OperatorShellUnavailable as exc:
+        raise AuthorityRefusal('operator_shell_unavailable', detail=str(exc)) from None
+    return _redacted_result(result)
 
 
-def _run(command, cwd):
-    from agent.redact import redact_sensitive_text
+async def _run(command, cwd):
+    from gateway.run_inbound_hooks import _stop_exec_tree
     from hermes_cli._subprocess_compat import windows_hide_flags
     from tools.environments.local import build_subprocess_env
-    # shell=True keeps the user-facing !cmd grammar (pipes, redirects); the child never inherits
-    # credentials the long-lived owner holds, nor a launch profile's .env residue in a routed one.
-    if not os.path.isdir(cwd):  # a deleted checkout / worktree: never fall back to the owner's cwd
+    if not await asyncio.to_thread(os.path.isdir, cwd):
         raise AuthorityRefusal('cwd_unavailable')
     env = build_subprocess_env(strip_launch_profile=True)
     try:
-        result = subprocess.run(command, cwd=cwd, shell=True, env=env, capture_output=True,
-                                text=True, encoding='utf-8', errors='replace', timeout=TIMEOUT_SECONDS,
-                                stdin=subprocess.DEVNULL, creationflags=windows_hide_flags(), check=False)
-    except subprocess.TimeoutExpired:
-        raise AuthorityRefusal('command_timeout') from None
+        process = await asyncio.create_subprocess_shell(
+            command, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            stdin=subprocess.DEVNULL, creationflags=windows_hide_flags(),
+            start_new_session=True,  # detached-spawn: ok — awaited; cancellation kills the shell group
+        )
     except OSError:
         raise AuthorityRefusal('command_failed') from None
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), TIMEOUT_SECONDS)
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        await asyncio.shield(_stop_exec_tree(process))
+        if isinstance(exc, TimeoutError):
+            raise AuthorityRefusal('command_timeout') from None
+        raise
+    return _redacted_result(subprocess.CompletedProcess(
+        command, process.returncode, stdout.decode('utf-8', 'replace'), stderr.decode('utf-8', 'replace'),
+    ))
+
+
+def _redacted_result(result):
+    from agent.redact import redact_sensitive_text
+
     # Redact before tailing so a credential crossing the slice boundary cannot survive as fragments.
     stdout = redact_sensitive_text(result.stdout or '', force=True, redact_url_credentials=True)[-4000:]
     stderr = redact_sensitive_text(result.stderr or '', force=True, redact_url_credentials=True)[-2000:]

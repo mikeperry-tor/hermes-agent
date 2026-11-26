@@ -122,6 +122,23 @@ class TestBangExecution:
         assert code == 0
         assert "ok" in lines
 
+    def test_strict_cwd_does_not_fall_back_if_the_directory_disappears(self, tmp_path, monkeypatch):
+        cwd = tmp_path / "current"
+        cwd.mkdir()
+        isdir = os.path.isdir
+
+        def remove_after_check(path):
+            existed = isdir(path)
+            if path == str(cwd) and existed:
+                cwd.rename(tmp_path / "moved")
+            return existed
+
+        monkeypatch.setattr(os.path, "isdir", remove_after_check)
+        lines = []
+        code = run_bang_command("echo unexpected-location", cwd=str(cwd), strict_cwd=True, writer=lines.append)
+        assert code == 127
+        assert "unexpected-location" not in lines
+
     def test_unavailable_environment_sanitizer_prevents_launch(self):
         lines = []
         real_import = builtins.__import__

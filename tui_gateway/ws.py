@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import contextlib
 import concurrent.futures
+import contextlib
+from dataclasses import dataclass
 import json
 import logging
 import socket
@@ -436,6 +437,21 @@ class _SendFailed(Exception):
     """Raised by handle_ws._reply when a reply could not be written: ends the read loop."""
 
 
+@dataclass
+class _PendingShell:
+    session_id: str
+    profile: str | None
+    task: asyncio.Task | None = None
+    cancelled: bool = False
+
+    def cancel(self) -> None:
+        if self.cancelled:
+            return
+        self.cancelled = True
+        if self.task is not None:
+            self.task.cancel()
+
+
 async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: str | None = None,
                     operator: bool = False) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``. *auth_identity* is the server-minted
@@ -459,6 +475,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         return {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": req_id}
 
     pending: asyncio.Queue = asyncio.Queue(maxsize=_WS_DISPATCH_QUEUE_MAX)
+    pending_shells: dict[int, _PendingShell] = {}
     dispatcher: asyncio.Task | None = None
     concurrent_reads: set[asyncio.Task] = set()
     started_reads: set[asyncio.Task] = set()
@@ -487,6 +504,23 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         already dispatches keeps going (a viewer leaving never stops a turn)."""
         client_gone.set()
         held_dropped.update(key for key, started in held_waiting.items() if not started.is_set())
+        for shell in pending_shells.values():
+            shell.cancel()
+
+    async def _dispatch_shell(req: dict, shell: _PendingShell) -> Any:
+        try:
+            if not shell.cancelled:
+                shell.task = asyncio.create_task(_dispatch_request(authority_connection, req, "shell.exec", transport))
+                try:
+                    return await shell.task
+                except asyncio.CancelledError:
+                    if not shell.cancelled or asyncio.current_task().cancelling():
+                        raise
+            if not client_gone.is_set():
+                return _error(4001, "command_interrupted", req.get("id"))
+            return None
+        finally:
+            pending_shells.pop(id(req), None)
 
     async def _dispatch_one(req: Any) -> None:
         """Dispatch one request and write its inline reply."""
@@ -497,7 +531,10 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         # writes the response itself via transport.write (a separate thread, so that is the safe
         # path). Inline handlers return the response dict, written here from the loop.
         try:
-            resp = await _dispatch_request(authority_connection, req, req_method, transport)
+            if shell := pending_shells.get(id(req)):
+                resp = await _dispatch_shell(req, shell)
+            else:
+                resp = await _dispatch_request(authority_connection, req, req_method, transport)
         # health: allow BLE001 -- dispatch boundary: logs the traceback (_log.exception) and answers -32603
         except Exception:
             dispatch_crashes += 1
@@ -544,7 +581,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             del held_waiting[key]  # dispatching from here on: a later disconnect lets these frames finish
             frames = held[key]
             if key in held_dropped:
-                for _ in frames:
+                for frame in frames:
+                    pending_shells.pop(id(frame), None)
                     held_room.release()
                 frames.clear()
             while frames:
@@ -615,6 +653,25 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             await _dispatch_one(req)
 
     async def _queue_request(req: Any) -> None:
+        if authority_connection is not None and isinstance(req, dict):
+            method, params = req.get("method"), req.get("params")
+            sid = params.get("session_id") if isinstance(params, dict) else None
+            profile = params.get("profile") if isinstance(params, dict) else None
+            valid_profile = profile is None or isinstance(profile, str)
+            if method == "shell.cancel":
+                # The reply must pass the serial lane while it waits for shell.exec. This
+                # socket can only cancel requests that it submitted for this session.
+                if not isinstance(sid, str) or not sid or not valid_profile or set(params) - {"session_id", "profile"}:
+                    response = _error(4001, "invalid_params", req.get("id"))
+                else:
+                    for shell in pending_shells.values():
+                        if shell.session_id == sid and shell.profile == (profile or None):
+                            shell.cancel()
+                    response = {"jsonrpc": "2.0", "id": req.get("id"), "result": {}}
+                await _reply(response, "send_failed_after_shell_cancel", "ws shell cancel reply failed peer=%s", peer)
+                return
+            if method == "shell.exec" and isinstance(sid, str) and sid and valid_profile:
+                pending_shells[id(req)] = _PendingShell(sid, profile or None)
         if _answers_open_request(req):
             await _dispatch_one(req)
             return
