@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import subprocess
+from threading import Event, Lock
 import uuid
 
 
@@ -51,9 +52,10 @@ def placement() -> Placement | None:
     return Placement(mode, terminal)
 
 
-def classic_shell_cwd(cli, selected: Placement, *, executor: bool = False) -> str | None:
+def classic_shell_cwd(cli, selected: Placement, *, executor: bool = False, abandon=None) -> str | None:
     """Confirm managed placement and read the directory from the classic session's owner."""
     from hermes_cli.gateway_client import GatewayClientError
+    from hermes_cli.gateway_connection import CallStopped
     from hermes_cli.gateway_side import connection_for
 
     connection = connection_for(cli)
@@ -63,7 +65,9 @@ def classic_shell_cwd(cli, selected: Placement, *, executor: bool = False) -> st
     if executor and selected.mode == "gateway":
         params["executor"] = True
     try:
-        owner = connection.call("shell.cwd", **params)
+        owner = connection.call("shell.cwd", abandon=abandon, **params)
+    except CallStopped:
+        raise KeyboardInterrupt from None
     except GatewayClientError as exc:
         raise OperatorShellUnavailable("Could not confirm shell placement with the chat owner.") from exc
     return owner_shell_cwd(selected, owner, executor=executor)
@@ -184,12 +188,41 @@ def executor_result(argv: list[str], receipt: str, status: int, stdout: str, std
     return subprocess.CompletedProcess(argv, int(code), stdout, before + trailing)
 
 
-def run_executor(selected: Placement, command: str, cwd: str | None, *, timeout: int,
-                 emit=None) -> subprocess.CompletedProcess:
+def run_classic_executor(cli, selected: Placement, command: str, *, timeout: int,
+                         emit=None) -> subprocess.CompletedProcess:
+    """Run an SSH command on the classic REPL worker and accept cancellation from the UI."""
+    stopped = Event()
+    binding = Lock()
+    cancel_task = None
+
+    def interrupt():
+        with binding:
+            if stopped.is_set():
+                return
+            stopped.set()
+            if cancel_task is not None:
+                with suppress(RuntimeError):
+                    cancel_task()
+
+    async def run(cwd):
+        nonlocal cancel_task
+        with binding:
+            if stopped.is_set():
+                raise asyncio.CancelledError
+            loop, task = asyncio.get_running_loop(), asyncio.current_task()
+            cancel_task = lambda: loop.call_soon_threadsafe(task.cancel)
+        return await run_executor_async(selected, command, cwd, timeout=timeout, emit=emit)
+
+    cli._operator_shell_interrupt = interrupt
     try:
-        return asyncio.run(run_executor_async(selected, command, cwd, timeout=timeout, emit=emit))
+        cwd = classic_shell_cwd(cli, selected, executor=True, abandon=stopped.is_set)
+        return asyncio.run(run(cwd))
+    except asyncio.CancelledError:
+        raise KeyboardInterrupt from None
     except TimeoutError:
         raise subprocess.TimeoutExpired("ssh", timeout) from None
+    finally:
+        cli._operator_shell_interrupt = None
 
 
 async def _stream_lines(stream, emit) -> None:
@@ -228,6 +261,7 @@ async def run_executor_async(selected: Placement, command: str, cwd: str | None,
                              timeout: int, emit=None) -> subprocess.CompletedProcess:
     argv, receipt = executor_command(selected, command, cwd, merge=emit is not None)
     reader, writer = os.pipe()
+    writer_open = True
     try:
         try:
             process = await asyncio.create_subprocess_exec(
@@ -239,6 +273,9 @@ async def run_executor_async(selected: Placement, command: str, cwd: str | None,
         try:
             stdout, stderr = await asyncio.wait_for(_collect(process, emit), timeout=timeout)
         except BaseException:
+            if writer_open:
+                os.close(writer)
+                writer_open = False
             with suppress(ProcessLookupError):
                 process.kill()
             with suppress(TimeoutError):
@@ -246,7 +283,8 @@ async def run_executor_async(selected: Placement, command: str, cwd: str | None,
             raise
     finally:
         os.close(reader)
-        os.close(writer)
+        if writer_open:
+            os.close(writer)
     return executor_result(
         argv, receipt, process.returncode, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace"),
     )
